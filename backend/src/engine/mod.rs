@@ -31,4 +31,11 @@ pub trait Engine: Send + Sync {
         prompt: &str,
         cfg: &SamplingConfig,
     ) -> Result<BoxStream<'static, Result<CompletionChunk>>>;
+    /// Renders `messages` into the model's prompt string using the server's own chat template.
+    async fn apply_template(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> Result<String>;
 }

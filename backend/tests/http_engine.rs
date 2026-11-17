@@ -101,3 +101,36 @@ async fn malformed_200_body_is_protocol_error() {
         Err(EngineError::Protocol(_))
     ));
 }
+
+#[tokio::test]
+async fn apply_template_maps_llama_endpoint() {
+    use backend::engine::{ChatMessage, Role};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/apply-template"))
+        .and(body_json(json!({
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"}
+            ],
+            "add_generation_prompt": true,
+            "chat_template_kwargs": {"enable_thinking": false}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"prompt": "RENDERED"})))
+        .mount(&server)
+        .await;
+
+    let engine = HttpEngine::new(server.uri());
+    let messages = vec![
+        ChatMessage {
+            role: Role::System,
+            content: "be brief".into(),
+        },
+        ChatMessage {
+            role: Role::User,
+            content: "hi".into(),
+        },
+    ];
+    let prompt = engine.apply_template(&messages, true, false).await.unwrap();
+    assert_eq!(prompt, "RENDERED");
+}

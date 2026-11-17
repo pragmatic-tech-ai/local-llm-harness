@@ -8,14 +8,15 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use super::{
-    CompletionChunk, Engine, EngineError, ModelProps, Result, SamplingConfig, TokenInfo,
-    TokenizeResult,
+    ChatMessage, CompletionChunk, Engine, EngineError, ModelProps, Result, SamplingConfig,
+    TokenInfo, TokenizeResult,
 };
 
 const PROPS_PATH: &str = "/props";
 const TOKENIZE_PATH: &str = "/tokenize";
 const COMPLETION_PATH: &str = "/completion";
 const DETOKENIZE_PATH: &str = "/detokenize";
+const APPLY_TEMPLATE_PATH: &str = "/apply-template";
 /// Number of top alternatives per token requested via `n_probs`.
 const TOP_LOGPROBS: u32 = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -24,6 +25,11 @@ const ERROR_BODY_MAX_CHARS: usize = 500;
 #[derive(Deserialize)]
 struct TokenizeResponse {
     tokens: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+struct ApplyTemplateResponse {
+    prompt: String,
 }
 
 #[derive(Deserialize)]
@@ -124,6 +130,28 @@ impl Engine for HttpEngine {
             .map_err(Self::map_transport)?;
         let parsed: DetokenizeResponse = Self::read_json(response).await?;
         Ok(parsed.content)
+    }
+
+    async fn apply_template(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> Result<String> {
+        let body = json!({
+            "messages": messages,
+            "add_generation_prompt": add_generation_prompt,
+            "chat_template_kwargs": { "enable_thinking": enable_thinking },
+        });
+        let response = self
+            .client
+            .post(self.url(APPLY_TEMPLATE_PATH))
+            .json(&body)
+            .send()
+            .await
+            .map_err(Self::map_transport)?;
+        let parsed: ApplyTemplateResponse = Self::read_json(response).await?;
+        Ok(parsed.prompt)
     }
 
     async fn complete(
