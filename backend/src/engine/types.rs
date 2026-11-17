@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SamplingConfig {
     pub temperature: f32,
     pub top_p: f32,
@@ -8,6 +9,19 @@ pub struct SamplingConfig {
     pub repeat_penalty: f32,
     pub seed: i64,
     pub max_tokens: i32,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.8,
+            top_p: 0.95,
+            top_k: 40,
+            repeat_penalty: 1.1,
+            seed: -1,
+            max_tokens: -1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,5 +126,34 @@ mod tests {
         let p: ModelProps = serde_json::from_str(raw).unwrap();
         assert_eq!(p.n_ctx, 4096);
         assert_eq!(p.model_name, "llama.gguf");
+    }
+
+    #[test]
+    fn sampling_config_defaults_and_partial_json() {
+        let d = SamplingConfig::default();
+        assert_eq!(d.temperature, 0.8);
+        assert_eq!(d.top_p, 0.95);
+        assert_eq!(d.top_k, 40);
+        assert_eq!(d.repeat_penalty, 1.1);
+        assert_eq!(d.seed, -1);
+        assert_eq!(d.max_tokens, -1);
+
+        let partial: SamplingConfig = serde_json::from_str(r#"{"temperature":0.2}"#).unwrap();
+        assert_eq!(partial.temperature, 0.2);
+        assert_eq!(
+            partial,
+            SamplingConfig {
+                temperature: 0.2,
+                ..SamplingConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn props_missing_n_ctx_fails_to_deserialize() {
+        let raw = r#"{"default_generation_settings":{}, "model":"m.gguf"}"#;
+        assert!(serde_json::from_str::<ModelProps>(raw).is_err());
+        let raw = r#"{"model":"m.gguf"}"#;
+        assert!(serde_json::from_str::<ModelProps>(raw).is_err());
     }
 }
