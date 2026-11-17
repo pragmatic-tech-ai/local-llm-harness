@@ -15,8 +15,9 @@ use super::{
 const PROPS_PATH: &str = "/props";
 const TOKENIZE_PATH: &str = "/tokenize";
 const COMPLETION_PATH: &str = "/completion";
-const TOP_LOGPROBS: u32 = 5;
 const DETOKENIZE_PATH: &str = "/detokenize";
+/// Number of top alternatives per token requested via `n_probs`.
+const TOP_LOGPROBS: u32 = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const ERROR_BODY_MAX_CHARS: usize = 500;
 
@@ -65,15 +66,22 @@ impl HttpEngine {
         }
     }
 
-    async fn read_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+    /// Passes a successful response through; turns any non-2xx into a `Protocol` error that
+    /// carries a bounded snippet of the body.
+    async fn check_status(response: reqwest::Response) -> Result<reqwest::Response> {
         let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(ERROR_BODY_MAX_CHARS).collect();
-            return Err(EngineError::Protocol(format!(
-                "unexpected status {status}: {snippet}"
-            )));
+        if status.is_success() {
+            return Ok(response);
         }
+        let body = response.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(ERROR_BODY_MAX_CHARS).collect();
+        Err(EngineError::Protocol(format!(
+            "unexpected status {status}: {snippet}"
+        )))
+    }
+
+    async fn read_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+        let response = Self::check_status(response).await?;
         let bytes = response.bytes().await.map_err(Self::map_transport)?;
         serde_json::from_slice(&bytes).map_err(|e| EngineError::Protocol(e.to_string()))
     }
@@ -142,14 +150,11 @@ impl Engine for HttpEngine {
             .send()
             .await
             .map_err(Self::map_transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let snippet: String = text.chars().take(ERROR_BODY_MAX_CHARS).collect();
-            return Err(EngineError::Protocol(format!(
-                "unexpected status {status}: {snippet}"
-            )));
-        }
+        let response = Self::check_status(response).await?;
+        // Known limitation: there is no read/idle timeout, so a server that stalls without
+        // closing the connection hangs the stream. A fixed timeout would kill valid streams from
+        // a "thinking" model that pauses mid-generation; a stall-aware timeout is deferred to the
+        // agent-loop phase.
         let state = StreamState {
             bytes: response.bytes_stream().boxed(),
             parser: SseParser::default(),
@@ -224,6 +229,9 @@ impl SseParser {
     fn parse_line(line: &[u8]) -> Option<Result<CompletionChunk>> {
         let text = match std::str::from_utf8(line) {
             Ok(t) => t.trim_end_matches(['\n', '\r']),
+            // Lines are decoded only once complete, and a character cannot span two complete SSE
+            // events (each payload is standalone JSON), so for a correct server this is
+            // effectively unreachable; treat it as a terminal protocol error.
             Err(e) => return Some(Err(EngineError::Protocol(format!("invalid utf-8: {e}")))),
         };
         let payload = text.strip_prefix("data:")?.trim_start();
@@ -272,8 +280,13 @@ impl SseParser {
             })
             .unwrap_or_default();
         // Older servers omit the chosen token's own probability; recover it from the top list.
+        // If the sampled token is absent from the top-N list (legacy shape), it was less likely
+        // than every listed alternative: report the lowest listed logprob as an upper bound
+        // (f32::MIN when no list exists) rather than dropping the token.
         let logprob = Self::logprob_of(e)
-            .or_else(|| top.iter().find(|(t, _)| *t == token).map(|(_, lp)| *lp))?;
+            .or_else(|| top.iter().find(|(t, _)| *t == token).map(|(_, lp)| *lp))
+            .or_else(|| top.iter().map(|(_, lp)| *lp).reduce(f32::min))
+            .unwrap_or(f32::MIN);
         Some(TokenInfo {
             token,
             logprob,

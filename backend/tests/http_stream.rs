@@ -13,11 +13,21 @@ const HEAD: &str =
 /// When `terminate` is false the socket is closed without the final zero chunk, which is what a
 /// server dying mid-stream looks like on the wire.
 async fn serve(pieces: Vec<Vec<u8>>, terminate: bool) -> String {
+    serve_capturing(pieces, terminate).await.0
+}
+
+/// Like `serve`, but also returns a handle that yields the raw request body the client sent.
+async fn serve_capturing(
+    pieces: Vec<Vec<u8>>,
+    terminate: bool,
+) -> (String, tokio::sync::oneshot::Receiver<String>) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
-        drain_request(&mut sock).await;
+        let body = drain_request(&mut sock).await;
+        let _ = tx.send(body);
         sock.write_all(HEAD.as_bytes()).await.unwrap();
         for b in pieces {
             sock.write_all(format!("{:x}\r\n", b.len()).as_bytes())
@@ -33,10 +43,10 @@ async fn serve(pieces: Vec<Vec<u8>>, terminate: bool) -> String {
         }
         let _ = sock.shutdown().await;
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), rx)
 }
 
-async fn drain_request(sock: &mut TcpStream) {
+async fn drain_request(sock: &mut TcpStream) -> String {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -50,11 +60,11 @@ async fn drain_request(sock: &mut TcpStream) {
                 .map(|v| v.trim().parse().unwrap())
                 .unwrap_or(0);
             if buf.len() >= h + 4 + len {
-                return;
+                return String::from_utf8_lossy(&buf[h + 4..h + 4 + len]).into_owned();
             }
         }
         if n == 0 {
-            return;
+            return String::new();
         }
     }
 }
@@ -130,4 +140,58 @@ async fn interrupted_stream_ends_with_error() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].as_ref().unwrap().text, "par");
     assert!(matches!(items[1], Err(EngineError::StreamInterrupted)));
+}
+
+#[tokio::test]
+async fn request_body_asks_for_stream_and_n_probs() {
+    let (url, body) = serve_capturing(
+        vec![piece(
+            "data: {\"content\":\"\",\"stop\":true}
+
+",
+        )],
+        true,
+    )
+    .await;
+    collect(url).await;
+    let sent: serde_json::Value = serde_json::from_str(&body.await.unwrap()).unwrap();
+    assert_eq!(sent["stream"], serde_json::json!(true));
+    assert!(sent["n_probs"].as_u64().unwrap() > 0);
+    assert_eq!(sent["prompt"], "hi");
+}
+
+#[tokio::test]
+async fn invalid_utf8_line_is_protocol_error() {
+    let mut bad = b"data: {\"content\":\"".to_vec();
+    bad.extend_from_slice(&[0xF0, 0x9F]); // truncated emoji, then the line ends
+    bad.extend_from_slice(
+        b"\"}
+
+",
+    );
+    let url = serve(vec![bad], true).await;
+    let items = collect(url).await;
+    assert_eq!(items.len(), 1);
+    assert!(matches!(items[0], Err(EngineError::Protocol(_))));
+}
+
+#[tokio::test]
+async fn legacy_token_missing_from_top_list_is_kept() {
+    let url = serve(
+        vec![
+            piece("data: {\"content\":\"z\",\"stop\":false,\"completion_probabilities\":[{\"content\":\"z\",\"probs\":[{\"tok_str\":\"a\",\"prob\":0.5}]}]}
+
+"),
+            piece("data: {\"content\":\"\",\"stop\":true}
+
+"),
+        ],
+        true,
+    )
+    .await;
+    let items = collect(url).await;
+    let first = items[0].as_ref().unwrap();
+    assert_eq!(first.tokens.len(), 1);
+    assert_eq!(first.tokens[0].token, "z");
+    assert!(first.tokens[0].logprob <= 0.5f32.ln());
 }
