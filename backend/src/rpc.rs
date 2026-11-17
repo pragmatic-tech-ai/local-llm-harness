@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::engine::{Engine, ModelProps, SamplingConfig};
-use crate::session::{ChatSession, TurnRejected};
+use crate::session::{ChatSession, ContextFill, TurnRejected};
 
 const ERR_PARSE: i64 = -32700;
 const ERR_METHOD_NOT_FOUND: i64 = -32601;
@@ -73,6 +73,19 @@ impl RpcError {
     }
 }
 
+/// Why a request failed: a JSON-RPC error (reported to the client as an error response) or a
+/// transport failure (the socket is dead, so the connection ends without a reply).
+enum Failure {
+    Rpc(RpcError),
+    Transport(BoxError),
+}
+
+impl From<RpcError> for Failure {
+    fn from(e: RpcError) -> Self {
+        Self::Rpc(e)
+    }
+}
+
 /// Accepts WebSocket connections forever; each connection gets its own `ChatSession`.
 pub async fn serve(
     listener: TcpListener,
@@ -81,8 +94,13 @@ pub async fn serve(
     system: Option<String>,
 ) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                eprintln!("accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let connection = Connection {
             engine: Arc::clone(&engine),
@@ -128,7 +146,8 @@ impl Connection {
         };
         let frame = match self.dispatch(ws, &request).await {
             Ok(result) => json!({"id": request.id, "result": result}),
-            Err(err) => Self::error_frame(request.id, &err),
+            Err(Failure::Rpc(err)) => Self::error_frame(request.id, &err),
+            Err(Failure::Transport(e)) => return Err(e),
         };
         Self::send_json(ws, frame).await
     }
@@ -137,9 +156,9 @@ impl Connection {
         json!({"id": id, "error": {"code": err.code, "message": err.message}})
     }
 
-    async fn dispatch(&mut self, ws: &mut Ws, req: &Request) -> Result<Value, RpcError> {
+    async fn dispatch(&mut self, ws: &mut Ws, req: &Request) -> Result<Value, Failure> {
         match req.method.as_str() {
-            "model_props" => Self::to_value(&self.props),
+            "model_props" => Ok(Self::to_value(&self.props)?),
             "tokenize" => {
                 let p: TokenizeParams = Self::params(req)?;
                 let result = self
@@ -147,7 +166,7 @@ impl Connection {
                     .tokenize(&p.text)
                     .await
                     .map_err(RpcError::internal)?;
-                Self::to_value(&result)
+                Ok(Self::to_value(&result)?)
             }
             "set_sampling" => {
                 let p: SetSamplingParams = Self::params(req)?;
@@ -159,10 +178,9 @@ impl Connection {
                 self.send_turn(ws, p).await?;
                 Ok(Value::Null)
             }
-            other => Err(RpcError::new(
-                ERR_METHOD_NOT_FOUND,
-                format!("unknown method: {other}"),
-            )),
+            other => {
+                Err(RpcError::new(ERR_METHOD_NOT_FOUND, format!("unknown method: {other}")).into())
+            }
         }
     }
 
@@ -174,33 +192,31 @@ impl Connection {
         serde_json::to_value(v).map_err(RpcError::internal)
     }
 
-    async fn send_turn(&mut self, ws: &mut Ws, p: SendTurnParams) -> Result<(), RpcError> {
-        let (prompt, fill) = self
+    async fn send_turn(&mut self, ws: &mut Ws, p: SendTurnParams) -> Result<(), Failure> {
+        let started = |prompt: &str, fill: ContextFill| json!({"prompt": prompt, "prompt_tokens": fill.used, "n_ctx": fill.total});
+        let turn = match self
             .session
-            .preview_turn(&p.content, p.enable_thinking)
-            .await
-            .map_err(RpcError::internal)?;
-        Self::notify(
-            ws,
-            "turn_started",
-            json!({"prompt": prompt, "prompt_tokens": fill.used, "n_ctx": fill.total}),
-        )
-        .await?;
-
-        let mut stream = match self
-            .session
-            .send(&p.content, &self.sampling, p.enable_thinking)
+            .begin_turn(&p.content, &self.sampling, p.enable_thinking)
             .await
         {
-            Ok(s) => s,
-            Err(TurnRejected::WindowFull { needed, total }) => {
-                let params = json!({"needed": needed, "total": total});
-                return Self::notify(ws, "turn_rejected", params).await;
-            }
-            Err(TurnRejected::Engine(e)) => {
-                return Self::notify(ws, "turn_error", json!({"message": e.to_string()})).await;
+            Ok(t) => t,
+            Err(failure) => {
+                if let (Some(prompt), Some(fill)) = (&failure.prompt, failure.fill) {
+                    Self::notify(ws, "turn_started", started(prompt, fill)).await?;
+                }
+                return match failure.reason {
+                    TurnRejected::WindowFull { needed, total } => {
+                        let params = json!({"needed": needed, "total": total});
+                        Self::notify(ws, "turn_rejected", params).await
+                    }
+                    TurnRejected::Engine(e) => {
+                        Self::notify(ws, "turn_error", json!({"message": e.to_string()})).await
+                    }
+                };
             }
         };
+        Self::notify(ws, "turn_started", started(&turn.prompt, turn.fill)).await?;
+        let mut stream = turn.stream;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
@@ -216,10 +232,10 @@ impl Connection {
         Self::notify(ws, "turn_done", json!({})).await
     }
 
-    async fn notify(ws: &mut Ws, method: &str, params: Value) -> Result<(), RpcError> {
+    async fn notify(ws: &mut Ws, method: &str, params: Value) -> Result<(), Failure> {
         Self::send_json(ws, json!({"method": method, "params": params}))
             .await
-            .map_err(RpcError::internal)
+            .map_err(Failure::Transport)
     }
 
     async fn send_json(ws: &mut Ws, value: Value) -> Result<(), BoxError> {

@@ -23,6 +23,31 @@ pub enum TurnRejected {
     Engine(#[from] EngineError),
 }
 
+/// A started turn: the exact prompt sent to the engine, its context fill, and the reply stream.
+pub struct Turn {
+    pub prompt: String,
+    pub fill: ContextFill,
+    pub stream: BoxStream<'static, Result<CompletionChunk>>,
+}
+
+/// A turn that did not start. `prompt`/`fill` are present whenever rendering got that far.
+#[derive(Debug)]
+pub struct TurnFailure {
+    pub prompt: Option<String>,
+    pub fill: Option<ContextFill>,
+    pub reason: TurnRejected,
+}
+
+impl TurnFailure {
+    fn bare(reason: TurnRejected) -> Self {
+        Self {
+            prompt: None,
+            fill: None,
+            reason,
+        }
+    }
+}
+
 /// A conversation: owns the message list, renders prompts via the engine's chat template,
 /// and refuses turns that would overflow the context window.
 pub struct ChatSession {
@@ -67,29 +92,6 @@ impl ChatSession {
         })
     }
 
-    /// The exact prompt that `send` would render for `user`, plus the fill it implies
-    /// (measured on that prompt). Does not modify the history.
-    pub async fn preview_turn(
-        &self,
-        user: &str,
-        enable_thinking: bool,
-    ) -> Result<(String, ContextFill)> {
-        let mut candidate = self.messages();
-        candidate.push(ChatMessage {
-            role: Role::User,
-            content: user.to_string(),
-        });
-        let prompt = Self::render(&*self.engine, &candidate, enable_thinking).await?;
-        let used = self.engine.tokenize(&prompt).await?.count;
-        Ok((
-            prompt,
-            ContextFill {
-                used,
-                total: self.props.n_ctx,
-            },
-        ))
-    }
-
     /// Starts a turn. Rejects with `WindowFull` before any `complete` call when the prompt
     /// plus `max_tokens` headroom would not fit. A positive `max_tokens` is reserved on top of
     /// the prompt; the default `-1` (unlimited) reserves nothing, so only a prompt that itself
@@ -104,21 +106,56 @@ impl ChatSession {
         cfg: &SamplingConfig,
         enable_thinking: bool,
     ) -> std::result::Result<BoxStream<'static, Result<CompletionChunk>>, TurnRejected> {
+        self.begin_turn(user, cfg, enable_thinking)
+            .await
+            .map(|turn| turn.stream)
+            .map_err(|rejected| rejected.reason)
+    }
+
+    /// Like `send`, but renders the prompt exactly once and exposes it (and the context fill
+    /// measured on it) alongside the stream, or alongside the rejection.
+    pub async fn begin_turn(
+        &mut self,
+        user: &str,
+        cfg: &SamplingConfig,
+        enable_thinking: bool,
+    ) -> std::result::Result<Turn, TurnFailure> {
         let user_message = ChatMessage {
             role: Role::User,
             content: user.to_string(),
         };
         let mut candidate = self.messages();
         candidate.push(user_message.clone());
-        let prompt = Self::render(&*self.engine, &candidate, enable_thinking).await?;
-        let used = self.engine.tokenize(&prompt).await?.count;
-        let needed = used + cfg.max_tokens.max(0) as usize;
+        let prompt = Self::render(&*self.engine, &candidate, enable_thinking)
+            .await
+            .map_err(|e| TurnFailure::bare(e.into()))?;
+        let used = self
+            .engine
+            .tokenize(&prompt)
+            .await
+            .map_err(|e| TurnFailure::bare(e.into()))?
+            .count;
         let total = self.props.n_ctx;
+        let fill = ContextFill { used, total };
+        let needed = used + cfg.max_tokens.max(0) as usize;
         if needed > total {
-            return Err(TurnRejected::WindowFull { needed, total });
+            return Err(TurnFailure {
+                prompt: Some(prompt),
+                fill: Some(fill),
+                reason: TurnRejected::WindowFull { needed, total },
+            });
         }
 
-        let stream = self.engine.complete(&prompt, cfg).await?;
+        let stream = match self.engine.complete(&prompt, cfg).await {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(TurnFailure {
+                    prompt: Some(prompt),
+                    fill: Some(fill),
+                    reason: e.into(),
+                })
+            }
+        };
 
         // Nothing is persisted up front: the user message and the assistant reply are committed
         // together when the stream reaches its stop chunk. An errored or dropped stream leaves
@@ -126,7 +163,7 @@ impl ChatSession {
         let history = Arc::clone(&self.messages);
         let mut pending = Some(user_message);
         let mut reply = String::new();
-        Ok(stream
+        let stream = stream
             .map(move |item| {
                 if let Ok(chunk) = &item {
                     reply.push_str(&chunk.text);
@@ -143,7 +180,12 @@ impl ChatSession {
                 }
                 item
             })
-            .boxed())
+            .boxed();
+        Ok(Turn {
+            prompt,
+            fill,
+            stream,
+        })
     }
 
     async fn render(

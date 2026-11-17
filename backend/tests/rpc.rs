@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use backend::engine::{
@@ -14,6 +14,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 struct FakeEngine {
     token_count: usize,
+    completed_prompts: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -32,9 +33,13 @@ impl Engine for FakeEngine {
     }
     async fn complete(
         &self,
-        _prompt: &str,
+        prompt: &str,
         _cfg: &SamplingConfig,
     ) -> Result<BoxStream<'static, Result<CompletionChunk>>> {
+        self.completed_prompts
+            .lock()
+            .unwrap()
+            .push(prompt.to_string());
         let chunks = ["Hel", "lo"].iter().enumerate().map(|(i, t)| {
             Ok(CompletionChunk {
                 text: t.to_string(),
@@ -64,14 +69,22 @@ fn props() -> ModelProps {
 type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn connect(token_count: usize) -> Client {
+    connect_recording(token_count).await.0
+}
+
+async fn connect_recording(token_count: usize) -> (Client, Arc<Mutex<Vec<String>>>) {
+    let completed_prompts = Arc::new(Mutex::new(Vec::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let engine: Arc<dyn Engine> = Arc::new(FakeEngine { token_count });
+    let engine: Arc<dyn Engine> = Arc::new(FakeEngine {
+        token_count,
+        completed_prompts: Arc::clone(&completed_prompts),
+    });
     tokio::spawn(rpc::serve(listener, engine, props(), None));
     let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
         .await
         .unwrap();
-    ws
+    (ws, completed_prompts)
 }
 
 async fn send(ws: &mut Client, id: u64, method: &str, params: Value) {
@@ -148,4 +161,15 @@ async fn ws_window_full_emits_rejected() {
         .find(|n| n["method"] == "turn_rejected")
         .unwrap();
     assert_eq!(rejected["params"], json!({"needed": 500, "total": 100}));
+}
+
+#[tokio::test]
+async fn ws_turn_started_prompt_is_exactly_what_complete_receives() {
+    let (mut ws, completed) = connect_recording(7).await;
+    let params = json!({"content": "hi", "enable_thinking": false});
+    send(&mut ws, 1, "send_turn", params).await;
+    let (notes, _resp) = collect(&mut ws, 1).await;
+    let shown = notes[0]["params"]["prompt"].as_str().unwrap().to_string();
+    let sent = completed.lock().unwrap().clone();
+    assert_eq!(sent, vec![shown]);
 }
