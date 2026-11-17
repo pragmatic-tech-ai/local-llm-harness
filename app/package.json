@@ -1,0 +1,20 @@
+{
+  "name": "local-llm-harness-app",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "npm run build && electron .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@pragmatic-tech-ai/mural": "^0.66.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "electron": "^45.3.3",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
