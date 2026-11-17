@@ -1,0 +1,11 @@
+# Rust
+/target
+**/target
+Cargo.lock
+# Node / Electron
+node_modules/
+dist/
+out/
+*.log
+# SDD scratch (git-ignored)
+.superpowers/
