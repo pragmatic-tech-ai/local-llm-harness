@@ -64,8 +64,8 @@ export class ChatViewModel extends Observable
     /** A turn is in flight while `current` is set; sends are blocked until a terminal notification clears it. */
     private Send(): void
     {
-        const draft = this._draft
-        if (draft.trim().length === 0 || this.current !== null)
+        const draft = this._draft.trim()
+        if (draft.length === 0 || this.current !== null)
         {
             return
         }

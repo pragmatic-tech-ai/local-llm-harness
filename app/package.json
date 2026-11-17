@@ -11,6 +11,7 @@
     "test": "vitest run",
     "pretest": "npm run compile:mu",
     "typecheck:node": "tsc -p tsconfig.node.json --noEmit",
+    "pretypecheck:web": "npm run compile:mu",
     "typecheck:web": "tsc -p tsconfig.web.json --noEmit"
   },
   "dependencies": {

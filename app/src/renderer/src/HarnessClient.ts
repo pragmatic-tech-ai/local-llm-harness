@@ -115,6 +115,7 @@ export class HarnessClient
     private static readonly NoteTurnError = 'turn_error'
     private static readonly NoteTurnRejected = 'turn_rejected'
     private static readonly NotConnectedMessage = 'Harness not connected'
+    private static readonly SocketErrorMessage = 'Harness socket error'
     private static readonly RpcErrorFallback = 'RPC error'
 
     public readonly OnTurnStarted = new TurnSignal<TurnStarted>()
@@ -152,7 +153,15 @@ export class HarnessClient
             }
         }
         socket.onmessage = (ev) => this.HandleFrame(String(ev.data))
-        socket.onclose = () => this.RejectAllPending()
+        socket.onerror = () => console.error(HarnessClient.SocketErrorMessage)
+        socket.onclose = () =>
+        {
+            this.RejectAllPending()
+            if (this.socket === socket)
+            {
+                this.socket = null
+            }
+        }
     }
 
     public ModelProps(): Promise<ModelProps>

@@ -18,12 +18,20 @@ export class MainApplication
     private static readonly PreloadFile = '../preload/index.js'
     private static readonly RendererFile = '../renderer/index.html'
     private static readonly RendererUrlEnv = 'ELECTRON_RENDERER_URL'
+    private static readonly ServerUrlEnv = 'HARNESS_SERVER_URL'
+    private static readonly ModelEnv = 'HARNESS_MODEL'
+    private static readonly BindEnv = 'HARNESS_BIND'
     private static readonly ExitMessage = 'sidecar exited unexpectedly: '
     private static readonly StartFailedMessage = 'sidecar failed to start: '
     private static readonly WindowWidth = 1280
     private static readonly WindowHeight = 800
 
-    private readonly sidecar = new Sidecar()
+    // Unset env vars fall back to the Sidecar defaults.
+    private readonly sidecar = new Sidecar({
+        serverUrl: process.env[MainApplication.ServerUrlEnv],
+        model: process.env[MainApplication.ModelEnv],
+        bind: process.env[MainApplication.BindEnv],
+    })
     private quitting = false
     private startPromise: Promise<unknown> | null = null
 
