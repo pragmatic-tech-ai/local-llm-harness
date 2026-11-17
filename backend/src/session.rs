@@ -67,7 +67,9 @@ impl ChatSession {
         })
     }
 
-    /// Starts a turn. Rejects with `WindowFull` before any `complete` call when the prompt plus
+    /// Starts a turn. `max_tokens` headroom: a positive value is reserved on top of the prompt;
+    /// the default `-1` (unlimited) reserves nothing, so only a prompt that itself overflows the
+    /// window is rejected (the intended warn-and-stop behaviour). Rejects with `WindowFull` before any `complete` call when the prompt plus
     /// `max_tokens` headroom would not fit. On success the user message is recorded and the
     /// returned stream appends the assistant reply to the history when it finishes.
     pub async fn send(
@@ -91,22 +93,26 @@ impl ChatSession {
         }
 
         let stream = self.engine.complete(&prompt, cfg).await?;
-        self.messages
-            .lock()
-            .expect("messages lock")
-            .push(user_message);
 
+        // Nothing is persisted up front: the user message and the assistant reply are committed
+        // together when the stream reaches its stop chunk. An errored or dropped stream leaves
+        // the history untouched, so it always stays a valid alternating sequence.
         let history = Arc::clone(&self.messages);
+        let mut pending = Some(user_message);
         let mut reply = String::new();
         Ok(stream
             .map(move |item| {
                 if let Ok(chunk) = &item {
                     reply.push_str(&chunk.text);
                     if chunk.stop {
-                        history.lock().expect("messages lock").push(ChatMessage {
-                            role: Role::Assistant,
-                            content: std::mem::take(&mut reply),
-                        });
+                        if let Some(user_message) = pending.take() {
+                            let mut history = history.lock().expect("messages lock");
+                            history.push(user_message);
+                            history.push(ChatMessage {
+                                role: Role::Assistant,
+                                content: std::mem::take(&mut reply),
+                            });
+                        }
                     }
                 }
                 item
@@ -270,6 +276,46 @@ mod tests {
         ));
         assert_eq!(engine.complete_calls.load(Ordering::SeqCst), 0);
         assert!(session.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn max_tokens_headroom_is_reserved() {
+        let engine = FakeEngine::new(4000);
+        let mut session = ChatSession::new(engine.clone(), props(4096), None);
+        let cfg = SamplingConfig {
+            max_tokens: 200,
+            ..SamplingConfig::default()
+        };
+        let result = session.send("hi", &cfg, false).await;
+        assert!(matches!(
+            result,
+            Err(TurnRejected::WindowFull {
+                needed: 4200,
+                total: 4096
+            })
+        ));
+        assert_eq!(engine.complete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_leaves_history_untouched() {
+        let engine = FakeEngine::new(10);
+        let mut session = ChatSession::new(engine.clone(), props(4096), None);
+        let cfg = SamplingConfig::default();
+        let mut stream = session.send("first", &cfg, false).await.unwrap();
+        // Read one chunk (not the stop chunk), then drop the stream.
+        assert!(stream.next().await.is_some());
+        drop(stream);
+        assert!(session.messages().is_empty());
+
+        let mut stream = session.send("second", &cfg, false).await.unwrap();
+        while stream.next().await.is_some() {}
+        assert_eq!(
+            session.messages(),
+            vec![msg(Role::User, "second"), msg(Role::Assistant, "Hello")]
+        );
+        let calls = engine.template_calls.lock().unwrap();
+        assert_eq!(calls[1].0, vec![msg(Role::User, "second")]);
     }
 
     #[tokio::test]
