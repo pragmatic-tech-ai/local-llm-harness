@@ -52,6 +52,19 @@ export interface TurnRejected
     total: number
 }
 
+/** The subset of WebSocket the client uses; lets tests substitute a fake. */
+export interface IHarnessSocket
+{
+    readyState: number
+    send(data: string): void
+    onopen: ((ev: unknown) => void) | null
+    onmessage: ((ev: { data: unknown }) => void) | null
+    onclose: ((ev: unknown) => void) | null
+    onerror: ((ev: unknown) => void) | null
+}
+
+export type HarnessSocketFactory = (url: string) => IHarnessSocket
+
 interface IPending
 {
     resolve: (value: unknown) => void
@@ -61,6 +74,7 @@ interface IPending
 /** Typed signal: handlers subscribe, the client raises (mirrors SidecarExitSignal). */
 export class TurnSignal<T>
 {
+    private static readonly HandlerFailedMessage = 'Turn signal handler threw'
     private readonly handlers: ((payload: T) => void)[] = []
 
     public Subscribe(handler: (payload: T) => void): void
@@ -72,7 +86,14 @@ export class TurnSignal<T>
     {
         for (const handler of this.handlers)
         {
-            handler(payload)
+            try
+            {
+                handler(payload)
+            }
+            catch (e)
+            {
+                console.error(TurnSignal.HandlerFailedMessage, e)
+            }
         }
     }
 }
@@ -93,7 +114,7 @@ export class HarnessClient
     private static readonly NoteTurnDone = 'turn_done'
     private static readonly NoteTurnError = 'turn_error'
     private static readonly NoteTurnRejected = 'turn_rejected'
-    private static readonly NotConnectedMessage = 'Harness connection closed'
+    private static readonly NotConnectedMessage = 'Harness not connected'
     private static readonly RpcErrorFallback = 'RPC error'
 
     public readonly OnTurnStarted = new TurnSignal<TurnStarted>()
@@ -102,39 +123,36 @@ export class HarnessClient
     public readonly OnTurnError = new TurnSignal<TurnError>()
     public readonly OnTurnRejected = new TurnSignal<TurnRejected>()
 
-    private socket: WebSocket | null = null
-    private connected = false
+    private static readonly SocketConnecting = 0
+    private static readonly SocketOpen = 1
+
+    private socket: IHarnessSocket | null = null
     private nextId = 1
     private readonly pending = new Map<number, IPending>()
     private readonly queue: string[] = []
 
+    constructor(private readonly socketFactory: HarnessSocketFactory = (url) => new WebSocket(url) as unknown as IHarnessSocket)
+    {
+    }
+
     public get IsConnected(): boolean
     {
-        return this.connected
+        return this.socket !== null && this.socket.readyState === HarnessClient.SocketOpen
     }
 
     public Connect(url: string): void
     {
-        const socket = new WebSocket(url)
+        const socket = this.socketFactory(url)
         this.socket = socket
         socket.onopen = () =>
         {
-            this.connected = true
             for (const frame of this.queue.splice(0))
             {
                 socket.send(frame)
             }
         }
-        socket.onmessage = (ev: MessageEvent) => this.HandleFrame(String(ev.data))
-        socket.onclose = () =>
-        {
-            this.connected = false
-            this.RejectAllPending()
-        }
-        socket.onerror = () =>
-        {
-            this.connected = false
-        }
+        socket.onmessage = (ev) => this.HandleFrame(String(ev.data))
+        socket.onclose = () => this.RejectAllPending()
     }
 
     public ModelProps(): Promise<ModelProps>
@@ -158,14 +176,27 @@ export class HarnessClient
         await this.Request<null>(HarnessClient.MethodSendTurn, { content, enable_thinking: enableThinking })
     }
 
-    /** Parses one text frame: responses (have id) settle pending requests; notifications raise events. */
+    /** Parses one text frame: responses (have id) settle pending requests; notifications raise events. Malformed frames are ignored. */
     public HandleFrame(raw: string): void
     {
-        const frame = JSON.parse(raw) as {
-            id?: number
+        let parsed: unknown
+        try
+        {
+            parsed = JSON.parse(raw)
+        }
+        catch
+        {
+            return
+        }
+        if (typeof parsed !== 'object' || parsed === null)
+        {
+            return
+        }
+        const frame = parsed as {
+            id?: unknown
             result?: unknown
-            error?: { code?: number, message?: string }
-            method?: string
+            error?: { code?: number, message?: string } | null
+            method?: unknown
             params?: unknown
         }
         if (typeof frame.id === 'number')
@@ -176,7 +207,7 @@ export class HarnessClient
                 return
             }
             this.pending.delete(frame.id)
-            if (frame.error !== undefined)
+            if (frame.error !== undefined && frame.error !== null)
             {
                 entry.reject(new Error(frame.error.message ?? HarnessClient.RpcErrorFallback))
             }
@@ -216,14 +247,21 @@ export class HarnessClient
 
     private Request<T>(method: string, params: unknown): Promise<T>
     {
+        const socket = this.socket
+        // Queue only while the socket is actually connecting; otherwise it will
+        // never flush, so fail fast instead of hanging forever.
+        if (socket === null || (socket.readyState !== HarnessClient.SocketConnecting && socket.readyState !== HarnessClient.SocketOpen))
+        {
+            return Promise.reject(new Error(HarnessClient.NotConnectedMessage))
+        }
         const id = this.nextId++
         const frame = JSON.stringify({ id, method, params })
         return new Promise<T>((resolve, reject) =>
         {
             this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject })
-            if (this.connected && this.socket !== null)
+            if (socket.readyState === HarnessClient.SocketOpen)
             {
-                this.socket.send(frame)
+                socket.send(frame)
             }
             else
             {

@@ -6,12 +6,9 @@ import { AssistantMessage, UserMessage } from './messages'
 export class ChatViewModel extends Observable
 {
     private static readonly DraftProperty = 'Draft'
-    private static readonly ErrorPrefix = '\n[error: '
-    private static readonly Suffix = ']'
-    private static readonly RejectedPrefix = '\n[context window full: needed '
-    private static readonly RejectedOf = ' of '
-    private static readonly RejectedSuffix = ' tokens]'
-    private static readonly SendFailedPrefix = '\n[send failed: '
+    private static readonly ErrorFormat = '\n[error: {0}]'
+    private static readonly RejectedFormat = '\n[context window full: needed {0} of {1} tokens]'
+    private static readonly SendFailedFormat = '\n[send failed: {0}]'
 
     public readonly Transcript = new ObservableCollection<UserMessage | AssistantMessage>()
     public EnableThinking = false
@@ -35,20 +32,9 @@ export class ChatViewModel extends Observable
             }
         })
         client.OnTurnChunk.Subscribe(p => this.current?.Append(p.text))
-        client.OnTurnDone.Subscribe(() =>
-        {
-            this.current = null
-        })
-        client.OnTurnError.Subscribe(p =>
-        {
-            this.current?.Append(ChatViewModel.ErrorPrefix + p.message + ChatViewModel.Suffix)
-            this.current = null
-        })
-        client.OnTurnRejected.Subscribe(p =>
-        {
-            this.current?.Append(ChatViewModel.RejectedPrefix + p.needed + ChatViewModel.RejectedOf + p.total + ChatViewModel.RejectedSuffix)
-            this.current = null
-        })
+        client.OnTurnDone.Subscribe(() => this.EndTurn(null))
+        client.OnTurnError.Subscribe(p => this.EndTurn(ChatViewModel.Format(ChatViewModel.ErrorFormat, p.message)))
+        client.OnTurnRejected.Subscribe(p => this.EndTurn(ChatViewModel.Format(ChatViewModel.RejectedFormat, p.needed, p.total)))
     }
 
     public get Draft(): string
@@ -73,10 +59,11 @@ export class ChatViewModel extends Observable
         return this._submitCommand
     }
 
+    /** A turn is in flight while `current` is set; sends are blocked until a terminal notification clears it. */
     private Send(): void
     {
         const draft = this._draft
-        if (draft.trim().length === 0)
+        if (draft.trim().length === 0 || this.current !== null)
         {
             return
         }
@@ -85,10 +72,39 @@ export class ChatViewModel extends Observable
         const reply = new AssistantMessage('')
         this.Transcript.Add(reply)
         this.current = reply
-        this.client.SendTurn(draft, this.EnableThinking).catch((e: Error) =>
+        this.client.SendTurn(draft, this.EnableThinking).then(
+            () => this.ClearIfCurrent(reply),
+            (e: Error) =>
+            {
+                // Only a still-active turn reports: after a terminal notification
+                // current !== reply, so no duplicate note follows [error: ...].
+                if (this.current === reply)
+                {
+                    reply.Append(ChatViewModel.Format(ChatViewModel.SendFailedFormat, e.message))
+                    this.current = null
+                }
+            })
+    }
+
+    private ClearIfCurrent(reply: AssistantMessage): void
+    {
+        if (this.current === reply)
         {
-            reply.Append(ChatViewModel.SendFailedPrefix + e.message + ChatViewModel.Suffix)
             this.current = null
-        })
+        }
+    }
+
+    private EndTurn(note: string | null): void
+    {
+        if (note !== null)
+        {
+            this.current?.Append(note)
+        }
+        this.current = null
+    }
+
+    private static Format(template: string, ...values: unknown[]): string
+    {
+        return template.replace(/\{(\d+)\}/g, (_m, i: string) => String(values[Number(i)]))
     }
 }

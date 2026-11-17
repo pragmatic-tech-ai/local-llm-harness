@@ -6,14 +6,7 @@ import AssistantMessage from "../messages.js"
 resources ChatResources {
     DataTemplate [ DataType = ChatViewModel ] {
         DockPanel [ LastChildFill = true, Margin = (12,12,12,12) ] {
-            resources: {
-                // Enter-to-send. SubmitsOnEnter leaves a plain Return unhandled, so
-                // KeyDown bubbles to this DockPanel; SubmitCommand sends only on Return.
-                Style [ TargetType = DockPanel ] {
-                    on KeyDown { InvokeCommand [ Command = $SubmitCommand ] }
-                }
-            }
-            DockPanel [ DockPanel.Dock = Bottom, LastChildFill = true, Margin = (0,8,0,0) ] {
+            DockPanel [ DockPanel.Dock = Bottom, Style = @ComposerSubmitStyle, LastChildFill = true, Margin = (0,8,0,0) ] {
                 Button [ DockPanel.Dock = Right, Command = $SendCommand, Margin = (6,0,0,0), VerticalAlignment = Bottom ] {
                     TextBlock [ Text = "Send" ]
                 }
@@ -24,6 +17,13 @@ resources ChatResources {
                 ItemsControl [ ItemsSource = $Transcript, ItemsPanel = @VerticalStackPanel ]
             }
         }
+    }
+
+    // Enter-to-send. SubmitsOnEnter leaves a plain Return unhandled, so KeyDown
+    // bubbles from the TextBox to the composer DockPanel, which references this
+    // style explicitly (not implicit) so no other DockPanel fires it.
+    Style x:key="ComposerSubmitStyle" [ TargetType = DockPanel ] {
+        on KeyDown { InvokeCommand [ Command = $SubmitCommand ] }
     }
 
     ItemsPanelTemplate x:key="VerticalStackPanel" {
