@@ -85,3 +85,19 @@ async fn connection_refused_is_typed() {
         Err(EngineError::ConnectionRefused)
     ));
 }
+
+#[tokio::test]
+async fn malformed_200_body_is_protocol_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tokenize"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"unexpected": true})))
+        .mount(&server)
+        .await;
+
+    let engine = HttpEngine::new(server.uri());
+    assert!(matches!(
+        engine.tokenize("x").await,
+        Err(EngineError::Protocol(_))
+    ));
+}
