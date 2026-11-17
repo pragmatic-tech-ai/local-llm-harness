@@ -59,7 +59,7 @@ pub struct TokenizeResult {
 }
 
 /// Model properties, (de)serialized in llama.cpp's `/props` shape:
-/// `{"default_generation_settings":{"n_ctx":N},"model":"..."}`.
+/// `{"default_generation_settings":{"n_ctx":N},"model_path":"..."}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "RawProps", into = "RawProps")]
 pub struct ModelProps {
@@ -70,7 +70,7 @@ pub struct ModelProps {
 #[derive(Serialize, Deserialize)]
 struct RawProps {
     default_generation_settings: RawGenerationSettings,
-    model: String,
+    model_path: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,7 +82,7 @@ impl From<RawProps> for ModelProps {
     fn from(raw: RawProps) -> Self {
         Self {
             n_ctx: raw.default_generation_settings.n_ctx,
-            model_name: raw.model,
+            model_name: raw.model_path,
         }
     }
 }
@@ -91,7 +91,7 @@ impl From<ModelProps> for RawProps {
     fn from(p: ModelProps) -> Self {
         Self {
             default_generation_settings: RawGenerationSettings { n_ctx: p.n_ctx },
-            model: p.model_name,
+            model_path: p.model_name,
         }
     }
 }
@@ -122,10 +122,10 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&props).unwrap()).unwrap();
         assert_eq!(props, back);
 
-        let raw = r#"{"default_generation_settings":{"n_ctx":4096}, "model":"llama.gguf"}"#;
+        let raw = r#"{"default_generation_settings":{"n_ctx":4096}, "model_path":"C:\\models\\gemma-4-12B-it-QAT-Q4_0.gguf","model_alias":"gemma","model_ftype":"Q4_0"}"#;
         let p: ModelProps = serde_json::from_str(raw).unwrap();
         assert_eq!(p.n_ctx, 4096);
-        assert_eq!(p.model_name, "llama.gguf");
+        assert_eq!(p.model_name, r"C:\models\gemma-4-12B-it-QAT-Q4_0.gguf");
     }
 
     #[test]
@@ -151,9 +151,9 @@ mod tests {
 
     #[test]
     fn props_missing_n_ctx_fails_to_deserialize() {
-        let raw = r#"{"default_generation_settings":{}, "model":"m.gguf"}"#;
+        let raw = r#"{"default_generation_settings":{}, "model_path":"m.gguf"}"#;
         assert!(serde_json::from_str::<ModelProps>(raw).is_err());
-        let raw = r#"{"model":"m.gguf"}"#;
+        let raw = r#"{"model_path":"m.gguf"}"#;
         assert!(serde_json::from_str::<ModelProps>(raw).is_err());
     }
 }

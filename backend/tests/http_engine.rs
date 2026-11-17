@@ -44,7 +44,9 @@ async fn props_reads_n_ctx() {
         .and(path("/props"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "default_generation_settings": {"n_ctx": 4096},
-            "model": "llama.gguf"
+            "model_path": "C:\\models\\gemma-4-12B-it-QAT-Q4_0.gguf",
+            "model_alias": "gemma",
+            "model_ftype": "Q4_0"
         })))
         .mount(&server)
         .await;
@@ -52,7 +54,7 @@ async fn props_reads_n_ctx() {
     let engine = HttpEngine::new(server.uri());
     let props = engine.props().await.unwrap();
     assert_eq!(props.n_ctx, 4096);
-    assert_eq!(props.model_name, "llama.gguf");
+    assert_eq!(props.model_name, r"C:\models\gemma-4-12B-it-QAT-Q4_0.gguf");
 }
 
 #[tokio::test]
