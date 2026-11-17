@@ -169,10 +169,18 @@ remains a *standalone app that uses* mural — it is not wired into Plexus or th
 - **Backend↔frontend transport:** local **WebSocket / JSON-RPC**, Electron spawning the
   Rust backend as a sidecar (not a native Node addon).
 - **First model:** `gemma-4-12B-it-QAT-Q4_0.gguf`, reused in place from the
-  hive-laptop's LM Studio model directory (no re-download). Prompt built by hand with
-  **Gemma's turn template** (`<start_of_turn>…<end_of_turn>`); Gemma has no distinct
-  system role, so any system text is folded into the first user turn. A smaller GGUF
-  can be dropped in later via config for faster, packed-context experiments.
+  hive-laptop's LM Studio model directory (no re-download). A smaller GGUF can be
+  dropped in later via config for faster, packed-context experiments.
+- **Prompt rendering (revised after live discovery, user decision):** Gemma 4 is a
+  *thinking* model whose real chat template is an 18 KB Jinja with an unusual token
+  scheme (`<|turn>{role}`, `<turn|>`, `<|channel>thought`) and a thinking on/off
+  switch — far too complex and model-specific to hand-reimplement. So the harness owns
+  the **message list, sampling, and a thinking on/off toggle**, and renders the prompt
+  via llama-server's **`/apply-template`**, which returns the exact prompt string. That
+  string is what the instrument panel DISPLAYS and what we send to native
+  `/completion`. The "own the prompt" goal is served by showing the real bytes, not by
+  re-deriving Google's template. (`/v1/chat/completions` was rejected — it hides the
+  prompt.)
 - **Project location:** standalone at `D:\local-llm-harness` (this doc lives under
   `docs/specs/`).
 - **Context-window-full policy (phase A): warn and stop, don't silently manage.** When

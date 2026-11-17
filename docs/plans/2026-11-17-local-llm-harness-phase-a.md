@@ -16,7 +16,7 @@
 - Backend is a **standalone process with a configurable bind address** (default `127.0.0.1`, overridable to `0.0.0.0`), spawned by Electron as a sidecar — **not** a native Node addon.
 - Phase A applies sampling knobs to the **next turn only**; no mid-generation mutation.
 - Context-window-full policy: **warn and stop**. Never auto-truncate or summarize. The raw-prompt view always shows the real, untruncated history.
-- Prompt is **built by hand** in the backend (**Gemma turn template** for the default Gemma-4 model), not delegated to `/v1/chat/completions`. Phase A uses llama.cpp's **native** endpoints (`/completion`, `/tokenize`, `/detokenize`, `/props`).
+- Prompt is **rendered via llama-server's `/apply-template`** from the message list (user decision). We own message assembly, sampling, and a **thinking on/off** toggle (Gemma 4 is a reasoning model); llama-server applies the model's real 18 KB chat template and returns the exact prompt string, which we DISPLAY in the instrument panel and send to native `/completion`. We do NOT hand-reimplement the Gemma template, and we do NOT use `/v1/chat/completions` (it hides the prompt). Phase A uses llama.cpp's **native** endpoints (`/apply-template`, `/completion`, `/tokenize`, `/detokenize`, `/props`).
 - Context size comes from the server's actual `n_ctx` via `/props` — never hardcoded.
 - **Deployment:** `llama-server` runs on the **hive-laptop** (`192.168.1.101`, 6 GB laptop GPU, partial CPU offload for the 12B), bound to the LAN; the Rust sidecar reaches it via `--server-url`. Sidecar + Electron run on the dev machine. (Prerequisite, not a code task: a CUDA `llama-server` present on the hive-laptop, loading the GGUF below — see "Prerequisite" after the tasks.)
 - Conventions by layer: **Rust** = `snake_case` + `rustfmt`. **mural/TS** = OOP (no module-level free functions / mutable module state), Allman braces, PascalCase public methods/interfaces, string literals hoisted to named class constants, VMs extend `Observable`.
@@ -104,23 +104,30 @@
 - Create: `backend/src/session.rs`
 - Test: `backend/src/session.rs` (`#[cfg(test)]`, fake `Engine`)
 
+This task ALSO extends the engine seam: the prompt is rendered by the engine via
+llama-server's `/apply-template`, not hand-built. Add one method to the `Engine` trait
+(Task 1, `mod.rs`), implement it on `HttpEngine` (`http.rs`), and have `ChatSession`
+use it.
+
 **Interfaces:**
-- Consumes: `Engine`, types (Task 1).
+- Consumes: `Engine`, types (Task 1); `HttpEngine` (Tasks 2–3).
 - Produces:
+  - Engine trait addition: `apply_template(&self, messages: &[ChatMessage], add_generation_prompt: bool, enable_thinking: bool) -> Result<String>` — POSTs the message list to llama-server `/apply-template` and returns the rendered prompt string. `HttpEngine` implements it; the fake `Engine` in tests returns a canned string.
   - `ChatSession::new(engine, props: ModelProps, system: Option<String>)`
-  - `build_prompt(&self) -> String` (Gemma turn template; no distinct system role —
-    system text, if any, is prepended into the first user turn)
+  - `build_prompt(&self, enable_thinking: bool) -> Result<String>` — async; assembles the message list (system as its own message or folded per the model, since Gemma has no system role) and delegates to `engine.apply_template(..)`. Returns the exact rendered prompt (also what the UI displays).
   - `context_fill(&self) -> Result<ContextFill>` where `ContextFill { used: usize, total: usize }`
-  - `send(&mut self, user: &str, cfg: &SamplingConfig) -> Result<BoxStream<..CompletionChunk..>, TurnRejected>` with `TurnRejected::WindowFull { needed: usize, total: usize }`
+  - `send(&mut self, user: &str, cfg: &SamplingConfig, enable_thinking: bool) -> Result<BoxStream<..CompletionChunk..>, TurnRejected>` with `TurnRejected::WindowFull { needed: usize, total: usize }`
 
 - [ ] **Step 1: Write the failing tests** —
-  - `build_prompt_is_gemma`: system "S" + user "hi" → exact string `"<start_of_turn>user\nS\n\nhi<end_of_turn>\n<start_of_turn>model\n"` (system folded into the first user turn; confirm the exact separator against the model's tokenizer/template metadata and adjust the assertion to match).
+  - `apply_template_maps_llama_endpoint` (in `backend/tests/` against a mock, like Task 2's): POST `/apply-template` with a messages body returns `{"prompt":"<rendered>"}`; assert `apply_template(..)` returns `"<rendered>"` and that the request body carried the messages and the `add_generation_prompt`/thinking flags. (The exact Gemma token format is the server's responsibility — do NOT assert a hand-written template string.)
+  - `build_prompt_delegates_to_apply_template`: with a fake `Engine` whose `apply_template` returns a sentinel string, `build_prompt(..)` returns that sentinel and passes the assembled messages (system + user) through. Assert the fake received the expected message list and `add_generation_prompt = true`.
+  - `thinking_toggle_is_forwarded`: `build_prompt(enable_thinking=false)` forwards `enable_thinking=false` to `apply_template`; `true` forwards `true`. (Assert via the fake engine's recorded argument.)
   - `context_fill_uses_props_n_ctx`: fake engine reports `tokenize` count 10, props `n_ctx` 4096 → `ContextFill { used: 10, total: 4096 }` (Review Focus — real n_ctx).
   - `oversized_first_message_is_rejected`: fake engine returns a token count > `n_ctx` for the first user turn → `send` returns `Err(TurnRejected::WindowFull{..})` and makes **no** `complete` call (Review Focus — oversized first message; assert the fake's `complete` counter stayed 0).
-- [ ] **Step 2: Run to verify they fail** — `cargo test -p backend session` → FAIL.
-- [ ] **Step 3: Implement** `ChatSession`: append message, build ChatML prompt, tokenize to get `used`, compare against `props.n_ctx` (reserve `max_tokens` headroom), reject with `WindowFull` before any `complete`; otherwise return the engine stream and append the assistant reply on completion.
+- [ ] **Step 2: Run to verify they fail** — `cargo test -p backend` → FAIL.
+- [ ] **Step 3: Implement** the trait method + `HttpEngine::apply_template` (POST `/apply-template`, reuse `check_status`/`read_json`), then `ChatSession`: append message, `build_prompt` via `apply_template`, `tokenize` the rendered prompt to get `used`, compare against `props.n_ctx` (reserve `max_tokens` headroom), reject with `WindowFull` before any `complete`; otherwise return the engine stream and append the assistant reply on completion.
 - [ ] **Step 4: Run to verify they pass** — same command → PASS.
-- [ ] **Step 5: Commit** — `feat(backend): chat session with warn-and-stop`.
+- [ ] **Step 5: Commit** — `feat(backend): chat session, apply-template prompt, warn-and-stop`.
 
 ---
 
@@ -136,12 +143,12 @@
   - `model_props() -> ModelProps`
   - `tokenize({text}) -> TokenizeResult`
   - `set_sampling({config})` (stored, applied next `send_turn`)
-  - `send_turn({content})` → emits a stream of notifications `turn_chunk` (`{text, tokens, stop}`), terminating with `turn_done` or `turn_error`; and `turn_rejected` (`{needed,total}`) when the window is full.
+  - `send_turn({content, enable_thinking})` → first emits `turn_started` (`{prompt, prompt_tokens, n_ctx}` — the exact rendered prompt from `/apply-template` plus the context-fill numbers, for the instrument panel's raw-prompt view and meter); then a stream of `turn_chunk` (`{text, tokens, stop}`), terminating with `turn_done` or `turn_error`; or `turn_rejected` (`{needed,total}`) instead of any chunk when the window is full. `enable_thinking` is forwarded to `ChatSession`/`build_prompt`. (The `turn_started` prompt + context-fill fields resolve the pre-flight gap: the UI needs the real prompt and `used`/`total`, which the wire surface must carry.)
   - CLI/env config: `--bind <addr:port>` (default `127.0.0.1:8777`), `--server-url <llama-server url>`, `--model <name>`.
 
 - [ ] **Step 1: Write the failing tests** —
   - `ws_tokenize_roundtrips`: connect, call `tokenize`, assert the result matches the fake engine.
-  - `ws_send_turn_streams_then_done`: call `send_turn`, assert ordered `turn_chunk`* then `turn_done`.
+  - `ws_send_turn_streams_started_then_done`: call `send_turn`, assert the first notification is `turn_started` carrying `prompt`, `prompt_tokens`, `n_ctx`, then ordered `turn_chunk`* then `turn_done`.
   - `ws_window_full_emits_rejected`: fake engine forces overflow; assert a `turn_rejected` notification with `needed`/`total`, and no `turn_chunk`.
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p backend --test rpc` → FAIL.
 - [ ] **Step 3: Implement** the WS server (axum ws or tokio-tungstenite) dispatching JSON-RPC to `ChatSession`; `main.rs` parses config, builds `HttpEngine`, fetches `/props`, binds the configured address.
@@ -175,7 +182,7 @@
 
 **Interfaces:**
 - Consumes: the JSON-RPC surface (Task 5), the sidecar url (Task 6).
-- Produces: `HarnessClient` — `Connect(url)`, `SendTurn(content)`, events/callbacks for `TurnChunk`, `TurnDone`, `TurnError`, `TurnRejected`; `ChatViewModel extends Observable` holding the transcript and the streaming-reply buffer.
+- Produces: `HarnessClient` — the full client wrapper over the Task 5 RPC surface: `Connect(url)`, `SendTurn(content, enableThinking)`, `SetSampling(config)`, `Tokenize(text)`, `ModelProps()`, and events/callbacks for `TurnStarted` (`{prompt, promptTokens, nCtx}`), `TurnChunk`, `TurnDone`, `TurnError`, `TurnRejected` (Task 8 depends on this full surface — pre-flight ruling); `ChatViewModel extends Observable` holding the transcript and the streaming-reply buffer. (`SetSampling`/`Tokenize`/`ModelProps` may be thin passthroughs here, fully exercised in Task 8.)
 
 - [ ] **Step 1: Write the failing test** — `MapsTurnChunkNotificationsToText`: feed the client a sequence of `turn_chunk` then `turn_done` frames (fake socket); assert it raises `TurnChunk` per frame with the right text and `TurnDone` last.
 - [ ] **Step 2: Run to verify it fails** — `npm --prefix app test -- HarnessClient` → FAIL.
@@ -193,8 +200,8 @@
 - Test: `app/src/InstrumentPanelViewModel.test.ts`
 
 **Interfaces:**
-- Consumes: `HarnessClient` (`set_sampling`, `tokenize`, `model_props`), `TurnChunk` token/logprob data, `TurnRejected`.
-- Produces: `InstrumentPanelViewModel extends Observable` exposing: sampling knobs (temperature/top-p/top-k/repeat-penalty/seed/max-tokens) with an `ApplyNext` semantic; the **raw outgoing prompt** (as sent); token-count + **context-fill** meter (`used`/`total`); per-token **logprob** list for the last reply; a **tokenization** view (text → tokens via `tokenize`).
+- Consumes: `HarnessClient` (`set_sampling`, `tokenize`, `model_props`), the `TurnStarted` event (`prompt`, `prompt_tokens`, `n_ctx`), `TurnChunk` token/logprob data, `TurnRejected`.
+- Produces: `InstrumentPanelViewModel extends Observable` exposing: sampling knobs (temperature/top-p/top-k/repeat-penalty/seed/max-tokens) with an `ApplyNext` semantic; a **thinking on/off** toggle (also `ApplyNext`, forwarded as `enable_thinking` on the next `SendTurn`); the **raw outgoing prompt** (taken from `TurnStarted.prompt` — the real `/apply-template` output); token-count + **context-fill** meter (`used` = `TurnStarted.prompt_tokens`, `total` = `n_ctx`); per-token **logprob** list for the last reply (render the `f32::MIN` logprob sentinel as "n/a", not a huge negative number); a **tokenization** view (text → tokens via `tokenize`).
 
 - [ ] **Step 1: Write the failing tests** —
   - `KnobEditsApplyToNextTurnNotCurrent`: edit temperature mid-stream; assert the value sent via `set_sampling` is applied on the *next* `SendTurn`, not the in-flight one.
