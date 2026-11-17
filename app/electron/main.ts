@@ -5,18 +5,19 @@ import { Sidecar } from './sidecar';
 export class SidecarHolder
 {
     private static readonly ReadyEvent = 'ready';
-    private static readonly WillQuitEvent = 'will-quit';
-    private static readonly ExitEvent = 'exit';
+    private static readonly BeforeQuitEvent = 'before-quit';
     private static readonly ExitMessage = 'sidecar exited unexpectedly: ';
+    private static readonly StartFailedMessage = 'sidecar failed to start: ';
 
     public Url: string | null = null;
     private readonly sidecar = new Sidecar();
+    private quitting = false;
 
     public Attach(): void
     {
         app.on(SidecarHolder.ReadyEvent, () => void this.OnReady());
-        app.on(SidecarHolder.WillQuitEvent, () => void this.sidecar.Stop());
-        this.sidecar.OnExit.on(SidecarHolder.ExitEvent, (code: number | null, expected: boolean) =>
+        app.on(SidecarHolder.BeforeQuitEvent, event => void this.OnBeforeQuit(event));
+        this.sidecar.OnExit.Subscribe((code, expected) =>
         {
             if (!expected)
             {
@@ -27,8 +28,27 @@ export class SidecarHolder
 
     private async OnReady(): Promise<void>
     {
-        const ready = await this.sidecar.Start();
-        this.Url = ready.url;
+        try
+        {
+            const ready = await this.sidecar.Start();
+            this.Url = ready.url;
+        }
+        catch (err)
+        {
+            console.error(SidecarHolder.StartFailedMessage + (err instanceof Error ? err.message : String(err)));
+        }
+    }
+
+    private async OnBeforeQuit(event: { preventDefault(): void }): Promise<void>
+    {
+        if (this.quitting)
+        {
+            return;
+        }
+        this.quitting = true;
+        event.preventDefault();
+        await this.sidecar.Stop();
+        app.quit();
     }
 }
 

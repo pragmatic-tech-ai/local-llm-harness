@@ -1,5 +1,4 @@
 import { ChildProcess, spawn } from 'node:child_process';
-import { EventEmitter } from 'node:events';
 import * as path from 'node:path';
 
 export interface ISidecarOptions
@@ -18,9 +17,29 @@ export interface ISidecarReady
     url: string;
 }
 
+export type SidecarExitHandler = (code: number | null, expected: boolean) => void;
+
+/** Typed signal raised when the backend process exits; expected is true after Stop(). */
+export class SidecarExitSignal
+{
+    private readonly handlers: SidecarExitHandler[] = [];
+
+    public Subscribe(handler: SidecarExitHandler): void
+    {
+        this.handlers.push(handler);
+    }
+
+    public Raise(code: number | null, expected: boolean): void
+    {
+        for (const handler of this.handlers)
+        {
+            handler(code, expected);
+        }
+    }
+}
+
 /**
- * Spawns and manages the Rust backend process. Raises OnExit ('exit' event with
- * (code, expected)) whenever the child exits; expected is true after Stop().
+ * Spawns and manages the Rust backend process. Raises OnExit (code, expected) whenever the child exits; expected is true after Stop().
  */
 export class Sidecar
 {
@@ -45,8 +64,9 @@ export class Sidecar
     private static readonly KillSignal = 'SIGTERM';
     private static readonly ForceKillSignal = 'SIGKILL';
     private static readonly StopGraceMs = 5000;
+    private static readonly DistDirName = 'dist';
 
-    public readonly OnExit: EventEmitter = new EventEmitter();
+    public readonly OnExit: SidecarExitSignal = new SidecarExitSignal();
 
     private readonly options: ISidecarOptions;
     private child: ChildProcess | null = null;
@@ -126,26 +146,46 @@ export class Sidecar
             child.stdout?.on(Sidecar.DataEvent, onData);
             child.stderr?.on(Sidecar.DataEvent, onData);
 
+            let exitRaised = false;
+            const raiseExit = (code: number | null): void =>
+            {
+                if (exitRaised)
+                {
+                    return;
+                }
+                exitRaised = true;
+                clearTimeout(timer);
+                this.child = null;
+                this.url = null;
+                this.OnExit.Raise(code, this.stopping);
+            };
+
             child.on(Sidecar.ErrorEvent, err =>
             {
                 clearTimeout(timer);
-                this.child = null;
                 if (!ready)
                 {
                     reject(err);
+                }
+                // Never spawned (ENOENT etc.): no exit event will follow, so release the child.
+                // Spawned but errored: still raise an exit so the UI can react.
+                if (child.pid === undefined)
+                {
+                    this.child = null;
+                }
+                else
+                {
+                    raiseExit(null);
                 }
             });
 
             child.on(Sidecar.ExitEvent, code =>
             {
-                clearTimeout(timer);
-                this.child = null;
-                this.url = null;
                 if (!ready)
                 {
                     reject(new Error(Sidecar.ExitedBeforeReady + code + Sidecar.ExitedBeforeReadyEnd));
                 }
-                this.OnExit.emit(Sidecar.ExitEvent, code, this.stopping);
+                raiseExit(code);
             });
         });
     }
@@ -166,6 +206,8 @@ export class Sidecar
                 clearTimeout(force);
                 resolve();
             });
+            // On Windows SIGTERM is a hard TerminateProcess, so the SIGKILL escalation is effectively a no-op
+            // there; a graceful shutdown would need a protocol-level message.
             child.kill(Sidecar.KillSignal);
         });
     }
@@ -173,7 +215,7 @@ export class Sidecar
     private static AppRoot(): string
     {
         const parent = path.basename(path.dirname(__dirname));
-        return parent === 'dist' ? path.resolve(__dirname, '..', '..') : path.resolve(__dirname, '..');
+        return parent === Sidecar.DistDirName ? path.resolve(__dirname, '..', '..') : path.resolve(__dirname, '..');
     }
 
     private static ParseReadyLine(line: string): string | null
