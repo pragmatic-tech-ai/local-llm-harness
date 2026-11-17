@@ -49,7 +49,7 @@ resources InstrumentPanelResources {
                 // Bar: a track Border with a fill Border whose Width follows $ContextBarWidth
                 // (mural ships no ProgressBar).
                 Border [ Fill = @Bg2, Stroke = Pen [ Brush = @Border ], CornerRadius = 4, Height = 8,
-                         HorizontalAlignment = Left, Width = 300, Margin = (0,2,0,8), ClipToBounds = true ] {
+                         HorizontalAlignment = Left, Width = $ContextBarTrackWidth, Margin = (0,2,0,8), ClipToBounds = true ] {
                     Border [ Fill = @Fg2, CornerRadius = 4, HorizontalAlignment = Left, Width = $ContextBarWidth ]
                 }
                 TextBlock [ Text = $Warning, Foreground = @StateDanger, TextWrapping = Wrap,

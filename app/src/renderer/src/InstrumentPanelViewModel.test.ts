@@ -78,7 +78,8 @@ describe('InstrumentPanelViewModel', () =>
         expect(rig.vm.Panel.Warning).toContain('4096')
         expect(rig.vm.Panel.HasWarning).toBe(true)
         expect(rig.vm.Transcript.ToArray().length).toBe(2)
-        rig.Notify('turn_started', { prompt: 'p2', prompt_tokens: 10, n_ctx: 4096 })
+        rig.Notify('turn_done', {})
+        rig.Send('two')
         expect(rig.vm.Panel.Warning).toBe('')
     })
 
@@ -105,6 +106,33 @@ describe('InstrumentPanelViewModel', () =>
         await Promise.resolve()
         expect(rig.vm.Panel.ModelName).toBe('g-12b.gguf')
         expect(rig.vm.Panel.ContextTotal).toBe(4096)
+    })
+
+    it('SurfacesSamplingFailureOnPanel', async () =>
+    {
+        const rig = new Rig()
+        rig.Send('one')
+        rig.client.HandleFrame(JSON.stringify({ id: 2, error: { code: 1, message: 'bad config' } }))
+        await new Promise(r => setTimeout(r, 0))
+        expect(rig.vm.Panel.Warning).toContain('bad config')
+    })
+
+    it('RoundsIntegerKnobsInConfig', () =>
+    {
+        const rig = new Rig()
+        rig.vm.Panel.TopK = 40.0000001
+        rig.vm.Panel.Seed = 7.2
+        rig.vm.Panel.MaxTokens = 255.6
+        rig.vm.Panel.Temperature = 0.85
+        const c = rig.vm.Panel.Config
+        expect([c.top_k, c.seed, c.max_tokens, c.temperature]).toEqual([40, 7, 256, 0.85])
+    })
+
+    it('ToleratesChunkWithoutTokens', () =>
+    {
+        const rig = new Rig()
+        rig.Send('one')
+        expect(() => rig.Notify('turn_chunk', { text: 'a', stop: false })).not.toThrow()
     })
 
     it('DefaultsMaxTokensTo256', () =>

@@ -74,8 +74,9 @@ export class ChatViewModel extends Observable
         const reply = new AssistantMessage('')
         this.Transcript.Add(reply)
         this.current = reply
+        this.Panel.ClearWarning()
         // Apply the knobs to THIS turn (set_sampling lands before send_turn on the single ws stream).
-        this.client.SetSampling(this.Panel.Config).catch(() => undefined)
+        this.client.SetSampling(this.Panel.Config).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
         this.client.SendTurn(draft, this.Panel.EnableThinking).then(
             () => this.ClearIfCurrent(reply),
             (e: Error) =>

@@ -8,6 +8,7 @@ export class InstrumentPanelViewModel extends Observable
     private static readonly WarningFormat = 'context window full: needs {0} tokens, only {1} available — shorten the conversation'
     private static readonly ContextFormat = '{0} / {1} ({2}%)'
     private static readonly TokenizeFormat = '{0} tokens: [{1}]'
+    private static readonly SamplingFailedFormat = 'sampling not applied: {0}'
     private static readonly TokenizeFailedFormat = 'tokenize failed: {0}'
     private static readonly TokenSeparator = ', '
     private static readonly PathSeparators = /[\\/]/
@@ -41,13 +42,12 @@ export class InstrumentPanelViewModel extends Observable
         client.OnTurnStarted.Subscribe(p =>
         {
             this.Logprobs.Clear()
-            this.SetWarning('')
             this._prompt = this.Change('Prompt', this._prompt, p.prompt)
             this.SetContext(p.prompt_tokens, p.n_ctx)
         })
         client.OnTurnChunk.Subscribe(p =>
         {
-            for (const info of p.tokens)
+            for (const info of p.tokens ?? [])
             {
                 this.Logprobs.Add(new LogprobVM(info))
             }
@@ -142,10 +142,10 @@ export class InstrumentPanelViewModel extends Observable
         return {
             temperature: this._temperature,
             top_p: this._topP,
-            top_k: this._topK,
+            top_k: Math.round(this._topK),
             repeat_penalty: this._repeatPenalty,
-            seed: this._seed,
-            max_tokens: this._maxTokens,
+            seed: Math.round(this._seed),
+            max_tokens: Math.round(this._maxTokens),
         }
     }
 
@@ -167,6 +167,24 @@ export class InstrumentPanelViewModel extends Observable
     public get ContextFraction(): number
     {
         return this._contextTotal > 0 ? this._contextUsed / this._contextTotal : 0
+    }
+
+    /** Width of the context bar track; the single source for the .mu track and the fill math. */
+    public get ContextBarTrackWidth(): number
+    {
+        return InstrumentPanelViewModel.BarPixels
+    }
+
+    /** Called when a new turn is attempted; a failed set_sampling then re-raises its own warning. */
+    public ClearWarning(): void
+    {
+        this.SetWarning('')
+    }
+
+    /** Surfaces a failed set_sampling: the turn would otherwise run with stale knobs unnoticed. */
+    public ReportSamplingError(message: string): void
+    {
+        this.SetWarning(InstrumentPanelViewModel.Format(InstrumentPanelViewModel.SamplingFailedFormat, message))
     }
 
     /** Fill width in pixels for the bar (clamped to the track). */
