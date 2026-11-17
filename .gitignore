@@ -1,7 +1,7 @@
 # Rust
 /target
 **/target
-Cargo.lock
+# NB: Cargo.lock IS tracked — backend is an application/binary crate
 # Node / Electron
 node_modules/
 dist/
