@@ -1,8 +1,10 @@
+pub mod http;
 pub mod types;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+pub use http::HttpEngine;
 pub use types::{
     ChatMessage, CompletionChunk, ModelProps, Role, SamplingConfig, TokenInfo, TokenizeResult,
 };
