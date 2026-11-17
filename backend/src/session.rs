@@ -67,11 +67,14 @@ impl ChatSession {
         })
     }
 
-    /// Starts a turn. `max_tokens` headroom: a positive value is reserved on top of the prompt;
-    /// the default `-1` (unlimited) reserves nothing, so only a prompt that itself overflows the
-    /// window is rejected (the intended warn-and-stop behaviour). Rejects with `WindowFull` before any `complete` call when the prompt plus
-    /// `max_tokens` headroom would not fit. On success the user message is recorded and the
-    /// returned stream appends the assistant reply to the history when it finishes.
+    /// Starts a turn. Rejects with `WindowFull` before any `complete` call when the prompt
+    /// plus `max_tokens` headroom would not fit. A positive `max_tokens` is reserved on top of
+    /// the prompt; the default `-1` (unlimited) reserves nothing, so only a prompt that itself
+    /// overflows the window is rejected (the intended warn-and-stop behaviour).
+    ///
+    /// Nothing is recorded up front: the user message and the assistant reply are committed to
+    /// the history together when the returned stream reaches its `stop` chunk. If the stream
+    /// errors or is dropped first, neither is recorded and the history is left untouched.
     pub async fn send(
         &mut self,
         user: &str,
