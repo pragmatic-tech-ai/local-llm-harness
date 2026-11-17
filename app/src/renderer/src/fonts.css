@@ -1,0 +1,12 @@
+/* The Pragmatic theme registers and loads its own six woff2 faces (InterTight, JetBrainsMono,
+   SourceSerif4) from assets/fonts/, emitted at build time by the ThemeFontCopy plugin, so no
+   @font-face for them lives here (a CSS url() to a build-time-only asset would not resolve in dev).
+   This face only lets the bootstrap's document.fonts.load('24px "Material Symbols Outlined"')
+   resolve immediately: it binds the family to a locally installed copy when present. */
+@font-face {
+    font-family: "Material Symbols Outlined";
+    font-style: normal;
+    font-weight: 400;
+    font-display: block;
+    src: local("Material Symbols Outlined");
+}

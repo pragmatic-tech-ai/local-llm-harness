@@ -6,6 +6,9 @@
 node_modules/
 dist/
 out/
+.vite/
+*.mu.js
+*.tsbuildinfo
 *.log
 # SDD scratch (git-ignored)
 .superpowers/

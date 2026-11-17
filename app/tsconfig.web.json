@@ -1,0 +1,6 @@
+{
+  "extends": "@electron-toolkit/tsconfig/tsconfig.web.json",
+  "include": ["src/renderer/src/**/*", "src/renderer/src/**/*.mu", "src/preload/index.d.ts"],
+  "exclude": ["node_modules", "src/renderer/src/**/*.test.ts"],
+  "compilerOptions": { "composite": true, "allowJs": true, "types": ["electron-vite/node"] }
+}

@@ -1,4 +1,5 @@
 import { ChildProcess, spawn } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 export interface ISidecarOptions
@@ -64,7 +65,7 @@ export class Sidecar
     private static readonly KillSignal = 'SIGTERM';
     private static readonly ForceKillSignal = 'SIGKILL';
     private static readonly StopGraceMs = 5000;
-    private static readonly DistDirName = 'dist';
+    private static readonly ManifestFile = 'package.json';
 
     public readonly OnExit: SidecarExitSignal = new SidecarExitSignal();
 
@@ -94,7 +95,7 @@ export class Sidecar
         {
             return Promise.reject(new Error(Sidecar.AlreadyStarted));
         }
-        // __dirname is app/dist/electron (compiled) or app/electron (tests); resolve from the app root.
+        // Resolve from the app root (the package.json directory above __dirname).
         const binary = this.options.binaryPath ?? path.resolve(Sidecar.AppRoot(), Sidecar.DefaultBinaryRelative);
         const args = [
             ...(this.options.prefixArgs ?? []),
@@ -212,10 +213,20 @@ export class Sidecar
         });
     }
 
+    /** Walks up from this file (out/main when built, src/main under test) to the directory holding package.json. */
     private static AppRoot(): string
     {
-        const parent = path.basename(path.dirname(__dirname));
-        return parent === Sidecar.DistDirName ? path.resolve(__dirname, '..', '..') : path.resolve(__dirname, '..');
+        let dir = __dirname;
+        while (!fs.existsSync(path.join(dir, Sidecar.ManifestFile)))
+        {
+            const parent = path.dirname(dir);
+            if (parent === dir)
+            {
+                break;
+            }
+            dir = parent;
+        }
+        return dir;
     }
 
     private static ParseReadyLine(line: string): string | null
