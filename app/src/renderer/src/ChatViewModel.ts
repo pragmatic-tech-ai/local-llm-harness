@@ -1,6 +1,7 @@
 import { Key, Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import { HarnessClient } from './HarnessClient'
 import { AssistantMessage, UserMessage } from './messages'
+import { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
 
 /** Owns the transcript, the composer draft, and the send flow. */
 export class ChatViewModel extends Observable
@@ -11,7 +12,7 @@ export class ChatViewModel extends Observable
     private static readonly SendFailedFormat = '\n[send failed: {0}]'
 
     public readonly Transcript = new ObservableCollection<UserMessage | AssistantMessage>()
-    public EnableThinking = false
+    public readonly Panel: InstrumentPanelViewModel
 
     private _draft = ''
     private current: AssistantMessage | null = null
@@ -21,6 +22,7 @@ export class ChatViewModel extends Observable
     constructor(private readonly client: HarnessClient)
     {
         super()
+        this.Panel = new InstrumentPanelViewModel(client)
         this._sendCommand = new RelayCommand(() => this.Send())
         // Enter-to-send: the TextBox (SubmitsOnEnter) leaves Return unhandled so
         // KeyDown bubbles to a DockPanel trigger; this command sends only on Return.
@@ -72,7 +74,9 @@ export class ChatViewModel extends Observable
         const reply = new AssistantMessage('')
         this.Transcript.Add(reply)
         this.current = reply
-        this.client.SendTurn(draft, this.EnableThinking).then(
+        // Apply the knobs to THIS turn (set_sampling lands before send_turn on the single ws stream).
+        this.client.SetSampling(this.Panel.Config).catch(() => undefined)
+        this.client.SendTurn(draft, this.Panel.EnableThinking).then(
             () => this.ClearIfCurrent(reply),
             (e: Error) =>
             {

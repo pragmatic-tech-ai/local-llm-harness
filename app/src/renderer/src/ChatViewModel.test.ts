@@ -84,8 +84,8 @@ describe('ChatViewModel', () =>
         rig.Send('one')
         rig.Notify('turn_done', {})
         rig.Send('two')
-        // The old turn's send_turn response (id 1) arrives late, as an error.
-        rig.client.HandleFrame(JSON.stringify({ id: 1, error: { code: 1, message: 'late' } }))
+        // The old turn's send_turn response (id 2; set_sampling takes id 1) arrives late, as an error.
+        rig.client.HandleFrame(JSON.stringify({ id: 2, error: { code: 1, message: 'late' } }))
         await Promise.resolve()
         rig.Notify('turn_chunk', { text: 'z', tokens: [], stop: false })
         expect(rig.Reply(1).Text).toBe('')
@@ -97,7 +97,7 @@ describe('ChatViewModel', () =>
         const rig = new Rig(true)
         rig.Send('one')
         rig.Notify('turn_error', { message: 'boom' })
-        rig.client.HandleFrame(JSON.stringify({ id: 1, error: { code: 1, message: 'boom' } }))
+        rig.client.HandleFrame(JSON.stringify({ id: 2, error: { code: 1, message: 'boom' } }))
         await Promise.resolve()
         expect(rig.Reply(1).Text).toBe('\n[error: boom]')
     })

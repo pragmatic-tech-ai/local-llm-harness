@@ -6,6 +6,8 @@ import AssistantMessage from "../messages.js"
 resources ChatResources {
     DataTemplate [ DataType = ChatViewModel ] {
         DockPanel [ LastChildFill = true, Margin = (12,12,12,12) ] {
+            // Instrument panel to the right of the transcript (Content region split, not the shell dock).
+            ContentControl [ DockPanel.Dock = Right, Width = 360, Content = $Panel, Margin = (12,0,0,0) ]
             DockPanel [ DockPanel.Dock = Bottom, Style = @ComposerSubmitStyle, LastChildFill = true, Margin = (0,8,0,0) ] {
                 Button [ DockPanel.Dock = Right, Command = $SendCommand, Margin = (6,0,0,0), VerticalAlignment = Bottom ] {
                     TextBlock [ Text = "Send" ]
@@ -24,10 +26,6 @@ resources ChatResources {
     // style explicitly (not implicit) so no other DockPanel fires it.
     Style x:key="ComposerSubmitStyle" [ TargetType = DockPanel ] {
         on KeyDown { InvokeCommand [ Command = $SubmitCommand ] }
-    }
-
-    ItemsPanelTemplate x:key="VerticalStackPanel" {
-        StackPanel [ Orientation = Vertical ]
     }
 
     DataTemplate [ DataType = UserMessage ] {
