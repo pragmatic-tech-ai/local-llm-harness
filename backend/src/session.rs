@@ -67,6 +67,29 @@ impl ChatSession {
         })
     }
 
+    /// The exact prompt that `send` would render for `user`, plus the fill it implies
+    /// (measured on that prompt). Does not modify the history.
+    pub async fn preview_turn(
+        &self,
+        user: &str,
+        enable_thinking: bool,
+    ) -> Result<(String, ContextFill)> {
+        let mut candidate = self.messages();
+        candidate.push(ChatMessage {
+            role: Role::User,
+            content: user.to_string(),
+        });
+        let prompt = Self::render(&*self.engine, &candidate, enable_thinking).await?;
+        let used = self.engine.tokenize(&prompt).await?.count;
+        Ok((
+            prompt,
+            ContextFill {
+                used,
+                total: self.props.n_ctx,
+            },
+        ))
+    }
+
     /// Starts a turn. Rejects with `WindowFull` before any `complete` call when the prompt
     /// plus `max_tokens` headroom would not fit. A positive `max_tokens` is reserved on top of
     /// the prompt; the default `-1` (unlimited) reserves nothing, so only a prompt that itself
