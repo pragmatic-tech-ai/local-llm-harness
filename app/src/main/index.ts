@@ -25,6 +25,7 @@ export class MainApplication
 
     private readonly sidecar = new Sidecar()
     private quitting = false
+    private startPromise: Promise<unknown> | null = null
 
     public Run(): void
     {
@@ -35,7 +36,20 @@ export class MainApplication
                 console.error(MainApplication.ExitMessage + code)
             }
         })
-        ipcMain.handle(MainApplication.BackendUrlChannel, () => this.sidecar.Url)
+        ipcMain.handle(MainApplication.BackendUrlChannel, async () =>
+        {
+            // Wait for the sidecar to finish starting so the renderer gets the
+            // real url, not the null it holds before Start() resolves.
+            try
+            {
+                await this.startPromise
+            }
+            catch
+            {
+                // start failed; return the current (likely null) url
+            }
+            return this.sidecar.Url
+        })
         app.on(MainApplication.BeforeQuitEvent, (event) => void this.OnBeforeQuit(event))
         app.on(MainApplication.WindowAllClosedEvent, () =>
         {
@@ -58,10 +72,11 @@ export class MainApplication
                 this.CreateWindow()
             }
         })
+        this.startPromise = this.sidecar.Start()
         this.CreateWindow()
         try
         {
-            await this.sidecar.Start()
+            await this.startPromise
         }
         catch (err)
         {

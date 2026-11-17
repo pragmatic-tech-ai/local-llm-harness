@@ -60,7 +60,7 @@ class ThemeFontCopy
     {
         return {
             name: ThemeFontCopy.PluginName,
-            apply: 'build',
+            // Build: emit the fonts as assets under the requested path.
             generateBundle()
             {
                 const fonts = ThemeFontCopy.Fonts()
@@ -72,6 +72,26 @@ class ThemeFontCopy
                         source: readFileSync(join(fonts.dir, file)),
                     })
                 }
+            },
+            // Dev: serve the same fonts from the dev server, so `assets/fonts/*.woff2`
+            // resolves (the theme's @font-face url()s) instead of 404ing — which
+            // otherwise rejects `document.fonts.load` and leaves text on fallback fonts.
+            configureServer(server)
+            {
+                const fonts = ThemeFontCopy.Fonts()
+                const prefix = '/' + ThemeFontCopy.OutputDir
+                server.middlewares.use((req, res, next) =>
+                {
+                    const url = (req.url ?? '').split('?')[0]
+                    const name = url.startsWith(prefix) ? url.slice(prefix.length) : ''
+                    if (!name.endsWith(ThemeFontCopy.FontExtension) || !fonts.files.includes(name))
+                    {
+                        next()
+                        return
+                    }
+                    res.setHeader('Content-Type', 'font/woff2')
+                    res.end(readFileSync(join(fonts.dir, name)))
+                })
             },
         }
     }

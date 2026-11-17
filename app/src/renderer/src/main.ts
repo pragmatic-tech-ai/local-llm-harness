@@ -15,7 +15,17 @@ class RendererBootstrap
     public static async Run(): Promise<void>
     {
         ThemeManager.Density = Density.Compact
-        await document.fonts.load(RendererBootstrap.IconFont)
+        try
+        {
+            // Preload the icon font so first layout uses real glyph metrics.
+            // A layout optimization only — a load failure (e.g. the font not
+            // served in dev) must never abort the bootstrap.
+            await document.fonts.load(RendererBootstrap.IconFont)
+        }
+        catch
+        {
+            // non-fatal
+        }
         const host = document.getElementById(RendererBootstrap.AppElementId) as HTMLElement
         app.initialize(new HtmlTarget(host))
         app.Services.getRequired(ContentHostService.Key).View(new PlaceholderViewModel())
