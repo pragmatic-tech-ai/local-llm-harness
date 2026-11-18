@@ -13,7 +13,10 @@ use futures::stream::BoxStream;
 
 #[cfg(feature = "candle")]
 pub use candle::CandleEngine;
-pub use factory::{build_engine, validate, EngineBuildError, EngineConfig, EngineKind};
+pub use factory::{
+    build_engine, build_engine_with, validate, EngineBuildError, EngineConfig, EngineKind,
+    HttpWarmup,
+};
 pub use http::HttpEngine;
 #[cfg(feature = "llamacpp")]
 pub use llamacpp::LocalLlamaEngine;

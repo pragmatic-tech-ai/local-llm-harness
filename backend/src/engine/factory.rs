@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::ValueEnum;
 
@@ -113,8 +114,55 @@ fn validate_llamacpp(_cfg: &EngineConfig) -> Result<(), EngineBuildError> {
     })
 }
 
+/// How patiently the http engine waits for an upstream server that is still warming up
+/// (llama-server answers 503 while loading a model, and refuses connections before it listens).
+#[derive(Debug, Clone, Copy)]
+pub struct HttpWarmup {
+    /// Pause between `props` attempts.
+    pub retry_delay: Duration,
+    /// Total time to keep retrying before returning the last error.
+    pub window: Duration,
+}
+
+impl HttpWarmup {
+    const DEFAULT_RETRY_DELAY: Duration = Duration::from_millis(1500);
+    /// Kept under the supervisor's 180s readiness timeout so the proxy fails (or binds) first.
+    const DEFAULT_WINDOW: Duration = Duration::from_secs(170);
+
+    /// Fetch `props`, retrying on any error until the window elapses.
+    async fn fetch_props(&self, engine: &dyn Engine) -> Result<ModelProps, super::EngineError> {
+        let deadline = tokio::time::Instant::now() + self.window;
+        loop {
+            match engine.props().await {
+                Ok(props) => return Ok(props),
+                Err(e) if tokio::time::Instant::now() + self.retry_delay >= deadline => {
+                    return Err(e)
+                }
+                Err(_) => tokio::time::sleep(self.retry_delay).await,
+            }
+        }
+    }
+}
+
+impl Default for HttpWarmup {
+    fn default() -> Self {
+        HttpWarmup {
+            retry_delay: Self::DEFAULT_RETRY_DELAY,
+            window: Self::DEFAULT_WINDOW,
+        }
+    }
+}
+
 pub async fn build_engine(
     cfg: &EngineConfig,
+) -> Result<(Arc<dyn Engine>, ModelProps), EngineBuildError> {
+    build_engine_with(cfg, HttpWarmup::default()).await
+}
+
+/// `build_engine` with an explicit http warm-up policy (tests use a short one).
+pub async fn build_engine_with(
+    cfg: &EngineConfig,
+    warmup: HttpWarmup,
 ) -> Result<(Arc<dyn Engine>, ModelProps), EngineBuildError> {
     validate(cfg)?;
     match cfg.kind {
@@ -124,7 +172,7 @@ pub async fn build_engine(
                 .clone()
                 .ok_or(EngineBuildError::MissingServerUrl)?;
             let engine: Arc<dyn Engine> = Arc::new(HttpEngine::new(url));
-            let props = engine.props().await?;
+            let props = warmup.fetch_props(engine.as_ref()).await?;
             Ok((engine, props))
         }
         #[cfg(feature = "llamacpp")]
