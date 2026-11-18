@@ -25,6 +25,10 @@ impl ChatTemplate {
     /// templates (Gemma, Llama) call to reject unsupported conversations.
     pub fn from_jinja(src: &str) -> Result<Self, TemplateError> {
         let mut env = Environment::new();
+        // Real templates use Python-style string methods (.strip(), .startswith()) and
+        // helpers such as strftime_now.
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        minijinja_contrib::add_to_environment(&mut env);
         env.add_function("raise_exception", |msg: String| -> Result<String, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
@@ -117,7 +121,10 @@ mod tests {
 
     #[test]
     fn bad_template_errors_not_panics() {
-        assert!(ChatTemplate::from_jinja("{% if %}{{ unclosed").is_err());
+        assert!(matches!(
+            ChatTemplate::from_jinja("{% if %}{{ unclosed"),
+            Err(TemplateError::Compile(_))
+        ));
     }
 
     #[test]
@@ -133,5 +140,18 @@ mod tests {
     fn bos_token_is_empty() {
         let t = ChatTemplate::from_jinja("[{{ bos_token }}]").unwrap();
         assert_eq!(t.render(&msgs(), false, false).unwrap(), "[]");
+    }
+
+    #[test]
+    fn python_style_string_methods_resolve() {
+        let t = ChatTemplate::from_jinja(
+            "{% for m in messages %}{{ m.content.strip() }}{% if m.role.startswith('us') %}!{% endif %}{% endfor %}",
+        )
+        .unwrap();
+        let m = vec![ChatMessage {
+            role: Role::User,
+            content: "  hi  ".into(),
+        }];
+        assert_eq!(t.render(&m, false, false).unwrap(), "hi!");
     }
 }

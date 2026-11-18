@@ -15,6 +15,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-uti
 tokio-tungstenite = "0.26"
 clap = { version = "4", features = ["derive", "env"] }
 minijinja = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [dev-dependencies]
 wiremock = "0.6"
