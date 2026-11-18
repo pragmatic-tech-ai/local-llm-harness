@@ -1,5 +1,7 @@
 pub mod factory;
 pub mod http;
+#[cfg(feature = "llamacpp")]
+pub mod llamacpp;
 pub mod logprobs;
 pub mod template;
 pub mod types;
@@ -9,6 +11,8 @@ use futures::stream::BoxStream;
 
 pub use factory::{build_engine, validate, EngineBuildError, EngineConfig, EngineKind};
 pub use http::HttpEngine;
+#[cfg(feature = "llamacpp")]
+pub use llamacpp::LocalLlamaEngine;
 pub use types::{
     ChatMessage, CompletionChunk, ModelProps, Role, SamplingConfig, TokenInfo, TokenizeResult,
 };

@@ -4,6 +4,13 @@ use clap::ValueEnum;
 
 use super::{Engine, HttpEngine, ModelProps};
 
+/// Context size used for the in-process engine when the caller gives none.
+#[cfg(feature = "llamacpp")]
+const DEFAULT_N_CTX: u32 = 4096;
+/// GPU-layer count used for the in-process engine when the caller gives none (-1 = all layers).
+#[cfg(feature = "llamacpp")]
+const DEFAULT_N_GPU_LAYERS: i32 = -1;
+
 /// Which `Engine` implementation to construct at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum EngineKind {
@@ -31,6 +38,8 @@ pub enum EngineBuildError {
     MissingModel,
     #[error("the llamacpp engine is not compiled in (rebuild with --features llamacpp)")]
     FeatureDisabled,
+    #[error("failed to load the llamacpp engine: {0}")]
+    Load(String),
     #[error("engine error: {0}")]
     Engine(#[from] super::EngineError),
 }
@@ -59,7 +68,16 @@ pub async fn build_engine(
             Ok((engine, props))
         }
         #[cfg(feature = "llamacpp")]
-        EngineKind::Llamacpp => unimplemented!("wired in a later task"),
+        EngineKind::Llamacpp => {
+            let model = cfg.model.clone().ok_or(EngineBuildError::MissingModel)?;
+            let n_ctx = cfg.n_ctx.unwrap_or(DEFAULT_N_CTX);
+            let n_gpu_layers = cfg.n_gpu_layers.unwrap_or(DEFAULT_N_GPU_LAYERS);
+            let engine = super::llamacpp::LocalLlamaEngine::load(&model, None, n_ctx, n_gpu_layers)
+                .map_err(|e| EngineBuildError::Load(e.to_string()))?;
+            let engine: Arc<dyn Engine> = Arc::new(engine);
+            let props = engine.props().await?;
+            Ok((engine, props))
+        }
         #[cfg(not(feature = "llamacpp"))]
         EngineKind::Llamacpp => Err(EngineBuildError::FeatureDisabled),
     }
