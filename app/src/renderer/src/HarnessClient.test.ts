@@ -164,5 +164,31 @@ describe('HarnessClient', () =>
         client.Connect('ws://b')
         expect(sockets[0].closeCalls).toBe(1)
         expect(sockets[1].closeCalls).toBe(0)
+        expect(sockets[0].onmessage).toBeNull()
+    })
+
+    it('dispose_removes_exact_subscription_when_handler_subscribed_twice', () =>
+    {
+        const signal = new TurnSignal<number>()
+        const seen: number[] = []
+        const handler = (n: number) => seen.push(n)
+        signal.Subscribe(handler)
+        const second = signal.Subscribe(handler)
+        second.Dispose()
+        second.Dispose()
+        signal.Raise(1)
+        expect(seen).toEqual([1])
+    })
+
+    it('reconnect_drops_frames_queued_before_open', () =>
+    {
+        const sockets = [new FakeSocket(), new FakeSocket()]
+        let next = 0
+        const client = new HarnessClient(() => sockets[next++])
+        client.Connect('ws://a')
+        void client.ModelProps().catch(() => undefined)
+        client.Connect('ws://b')
+        sockets[1].Open()
+        expect(sockets[1].sent).toEqual([])
     })
 })

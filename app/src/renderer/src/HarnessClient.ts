@@ -81,15 +81,16 @@ export interface IDisposable
 export class TurnSignal<T>
 {
     private static readonly HandlerFailedMessage = 'Turn signal handler threw'
-    private readonly handlers: ((payload: T) => void)[] = []
+    private readonly handlers: { handler: (payload: T) => void }[] = []
 
     public Subscribe(handler: (payload: T) => void): IDisposable
     {
-        this.handlers.push(handler)
+        const entry = { handler }
+        this.handlers.push(entry)
         return {
             Dispose: () =>
             {
-                const index = this.handlers.indexOf(handler)
+                const index = this.handlers.indexOf(entry)
                 if (index >= 0)
                 {
                     this.handlers.splice(index, 1)
@@ -100,11 +101,11 @@ export class TurnSignal<T>
 
     public Raise(payload: T): void
     {
-        for (const handler of [...this.handlers])
+        for (const entry of [...this.handlers])
         {
             try
             {
-                handler(payload)
+                entry.handler(payload)
             }
             catch (e)
             {
