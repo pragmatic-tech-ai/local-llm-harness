@@ -128,4 +128,41 @@ describe('HarnessClient', () =>
         expect(seen).toEqual([7])
         spy.mockRestore()
     })
+
+    it('subscribe_returns_disposable_that_unsubscribes', () =>
+    {
+        const signal = new TurnSignal<number>()
+        const seen: number[] = []
+        const subscription = signal.Subscribe(n => seen.push(n))
+        signal.Raise(1)
+        subscription.Dispose()
+        signal.Raise(2)
+        expect(seen).toEqual([1])
+    })
+
+    it('disconnect_rejects_pending_and_closes', async () =>
+    {
+        const socket = new FakeSocket()
+        const client = new HarnessClient(() => socket)
+        client.Connect('ws://x')
+        socket.Open()
+        const inFlight = client.SendTurn('hi', false)
+        client.Disconnect()
+        await expect(inFlight).rejects.toThrow('not connected')
+        expect(socket.closeCalls).toBe(1)
+        expect(client.IsConnected).toBe(false)
+        expect(socket.onmessage).toBeNull()
+    })
+
+    it('reconnect_closes_previous_socket', () =>
+    {
+        const sockets = [new FakeSocket(), new FakeSocket()]
+        let next = 0
+        const client = new HarnessClient(() => sockets[next++])
+        client.Connect('ws://a')
+        sockets[0].Open()
+        client.Connect('ws://b')
+        expect(sockets[0].closeCalls).toBe(1)
+        expect(sockets[1].closeCalls).toBe(0)
+    })
 })

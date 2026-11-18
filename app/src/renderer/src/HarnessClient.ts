@@ -57,6 +57,7 @@ export interface IHarnessSocket
 {
     readyState: number
     send(data: string): void
+    close(): void
     onopen: ((ev: unknown) => void) | null
     onmessage: ((ev: { data: unknown }) => void) | null
     onclose: ((ev: unknown) => void) | null
@@ -71,20 +72,35 @@ interface IPending
     reject: (reason: Error) => void
 }
 
+export interface IDisposable
+{
+    Dispose(): void
+}
+
 /** Typed signal: handlers subscribe, the client raises (mirrors SidecarExitSignal). */
 export class TurnSignal<T>
 {
     private static readonly HandlerFailedMessage = 'Turn signal handler threw'
     private readonly handlers: ((payload: T) => void)[] = []
 
-    public Subscribe(handler: (payload: T) => void): void
+    public Subscribe(handler: (payload: T) => void): IDisposable
     {
         this.handlers.push(handler)
+        return {
+            Dispose: () =>
+            {
+                const index = this.handlers.indexOf(handler)
+                if (index >= 0)
+                {
+                    this.handlers.splice(index, 1)
+                }
+            }
+        }
     }
 
     public Raise(payload: T): void
     {
-        for (const handler of this.handlers)
+        for (const handler of [...this.handlers])
         {
             try
             {
@@ -143,6 +159,7 @@ export class HarnessClient
 
     public Connect(url: string): void
     {
+        this.Disconnect()
         const socket = this.socketFactory(url)
         this.socket = socket
         socket.onopen = () =>
@@ -162,6 +179,22 @@ export class HarnessClient
                 this.socket = null
             }
         }
+    }
+
+    /** Closes the current socket, detaches its handlers so no late frames dispatch, and rejects pending requests. */
+    public Disconnect(): void
+    {
+        const socket = this.socket
+        this.socket = null
+        if (socket !== null)
+        {
+            socket.onopen = null
+            socket.onmessage = null
+            socket.onclose = null
+            socket.onerror = null
+            socket.close()
+        }
+        this.RejectAllPending()
     }
 
     public ModelProps(): Promise<ModelProps>

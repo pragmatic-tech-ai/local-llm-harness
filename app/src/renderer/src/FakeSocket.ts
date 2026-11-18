@@ -5,6 +5,7 @@ export class FakeSocket implements IHarnessSocket
 {
     public readyState = 0
     public readonly sent: string[] = []
+    public closeCalls = 0
     public onopen: ((ev: unknown) => void) | null = null
     public onmessage: ((ev: { data: unknown }) => void) | null = null
     public onclose: ((ev: unknown) => void) | null = null
@@ -13,6 +14,12 @@ export class FakeSocket implements IHarnessSocket
     public send(data: string): void
     {
         this.sent.push(data)
+    }
+
+    public close(): void
+    {
+        this.closeCalls++
+        this.readyState = 3
     }
 
     public Open(): void
