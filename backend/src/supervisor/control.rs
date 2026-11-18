@@ -121,6 +121,8 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
                 serde_json::to_value(info).map_err(RpcError::internal)
             }
             Self::METHOD_STOP => {
+                // Ignoring the id value is intentional for the single-harness design; a
+                // multi-harness manager would validate it here (forward-compat).
                 let _p: StopParams =
                     serde_json::from_value(params).map_err(RpcError::invalid_params)?;
                 self.manager.stop().await.map_err(RpcError::from_manager)?;
@@ -157,6 +159,8 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
         Value::Array(items)
     }
 
+    /// The hand-built JSON is a DELIBERATE field whitelist: it must never echo a path, so it is
+    /// intentionally NOT a blanket `Serialize` of `DiscoveredModel` (a future path field can't leak).
     fn list_models(&self) -> Value {
         let items: Vec<Value> = discover(&self.catalog)
             .into_iter()
