@@ -211,14 +211,14 @@ mod tests {
         b.extend_from_slice(&2u64.to_le_bytes());
         gstr(&mut b, "ab");
         gstr(&mut b, "cde");
-        // architecture
-        gstr(&mut b, "general.architecture");
-        b.extend_from_slice(&8u32.to_le_bytes());
-        gstr(&mut b, arch);
         // name
         gstr(&mut b, "general.name");
         b.extend_from_slice(&8u32.to_le_bytes());
         gstr(&mut b, "My Model");
+        // architecture
+        gstr(&mut b, "general.architecture");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        gstr(&mut b, arch);
         b
     }
 
@@ -257,11 +257,23 @@ mod tests {
     fn truncated_is_error() {
         let dir = temp_dir("trunc");
         let mut bytes = sample_gguf("gemma3");
-        bytes.truncate(bytes.len() - 20);
+        // Cut partway through the architecture value (the last KV).
+        bytes.truncate(bytes.len() - 3);
         let p = write(&dir, "t.gguf", &bytes);
         assert!(read_gguf_meta(&p).is_err());
         let p2 = write(&dir, "e.gguf", b"GG");
         assert!(read_gguf_meta(&p2).is_err());
+    }
+
+    #[test]
+    fn truncation_after_architecture_is_tolerated() {
+        let mut kv = Vec::new();
+        gstr(&mut kv, "general.architecture");
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        gstr(&mut kv, "llama");
+        // Header promises 5 KVs but the file ends right after architecture.
+        let meta = read_gguf_meta(&kv_file("tail", &kv, 5)).unwrap();
+        assert_eq!(meta.architecture, "llama");
     }
 
     #[test]
