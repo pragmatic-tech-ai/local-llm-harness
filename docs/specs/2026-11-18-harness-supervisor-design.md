@@ -256,3 +256,18 @@ States: `stopped -> loading -> ready`, and `ready|loading -> stopping -> stopped
   machine, eviction ordering) unit-tested with a fake process-spawner/clock; renderer
   VMs unit-tested with fake sockets; live GPU proof on the hive (start candle ->
   chat -> stop -> start llamacpp -> chat, confirming eviction + VRAM).
+
+## Accepted limitations (post-implementation, 2026-11-18)
+
+- **Control plane serializes behind an in-flight load; a load is not
+  cancellable.** `start` holds the single-harness lock for the whole readiness
+  wait (up to ~180 s for a 12B), and the control connection handles one request
+  at a time, so a Stop or harness switch issued mid-load is buffered and cannot
+  pre-empt the load — the GPU finishes loading a model the user may have
+  abandoned before the switch takes effect. This is a UX degradation, not a
+  correctness bug: the one-live-harness invariant and eviction-before-spawn hold
+  throughout, and the picker state self-heals (generation + ignored-id logic)
+  once the stale reply lands. Deferred as a fast-follow: make the control loop
+  handle requests concurrently (outbound-channel ws writer) and thread a
+  cancellation token through the readiness wait so a newer intent pre-empts the
+  load. Until then, prefer letting a load finish before switching.
