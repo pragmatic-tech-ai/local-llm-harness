@@ -57,6 +57,12 @@ export class InstrumentPanelViewModel extends Observable
         }
         this.subscriptions = []
         this.client = client
+        // Fresh harness = fresh panel: drop the previous harness's display state.
+        this.Logprobs.Clear()
+        this.Change('Prompt', this._prompt, '', x => this._prompt = x)
+        this.SetWarning('')
+        this.SetModelName('')
+        this.SetContext(0, 0)
         if (client)
         {
             this.subscriptions.push(client.OnTurnStarted.Subscribe(p =>
@@ -80,6 +86,10 @@ export class InstrumentPanelViewModel extends Observable
             client.ModelProps().then(
                 props =>
                 {
+                    if (this.client !== client)
+                    {
+                        return
+                    }
                     this.SetModelName(props.model_name)
                     this.SetContext(this._contextUsed, props.n_ctx)
                 },

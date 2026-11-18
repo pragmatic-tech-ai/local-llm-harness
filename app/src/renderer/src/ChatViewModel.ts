@@ -10,6 +10,7 @@ export class ChatViewModel extends Observable
     private static readonly CanChatProperty = 'CanChat'
     private static readonly ErrorFormat = '\n[error: {0}]'
     private static readonly RejectedFormat = '\n[context window full: needed {0} of {1} tokens]'
+    private static readonly DisconnectedNote = '\n[disconnected]'
     private static readonly SendFailedFormat = '\n[send failed: {0}]'
 
     public readonly Transcript = new ObservableCollection<UserMessage | AssistantMessage>()
@@ -35,7 +36,7 @@ export class ChatViewModel extends Observable
             {
                 this.Send()
             }
-        })
+        }, () => this.CanChat)
         if (client)
         {
             this.Bind(client)
@@ -56,7 +57,7 @@ export class ChatViewModel extends Observable
         }
         this.subscriptions = []
         // A rebind means a new/removed harness: drop any turn waiting on the old one.
-        this.current = null
+        this.EndTurn(ChatViewModel.DisconnectedNote)
         const old = this.CanChat
         this.client = client
         if (client)

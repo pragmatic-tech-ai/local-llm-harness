@@ -153,7 +153,35 @@ describe('ChatViewModel', () =>
         const clientB = new HarnessClient(() => new FakeSocket())
         a.vm.Bind(clientB)
         a.Notify('turn_chunk', { text: 'zzz', tokens: [], stop: false })
-        expect(a.Reply(1).Text).toBe('')
+        expect(a.Reply(1).Text).not.toContain('zzz')
+        // The panel must ignore the old client too.
+        a.Notify('turn_started', { prompt: 'old', prompt_tokens: 1, n_ctx: 2 })
+        a.Notify('turn_chunk', { text: 'q', tokens: [{ token: 'q', logprob: -1, top: [] }], stop: false })
+        expect(a.vm.Panel.Logprobs.ToArray().length).toBe(0)
+        expect(a.vm.Panel.Prompt).toBe('')
+    })
+
+    it('rebind_notes_abandoned_reply_and_clears_in_flight_turn', () =>
+    {
+        const rig = new Rig(true)
+        rig.Send('one')
+        const socketB = new FakeSocket()
+        const clientB = new HarnessClient(() => socketB)
+        clientB.Connect('ws://y')
+        socketB.Open()
+        rig.vm.Bind(clientB)
+        expect(rig.Reply(1).Text).toContain('[disconnected]')
+        rig.vm.Draft = 'two'
+        rig.vm.SendCommand.Execute()
+        expect(rig.Count()).toBe(4)
+        clientB.HandleFrame(JSON.stringify({ method: 'turn_chunk', params: { text: 'b', tokens: [], stop: false } }))
+        expect(rig.Reply(3).Text).toBe('b')
+    })
+
+    it('submit_command_disabled_when_unbound', () =>
+    {
+        const vm = new ChatViewModel()
+        expect(vm.SubmitCommand.CanExecute()).toBe(false)
     })
 
     it('unbind_disables_send', () =>
