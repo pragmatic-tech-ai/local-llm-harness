@@ -147,3 +147,70 @@ streaming with top-5 per-token logprobs; `apply_template` renders this model's s
 Gemma-3 `<start_of_turn>` template from gguf metadata; `max_tokens` cap-stop; and a
 two-turn conversation stays coherent (per-turn KV-cache reset works — turn 2 recalled a
 fact from turn 1). GPU offload confirmed (~5.8 GB VRAM).
+
+## Harness supervisor (always-on control plane)
+
+Added 2026-11-18. The supervisor is an always-on control plane that manages
+harnesses (a runtime + a loaded model) as lifecycle objects: it discovers
+models, starts/stops per-runtime worker processes on demand, and hands off the
+live worker ws url to the app. It is the backend crate's DEFAULT (no-feature,
+toolchain-free) build run with --supervisor; it embeds no engine, only spawns
+the pre-built worker exes named in a catalog.
+
+### Build (all three binaries from the branch)
+
+`C:\llm-harness\harness-build\build-all.cmd` (vcvars + CUDA 13.5 env, same
+workarounds as build-both) builds and copies:
+- `target\release\backend-candle.exe` (--features candle-cuda) — candle worker.
+- `target\release\backend-llamacpp.exe` (--features llamacpp) — llamacpp worker.
+- `target\release\backend.exe` (default) — the supervisor AND the http proxy.
+Order matters: the default build runs LAST so backend.exe is the default build.
+GOTCHA: stop the supervisor before rebuilding — a running backend.exe locks
+target\release\backend.exe and the default link fails with LNK1104.
+
+### Catalog + run
+
+- Catalog: `C:\llm-harness\harness-build\catalog.toml` declares advertise_host
+  (192.168.1.101), worker_port (8777), model_dirs (scanned for *.gguf), and the
+  three runtimes (candle/llamacpp/http) with their exe paths and params. The
+  http runtime also declares server_exe (llama-server.exe) and internal_port
+  (8080). Absolute paths live only here, never sent to the client.
+- Start script: `start-supervisor.cmd` sets HARNESS_SUPERVISOR=1,
+  HARNESS_SUPERVISOR_BIND=0.0.0.0:8778, HARNESS_CATALOG=...catalog.toml, puts
+  CUDA 13.5 bin on PATH (so spawned CUDA workers find their DLLs), and runs
+  `backend.exe --supervisor` (logs to supervisor.out/err).
+- Run via scheduled task **harness-supervisor** (one-shot, Run As visor,
+  interactive). Firewall inbound allow **"harness-supervisor 8778"** (TCP 8778)
+  was added. Restart: `ssh pragmatic-hive "schtasks /Run /TN harness-supervisor"`.
+
+### Control RPC (ws JSON-RPC on :8778)
+
+list_runtimes, list_models (discovered; no paths), list_harnesses,
+start{runtime,model} -> {id,url,props}, stop{id}, and a harness_changed
+notification. The app points at it with env
+**HARNESS_SUPERVISOR_URL=ws://192.168.1.101:8778**; the renderer then shows a
+harness picker, starts a harness, and connects chat directly to the handed-off
+worker url (handoff, not proxied). One harness lives at a time on the 6 GB GPU;
+start evicts the current one (kill + confirm exit) before spawning the next.
+
+### Verified live 2026-11-18 (RTX 3060, all three engines)
+
+- candle (gemma-3-4B): ready ~12 s; two-turn coherence within the worker
+  session; top-5 per-token logprobs; ~5.7 GB VRAM.
+- llamacpp (gemma-4-12B): starting it EVICTED candle (VRAM 5.73 -> 4.54 GB, no
+  OOM); fresh context on switch confirmed (the new harness did not know a fact
+  told to the previous one).
+- http (gemma-4-12B, two children llama-server + proxy): ready; chat streams;
+  stop tore down BOTH children, VRAM back to ~0.42 GB baseline; no orphans.
+- model_props reports a clean model name for every engine (no absolute path).
+
+### Notes / gotchas resolved during bring-up
+
+- Spawned workers must NOT inherit the supervisor's HARNESS_SUPERVISOR=1, or
+  they start in supervisor mode and fail to bind 8778. The manager forces
+  HARNESS_SUPERVISOR=false in every worker's env.
+- The http proxy tolerates llama-server still loading: build_engine retries the
+  initial /props on 503/refused for ~170 s (under the 180 s readiness timeout).
+- The per-engine tasks (llama-server, harness-backend, harness-candle) remain as
+  manual fallbacks. Hive left in the supervisor default (supervisor running, no
+  harness loaded).
