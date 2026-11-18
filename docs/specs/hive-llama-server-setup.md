@@ -57,3 +57,39 @@ PATH for nvcc's host compiler). From a plain shell, initialise it with
 `vcvars64.bat` (under the BuildTools `VC\Auxiliary\Build\`) and ensure the CUDA
 and CMake `bin` directories and `LIBCLANG_PATH` are on PATH before invoking
 `cargo`.
+
+## In-process engine: build, run, switch
+
+Source + build live at `C:\llm-harness\harness-build\backend` (a snapshot of the
+backend crate; the git branch is the source of truth). Two helper scripts sit in
+`C:\llm-harness\harness-build\`:
+
+- **`build-llamacpp.cmd`** — calls `vcvars64.bat`, puts CUDA 13.5 + CMake on PATH,
+  sets `CMAKE_CUDA_ARCHITECTURES=86` (the 3060), and runs
+  `cargo build --release --features llamacpp`. First build ~11 min (compiles
+  llama.cpp + ggml-cuda). Binary: `backend\target\release\backend.exe`.
+- **`start-llama-backend.cmd`** — sets `HARNESS_ENGINE=llamacpp`,
+  `HARNESS_MODEL=<gguf>`, `HARNESS_N_CTX=4096`, `HARNESS_NGL=28`,
+  `HARNESS_BIND=0.0.0.0:8777`, and runs the exe (logs to `backend.out`/`backend.err`).
+
+Run via scheduled task **`harness-backend`** (mirrors the `llama-server` task;
+`Run As visor`, interactive, one-time). It must be a task, not a bare ssh launch —
+OpenSSH puts session children in a job object that is killed on disconnect.
+
+Firewall: inbound allow rule **"harness-backend 8777"** (TCP 8777) was added.
+
+**The two engines are mutually exclusive on the 6 GB GPU** — only one GPU server
+runs at a time (llama-server uses ~5.1 GB at `-ngl 28`; the in-process engine uses
+~4.7 GB).
+
+- Switch to the in-process (`llamacpp`) engine:
+  `ssh pragmatic-hive 'Stop-Process -Name llama-server -Force; schtasks /Run /TN harness-backend'`
+  then point the app at it with env `HARNESS_BACKEND_URL=ws://192.168.1.101:8777`
+  (the app then connects remotely instead of spawning its local sidecar).
+- Switch back to `llama-server` (the HTTP engine):
+  `ssh pragmatic-hive 'schtasks /End /TN harness-backend; Stop-Process -Name backend -Force; schtasks /Run /TN llama-server'`
+
+Verified 2026-11-18: `apply_template` output is byte-identical to llama-server's
+`/apply-template` for both `enable_thinking` values; `model_props`, streaming
+`turn_chunk`s with top-5 per-token logprobs, and the `max_tokens` cap-stop all work;
+model offloaded to GPU (~4.7 GB VRAM).
