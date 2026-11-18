@@ -106,3 +106,44 @@ the 12B Q4_0 does not fit 6 GB). Downloaded 2026-11-18, both non-gated:
   the gguf, so it is supplied separately). NB: PowerShell `ConvertFrom-Json` wrongly
   rejects this file (case-insensitive key clash on Gemma byte tokens); the Rust
   `tokenizers` crate reads it fine — round-trip confirmed at engine load.
+
+### candle build + run (CUDA 13.5 workarounds)
+
+candle 0.9.2's CUDA stack needed two env workarounds to build against the hive's
+**CUDA 13.5** (candle historically targets ≤13.4):
+
+- `CUDARC_CUDA_VERSION=13040` — cudarc 0.19.10 supports 13.0–13.4 but panics on 13.5;
+  this pins its 13.4 bindings (CUDA is minor-ABI-compatible within major 13).
+- `NVCC_PREPEND_FLAGS=-Xcompiler /Zc:preprocessor` — CUDA 13.5's CCCL headers reject
+  MSVC's traditional preprocessor (fatal C1189); this switches cl to the conforming one.
+- plus `CUDA_COMPUTE_CAP=86` / `CMAKE_CUDA_ARCHITECTURES=86` (the 3060).
+
+Build script: `C:\llm-harness\harness-build\build-both.cmd` (sets the above + vcvars,
+builds `--features candle-cuda` and `--features llamacpp` and copies each exe aside).
+
+**Two separate binaries** — a combined `--features llamacpp,candle-cuda` build does NOT
+link (`LNK1319`: llama-cpp-sys's cmake-linked CUDA and candle's cudarc conflict). Each
+binary serves http + its own in-process engine:
+- `target\release\backend-candle.exe` (candle, 4B) — run via task **`harness-candle`**
+  (`start-candle.cmd`): `HARNESS_ENGINE=candle`, the 4B gguf + tokenizer, bind 8777.
+  Uses ~5.8 GB VRAM at `n_ctx 4096` (near the 6 GB ceiling — candle has no offload).
+- `target\release\backend-llamacpp.exe` (llamacpp, 12B) — run via task
+  **`harness-backend`** (`start-llama-backend.cmd`), as before.
+
+### Three-way engine switch (all mutually exclusive on the 6 GB GPU)
+
+Only one GPU server runs at a time. The app selects by connecting to the right place
+(`HARNESS_BACKEND_URL=ws://192.168.1.101:8777` for the in-process engines).
+
+- **http** (default): `schtasks /Run /TN llama-server` (llama.cpp server on :8080).
+- **llamacpp (12B)**: `ssh pragmatic-hive 'Stop-Process -Name llama-server -Force; schtasks /Run /TN harness-backend'`.
+- **candle (4B)**: `ssh pragmatic-hive 'schtasks /End /TN harness-backend; Stop-Process -Name llama-server,backend-llamacpp -Force; schtasks /Run /TN harness-candle'`.
+
+Switch back to the default by ending the harness task, stopping its process, and running
+`llama-server`. Hive left in the `llama-server` default.
+
+Verified live 2026-11-18 (candle on the RTX 3060): GGUF + tokenizer load; `model_props`;
+streaming with top-5 per-token logprobs; `apply_template` renders this model's standard
+Gemma-3 `<start_of_turn>` template from gguf metadata; `max_tokens` cap-stop; and a
+two-turn conversation stays coherent (per-turn KV-cache reset works — turn 2 recalled a
+fact from turn 1). GPU offload confirmed (~5.8 GB VRAM).
