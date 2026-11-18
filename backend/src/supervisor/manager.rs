@@ -461,6 +461,7 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
         let mut handles = match self.spawn_all(&plan).await {
             Ok(h) => h,
             Err(e) => {
+                self.shared.set_watcher(None);
                 self.shared
                     .publish(Shared::with_state(&info, HarnessState::Failed));
                 return Err(e);
