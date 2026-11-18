@@ -3,6 +3,7 @@ use backend::rpc;
 use backend::supervisor::catalog::Catalog;
 use backend::supervisor::control;
 use backend::supervisor::manager::{HarnessManager, ManagerConfig, ProcessLauncher, WsProbe};
+use clap::builder::BoolishValueParser;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,7 +34,7 @@ struct Config {
     #[arg(long, env = "HARNESS_TOKENIZER")]
     tokenizer: Option<String>,
     /// Run as the supervisor (control server managing worker harnesses) instead of an engine.
-    #[arg(long, env = "HARNESS_SUPERVISOR")]
+    #[arg(long, env = "HARNESS_SUPERVISOR", value_parser = BoolishValueParser::new())]
     supervisor: bool,
     /// Address:port the supervisor control server binds to.
     #[arg(long, env = "HARNESS_SUPERVISOR_BIND", default_value = "0.0.0.0:8778")]
@@ -69,9 +70,10 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
     if let Some(host) = &config.advertise_host {
         catalog.advertise_host = host.clone();
     }
-    let catalog = Arc::new(catalog);
+    // The manager owns its catalog while the control server shares one via Arc: one clone.
+    let shared = Arc::new(catalog.clone());
     let manager = HarnessManager::new(
-        (*catalog).clone(),
+        catalog,
         ProcessLauncher::new(),
         WsProbe,
         ManagerConfig::default(),
@@ -80,16 +82,23 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
     println!(
         "supervisor listening on ws://{} (advertise {}, {} runtimes, {} model dirs)",
         listener.local_addr()?,
-        catalog.advertise_host,
-        catalog.runtimes.len(),
-        catalog.model_dirs.len()
+        shared.advertise_host,
+        shared.runtimes.len(),
+        shared.model_dirs.len()
     );
-    control::serve(listener, Arc::new(manager), catalog).await;
+    control::serve(listener, Arc::new(manager), shared).await;
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
     if config.supervisor {
         return run_supervisor(&config).await;
@@ -118,6 +127,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::builder::TypedValueParser;
+    use clap::CommandFactory;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn supervisor_env_accepts_boolish_values() {
+        let cmd = Config::command();
+        let parser = BoolishValueParser::new();
+        for (raw, want) in [("1", true), ("yes", true), ("0", false), ("false", false)] {
+            let got = parser.parse_ref(&cmd, None, OsStr::new(raw)).unwrap();
+            assert_eq!(got, want, "{raw}");
+        }
+        let config = Config::try_parse_from(["backend", "--supervisor"]).unwrap();
+        assert!(config.supervisor);
+    }
 
     #[test]
     fn supervisor_flag_parses_bind_and_catalog() {
