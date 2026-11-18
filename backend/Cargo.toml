@@ -14,6 +14,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 tokio-tungstenite = "0.26"
 clap = { version = "4", features = ["derive", "env"] }
+minijinja = "2"
 
 [dev-dependencies]
 wiremock = "0.6"

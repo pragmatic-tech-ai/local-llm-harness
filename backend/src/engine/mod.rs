@@ -1,5 +1,6 @@
 pub mod factory;
 pub mod http;
+pub mod template;
 pub mod types;
 
 use async_trait::async_trait;
