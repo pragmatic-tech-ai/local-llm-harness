@@ -121,4 +121,47 @@ describe('ChatViewModel', () =>
         rig.Send('again')
         expect(rig.Count()).toBe(4)
     })
+
+    it('starts_unbound_cannot_chat', () =>
+    {
+        const vm = new ChatViewModel()
+        expect(vm.CanChat).toBe(false)
+        vm.Draft = 'hi'
+        vm.SendCommand.Execute()
+        expect(vm.Transcript.ToArray().length).toBe(0)
+    })
+
+    it('bind_enables_chat_and_routes_chunks', () =>
+    {
+        const socket = new FakeSocket()
+        const client = new HarnessClient(() => socket)
+        client.Connect('ws://x')
+        socket.Open()
+        const vm = new ChatViewModel()
+        vm.Bind(client)
+        expect(vm.CanChat).toBe(true)
+        vm.Draft = 'hi'
+        vm.SendCommand.Execute()
+        client.HandleFrame(JSON.stringify({ method: 'turn_chunk', params: { text: 'a', tokens: [], stop: false } }))
+        expect((vm.Transcript.ToArray()[1] as AssistantMessage).Text).toBe('a')
+    })
+
+    it('rebind_ignores_old_client_signals', () =>
+    {
+        const a = new Rig(true)
+        a.Send('hi')
+        const clientB = new HarnessClient(() => new FakeSocket())
+        a.vm.Bind(clientB)
+        a.Notify('turn_chunk', { text: 'zzz', tokens: [], stop: false })
+        expect(a.Reply(1).Text).toBe('')
+    })
+
+    it('unbind_disables_send', () =>
+    {
+        const rig = new Rig(true)
+        rig.vm.Bind(null)
+        expect(rig.vm.CanChat).toBe(false)
+        rig.Send('hi')
+        expect(rig.Count()).toBe(0)
+    })
 })

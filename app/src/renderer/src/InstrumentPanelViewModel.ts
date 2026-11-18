@@ -1,5 +1,5 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { HarnessClient, type SamplingConfig } from './HarnessClient'
+import { HarnessClient, type IDisposable, type SamplingConfig } from './HarnessClient'
 import { LogprobVM } from './LogprobVM'
 
 /** Low-level state of the model: sampling knobs, raw prompt, context fill, logprobs, tokenization. */
@@ -35,35 +35,56 @@ export class InstrumentPanelViewModel extends Observable
 
     public readonly Logprobs = new ObservableCollection<LogprobVM>()
 
-    constructor(private readonly client: HarnessClient)
+    private client: HarnessClient | null = null
+    private subscriptions: IDisposable[] = []
+
+    constructor(client?: HarnessClient)
     {
         super()
         this._tokenizeCommand = new RelayCommand(() => this.Tokenize())
-        client.OnTurnStarted.Subscribe(p =>
+        if (client)
         {
-            this.Logprobs.Clear()
-            this.Change('Prompt', this._prompt, p.prompt, x => this._prompt = x)
-            this.SetContext(p.prompt_tokens, p.n_ctx)
-        })
-        client.OnTurnChunk.Subscribe(p =>
+            this.Bind(client)
+        }
+    }
+
+    /** Rebinds to a (new) harness client, or unbinds with null. Stale subscriptions are disposed first. */
+    public Bind(client: HarnessClient | null): void
+    {
+        for (const s of this.subscriptions)
         {
-            for (const info of p.tokens ?? [])
+            s.Dispose()
+        }
+        this.subscriptions = []
+        this.client = client
+        if (client)
+        {
+            this.subscriptions.push(client.OnTurnStarted.Subscribe(p =>
             {
-                this.Logprobs.Add(new LogprobVM(info))
-            }
-        })
-        client.OnTurnRejected.Subscribe(p =>
-        {
-            this.SetWarning(InstrumentPanelViewModel.Format(InstrumentPanelViewModel.WarningFormat, p.needed, p.total))
-        })
-        // Shows the model + window size before the first turn. Rejects (ignored) if there is no connection.
-        client.ModelProps().then(
-            props =>
+                this.Logprobs.Clear()
+                this.Change('Prompt', this._prompt, p.prompt, x => this._prompt = x)
+                this.SetContext(p.prompt_tokens, p.n_ctx)
+            }))
+            this.subscriptions.push(client.OnTurnChunk.Subscribe(p =>
             {
-                this.SetModelName(props.model_name)
-                this.SetContext(this._contextUsed, props.n_ctx)
-            },
-            () => undefined)
+                for (const info of p.tokens ?? [])
+                {
+                    this.Logprobs.Add(new LogprobVM(info))
+                }
+            }))
+            this.subscriptions.push(client.OnTurnRejected.Subscribe(p =>
+            {
+                this.SetWarning(InstrumentPanelViewModel.Format(InstrumentPanelViewModel.WarningFormat, p.needed, p.total))
+            }))
+            // Shows the model + window size before the first turn. Rejects (ignored) if there is no connection.
+            client.ModelProps().then(
+                props =>
+                {
+                    this.SetModelName(props.model_name)
+                    this.SetContext(this._contextUsed, props.n_ctx)
+                },
+                () => undefined)
+        }
     }
 
     public get Temperature(): number
@@ -237,6 +258,10 @@ export class InstrumentPanelViewModel extends Observable
 
     private Tokenize(): void
     {
+        if (this.client === null)
+        {
+            return
+        }
         this.client.Tokenize(this._tokenizeInput).then(
             r =>
             {
