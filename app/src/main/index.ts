@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'node:path'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import { Sidecar } from './sidecar'
+import { BackendUrl } from './backend-url'
 
 /** Owns the BrowserWindow and the Rust backend sidecar for the app's lifetime. */
 export class MainApplication
@@ -32,8 +33,15 @@ export class MainApplication
         model: process.env[MainApplication.ModelEnv],
         bind: process.env[MainApplication.BindEnv],
     })
+    private readonly remoteUrl: string | null = MainApplication.ResolveBackendUrl(process.env)
     private quitting = false
     private startPromise: Promise<unknown> | null = null
+
+    /** The remote backend url from HARNESS_BACKEND_URL, or null to spawn the local sidecar. */
+    public static ResolveBackendUrl(env: NodeJS.ProcessEnv): string | null
+    {
+        return BackendUrl.Resolve(env)
+    }
 
     public Run(): void
     {
@@ -46,6 +54,10 @@ export class MainApplication
         })
         ipcMain.handle(MainApplication.BackendUrlChannel, async () =>
         {
+            if (this.remoteUrl)
+            {
+                return this.remoteUrl
+            }
             // Wait for the sidecar to finish starting so the renderer gets the
             // real url, not the null it holds before Start() resolves.
             try
@@ -80,6 +92,11 @@ export class MainApplication
                 this.CreateWindow()
             }
         })
+        if (this.remoteUrl)
+        {
+            this.CreateWindow()
+            return
+        }
         this.startPromise = this.sidecar.Start()
         this.CreateWindow()
         try
@@ -121,7 +138,10 @@ export class MainApplication
         }
         this.quitting = true
         event.preventDefault()
-        await this.sidecar.Stop()
+        if (this.startPromise)
+        {
+            await this.sidecar.Stop()
+        }
         app.quit()
     }
 }
