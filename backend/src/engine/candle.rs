@@ -494,14 +494,19 @@ mod tests {
             top_k: 40,
             ..SamplingConfig::default()
         };
-        assert_eq!(
-            CandleEngine::sampling_from(&cfg),
-            Sampling::TopKThenTopP {
-                k: 40,
-                p: 0.9,
-                temperature: 0.7,
+        // candle's `Sampling` carries f64 fields; the mapping widens f32 config values, so compare
+        // the numeric fields with a tolerance rather than relying on exact bit patterns.
+        match CandleEngine::sampling_from(&cfg) {
+            Sampling::TopKThenTopP { k, p, temperature } => {
+                assert_eq!(k, 40);
+                assert!((p - 0.9).abs() < 1e-6, "p was {p}");
+                assert!(
+                    (temperature - 0.7).abs() < 1e-6,
+                    "temperature was {temperature}"
+                );
             }
-        );
+            other => panic!("expected TopKThenTopP, got {other:?}"),
+        }
     }
 
     #[test]
@@ -512,13 +517,16 @@ mod tests {
             top_k: 0,
             ..SamplingConfig::default()
         };
-        assert_eq!(
-            CandleEngine::sampling_from(&cfg),
-            Sampling::TopP {
-                p: 0.8,
-                temperature: 0.5,
+        match CandleEngine::sampling_from(&cfg) {
+            Sampling::TopP { p, temperature } => {
+                assert!((p - 0.8).abs() < 1e-6, "p was {p}");
+                assert!(
+                    (temperature - 0.5).abs() < 1e-6,
+                    "temperature was {temperature}"
+                );
             }
-        );
+            other => panic!("expected TopP, got {other:?}"),
+        }
     }
 
     #[test]
