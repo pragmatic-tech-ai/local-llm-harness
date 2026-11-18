@@ -227,7 +227,11 @@ impl CandleEngine {
 
         let mut processor =
             LogitsProcessor::from_sampling(Self::resolve_seed(cfg.seed), Self::sampling_from(cfg));
-        let mut decoder = PieceDecoder::new();
+        // Incremental streaming detokenizer: `step(id)` buffers partial SentencePiece byte-fallback
+        // tokens (`<0xNN>`) until they form a complete char, then returns the reassembled delta. This
+        // is the only path that correctly reassembles multibyte chars (emoji, non-Latin scripts) that
+        // span several tokens — decoding each token in isolation would yield `U+FFFD`.
+        let mut stream = tokenizer.decode_stream(false);
 
         // Forward the whole prompt; `logits` are the last-position logits, shape (1, vocab).
         let input = Self::ids_tensor(&tokens, device)?;
@@ -263,17 +267,20 @@ impl CandleEngine {
                 break;
             }
 
+            // Label each token with its decoded piece (`▁`→space, `<0x0A>`→newline), matching the
+            // readable surface forms the sibling engines report — not the raw vocab symbols.
             let info = token_info(
                 &raw,
                 next as usize,
-                |id| tokenizer.id_to_token(id as u32).unwrap_or_default(),
+                |id| tokenizer.decode(&[id as u32], false).unwrap_or_default(),
                 TOP_LOGPROBS,
             );
-            // Decode this single token to bytes and feed the UTF-8 reassembler.
-            let piece = tokenizer
-                .decode(&[next], false)
-                .map_err(|e| EngineError::Protocol(format!("detokenize failed: {e}")))?;
-            let text = decoder.push(piece.as_bytes());
+            // Advance the streaming decoder; it returns the correctly-assembled text delta (or none
+            // while it is still buffering a partial byte-fallback char).
+            let text = stream
+                .step(next)
+                .map_err(|e| EngineError::Protocol(format!("stream decode failed: {e}")))?
+                .unwrap_or_default();
             tokens.push(next);
             generated += 1;
 
@@ -305,10 +312,11 @@ impl CandleEngine {
             index_pos += 1;
         }
 
-        // Flush any bytes left mid-character, then the terminal stop chunk.
-        let tail = decoder.finish();
+        // Terminal stop chunk. `DecodeStream` emits each char as soon as it completes and keeps no
+        // flushable tail (any trailing incomplete byte-fallback fragment is simply never a char), so
+        // there is nothing to drain here.
         let _ = tx.blocking_send(Ok(CompletionChunk {
-            text: tail,
+            text: String::new(),
             tokens: Vec::new(),
             stop: true,
         }));
@@ -393,85 +401,16 @@ impl Engine for CandleEngine {
     }
 }
 
-/// Reassembles streamed token pieces into valid UTF-8. A single token's bytes can split a
-/// multi-byte character, so bytes are buffered and only the valid prefix is emitted; the remainder
-/// waits for the next token (or is flushed lossily at the end). Identical in behaviour to the
-/// llama.cpp engine's decoder.
-struct PieceDecoder {
-    pending: Vec<u8>,
-}
-
-impl PieceDecoder {
-    fn new() -> Self {
-        Self {
-            pending: Vec::new(),
-        }
-    }
-
-    /// Appends `bytes` and returns the longest now-complete UTF-8 prefix.
-    fn push(&mut self, bytes: &[u8]) -> String {
-        self.pending.extend_from_slice(bytes);
-        match std::str::from_utf8(&self.pending) {
-            Ok(_) => {
-                let taken = std::mem::take(&mut self.pending);
-                // Just validated as UTF-8 above.
-                String::from_utf8(taken).unwrap_or_default()
-            }
-            Err(e) => {
-                let valid = e.valid_up_to();
-                let out = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
-                self.pending.drain(..valid);
-                out
-            }
-        }
-    }
-
-    /// Flushes whatever remains, replacing any dangling bytes with the replacement character.
-    fn finish(&mut self) -> String {
-        if self.pending.is_empty() {
-            return String::new();
-        }
-        String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned()
-    }
-}
-
 #[cfg(all(test, feature = "candle"))]
 mod tests {
     use super::*;
     use crate::engine::types::Role;
 
-    #[test]
-    fn piece_decoder_passes_through_ascii() {
-        let mut d = PieceDecoder::new();
-        assert_eq!(d.push(b"hello"), "hello");
-        assert_eq!(d.finish(), "");
-    }
-
-    #[test]
-    fn piece_decoder_reassembles_split_multibyte() {
-        let mut d = PieceDecoder::new();
-        // "é" is 0xC3 0xA9 split across two token pieces.
-        assert_eq!(d.push(&[0xC3]), "");
-        assert_eq!(d.push(&[0xA9]), "é");
-        assert_eq!(d.finish(), "");
-    }
-
-    #[test]
-    fn piece_decoder_reassembles_four_byte_char_split_three_ways() {
-        let mut d = PieceDecoder::new();
-        // "😀" is 0xF0 0x9F 0x98 0x80 split across several tokens.
-        assert_eq!(d.push(&[0xF0, 0x9F]), "");
-        assert_eq!(d.push(&[0x98]), "");
-        assert_eq!(d.push(&[0x80]), "😀");
-        assert_eq!(d.finish(), "");
-    }
-
-    #[test]
-    fn piece_decoder_flushes_dangling_bytes_lossily() {
-        let mut d = PieceDecoder::new();
-        assert_eq!(d.push(&[0xC3]), "");
-        assert_eq!(d.finish(), "\u{FFFD}");
-    }
+    // Streaming-decode correctness (byte-fallback reassembly of multibyte chars across tokens) is
+    // exercised by the hive live proof with a non-ASCII prompt: it requires a real model/tokenizer
+    // to produce the `<0xNN>` byte-fallback token sequence, which cannot be constructed here without
+    // one. The former `PieceDecoder` unit tests fed raw split bytes that the old per-token `decode`
+    // path never actually produced, so they proved nothing about real output and were removed.
 
     #[test]
     fn file_stem_strips_dir_and_extension() {

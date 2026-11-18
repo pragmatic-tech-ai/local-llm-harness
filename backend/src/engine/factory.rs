@@ -69,7 +69,9 @@ pub fn validate(cfg: &EngineConfig) -> Result<(), EngineBuildError> {
     }
 }
 
-/// `Candle` validation: a gguf model path and a tokenizer.json path are both required.
+/// `Candle` validation when the feature is compiled in: a gguf model path and a tokenizer.json path
+/// are both required.
+#[cfg(feature = "candle")]
 fn validate_candle(cfg: &EngineConfig) -> Result<(), EngineBuildError> {
     if cfg.model.is_none() {
         return Err(EngineBuildError::MissingModel);
@@ -78,6 +80,17 @@ fn validate_candle(cfg: &EngineConfig) -> Result<(), EngineBuildError> {
         return Err(EngineBuildError::MissingTokenizer);
     }
     Ok(())
+}
+
+/// `Candle` validation when the feature is absent: report that the engine isn't built in, taking
+/// precedence over the missing-model/tokenizer checks so the user learns to rebuild with
+/// `--features candle` rather than being asked for unusable paths. Mirrors `validate_llamacpp`.
+#[cfg(not(feature = "candle"))]
+fn validate_candle(_cfg: &EngineConfig) -> Result<(), EngineBuildError> {
+    Err(EngineBuildError::FeatureDisabled {
+        engine: "candle",
+        feature: "candle",
+    })
 }
 
 /// `Llamacpp` validation when the feature is compiled in: a model path is required.
@@ -212,6 +225,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "candle")]
     #[test]
     fn candle_requires_model_and_tokenizer() {
         let mut c = cfg(EngineKind::Candle);
@@ -223,6 +237,24 @@ mod tests {
         ));
         c.tokenizer = Some("tokenizer.json".into());
         assert!(validate(&c).is_ok());
+    }
+
+    #[cfg(not(feature = "candle"))]
+    #[test]
+    fn candle_reports_feature_disabled_when_absent() {
+        // Without the feature the kind is rejected as not-built-in, and that takes precedence
+        // over the missing-model/tokenizer checks (paths present or not).
+        let mut c = cfg(EngineKind::Candle);
+        assert!(matches!(
+            validate(&c),
+            Err(EngineBuildError::FeatureDisabled { .. })
+        ));
+        c.model = Some("m.gguf".into());
+        c.tokenizer = Some("tokenizer.json".into());
+        assert!(matches!(
+            validate(&c),
+            Err(EngineBuildError::FeatureDisabled { .. })
+        ));
     }
 
     #[test]
