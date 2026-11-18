@@ -11,7 +11,7 @@ serde_json = "1"
 thiserror = "2"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "process"] }
 tokio-tungstenite = "0.26"
 clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
@@ -35,6 +35,10 @@ llamacpp = ["dep:llama-cpp-2", "llama-cpp-2/cuda", "tokio/sync"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "tokio/sync"]
 # candle plus CUDA kernels; built where the CUDA toolchain exists.
 candle-cuda = ["candle", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
+# Windows Job Object FFI (pure Rust, no C toolchain) so workers die with the supervisor.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
 
 [dev-dependencies]
 wiremock = "0.6"

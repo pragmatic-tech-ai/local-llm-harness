@@ -3,7 +3,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -216,10 +216,13 @@ impl SpawnPlan {
 }
 
 /// A running child process.
+#[async_trait]
 pub trait WorkerHandle: Send {
+    /// Request termination (non-blocking).
     fn kill(&mut self);
     fn try_wait(&mut self) -> Option<ChildExit>;
-    fn wait(&mut self);
+    /// Resolve once the process has exited.
+    async fn wait(&mut self);
 }
 
 /// Starts child processes.
@@ -240,6 +243,8 @@ pub struct ManagerConfig {
     pub ready_timeout: Duration,
     /// How often children are checked for early exit while loading.
     pub poll_interval: Duration,
+    /// Extra time beyond `ready_timeout` before the outer guard gives up on a stuck probe.
+    pub ready_grace: Duration,
     /// How often a Ready harness is checked for a crash.
     pub health_interval: Duration,
 }
@@ -249,6 +254,7 @@ impl Default for ManagerConfig {
         ManagerConfig {
             ready_timeout: Duration::from_secs(180),
             poll_interval: Duration::from_millis(250),
+            ready_grace: Duration::from_secs(5),
             health_interval: Duration::from_secs(2),
         }
     }
@@ -287,12 +293,12 @@ impl Shared {
     }
 
     /// Kill every child, then confirm each has exited (so VRAM is released).
-    fn teardown(handles: &mut [Box<dyn WorkerHandle>]) {
+    async fn teardown(handles: &mut [Box<dyn WorkerHandle>]) {
         for h in handles.iter_mut() {
             h.kill();
         }
         for h in handles.iter_mut() {
-            h.wait();
+            h.wait().await;
         }
     }
 
@@ -317,7 +323,7 @@ impl Shared {
             return true;
         }
         if let Some(mut dead) = live.take() {
-            Self::teardown(&mut dead.handles);
+            Self::teardown(&mut dead.handles).await;
         }
         if let Some(info) = self.current() {
             self.publish(Self::with_state(&info, HarnessState::Failed));
@@ -371,13 +377,16 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
         self.shared.check_health(None).await;
     }
 
-    fn spawn_all(&self, plan: &SpawnPlan) -> Result<Vec<Box<dyn WorkerHandle>>, ManagerError> {
+    async fn spawn_all(
+        &self,
+        plan: &SpawnPlan,
+    ) -> Result<Vec<Box<dyn WorkerHandle>>, ManagerError> {
         let mut handles: Vec<Box<dyn WorkerHandle>> = Vec::new();
         for spec in &plan.children {
             match self.launcher.spawn(spec) {
                 Ok(h) => handles.push(h),
                 Err(e) => {
-                    Shared::teardown(&mut handles);
+                    Shared::teardown(&mut handles).await;
                     return Err(ManagerError::Spawn(e));
                 }
             }
@@ -390,20 +399,26 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
         let url = format!("ws://{}:{}", Self::LOCAL_HOST, self.catalog.worker_port);
         let probe = self.probe.await_ready(&url, self.config.ready_timeout);
         tokio::pin!(probe);
-        loop {
-            tokio::select! {
-                ready = &mut probe => {
-                    return if ready { Ok(()) } else { Err(ManagerError::LoadTimeout) };
-                }
-                _ = tokio::time::sleep(self.config.poll_interval) => {
-                    for h in handles.iter_mut() {
-                        if let Some(exit) = h.try_wait() {
-                            return Err(ManagerError::WorkerExited(exit.code));
+        let outer = self.config.ready_timeout + self.config.ready_grace;
+        let watch = async {
+            loop {
+                tokio::select! {
+                    ready = &mut probe => {
+                        return if ready { Ok(()) } else { Err(ManagerError::LoadTimeout) };
+                    }
+                    _ = tokio::time::sleep(self.config.poll_interval) => {
+                        for h in handles.iter_mut() {
+                            if let Some(exit) = h.try_wait() {
+                                return Err(ManagerError::WorkerExited(exit.code));
+                            }
                         }
                     }
                 }
             }
-        }
+        };
+        tokio::time::timeout(outer, watch)
+            .await
+            .unwrap_or(Err(ManagerError::LoadTimeout))
     }
 
     /// Start `model` on `runtime`, evicting any live harness first.
@@ -431,7 +446,7 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
                 self.shared
                     .publish(Shared::with_state(&info, HarnessState::Stopping));
             }
-            Shared::teardown(&mut old.handles);
+            Shared::teardown(&mut old.handles).await;
         }
 
         let mut info = HarnessInfo {
@@ -443,7 +458,7 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
         };
         self.shared.publish(info.clone());
 
-        let mut handles = match self.spawn_all(&plan) {
+        let mut handles = match self.spawn_all(&plan).await {
             Ok(h) => h,
             Err(e) => {
                 self.shared
@@ -452,7 +467,8 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
             }
         };
         if let Err(e) = self.await_ready(&mut handles).await {
-            Shared::teardown(&mut handles);
+            Shared::teardown(&mut handles).await;
+            self.shared.set_watcher(None);
             self.shared
                 .publish(Shared::with_state(&info, HarnessState::Failed));
             return Err(e);
@@ -497,8 +513,7 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
         if let Some(mut old) = live.take() {
             self.shared
                 .publish(Shared::with_state(&info, HarnessState::Stopping));
-            // Blocking wait is brief: the children were just killed.
-            Shared::teardown(&mut old.handles);
+            Shared::teardown(&mut old.handles).await;
         }
         let _ = self
             .shared
@@ -514,26 +529,124 @@ impl<L: WorkerLauncher, P: ReadinessProbe> Drop for HarnessManager<L, P> {
         self.shared.set_watcher(None);
         if let Ok(mut live) = self.shared.live.try_lock() {
             if let Some(mut old) = live.take() {
-                Shared::teardown(&mut old.handles);
+                for h in old.handles.iter_mut() {
+                    h.kill();
+                }
             }
         }
     }
 }
 
-/// Real launcher: spawns OS processes.
-///
-/// TODO(H1): put each child in a Windows Job Object with KILL_ON_JOB_CLOSE so children die if
-/// the supervisor is killed. That needs raw kernel32 FFI or the `windows-sys` crate; for now we
-/// kill explicitly on stop and on drop of the handle.
-pub struct ProcessLauncher;
-
-struct ProcessHandle {
-    child: Child,
+/// Windows Job Object configured to kill every member when its last handle closes, so workers
+/// die with the supervisor. A no-op on other platforms.
+struct JobObject {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
+// The job handle is only used for create/assign/close, all thread-safe kernel calls.
+#[cfg(windows)]
+unsafe impl Send for JobObject {}
+#[cfg(windows)]
+unsafe impl Sync for JobObject {}
+
+#[cfg(windows)]
+impl JobObject {
+    fn create() -> io::Result<JobObject> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        // SAFETY: plain FFI; the info struct is zero-initialised (valid) and sized correctly.
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                let err = io::Error::last_os_error();
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+                return Err(err);
+            }
+            Ok(JobObject { handle })
+        }
+    }
+
+    fn assign(&self, child: &tokio::process::Child) {
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        if let Some(raw) = child.raw_handle() {
+            // SAFETY: both handles are valid for the duration of the call.
+            let ok = unsafe { AssignProcessToJobObject(self.handle, raw as _) };
+            if ok == 0 {
+                eprintln!("job object assign failed: {}", io::Error::last_os_error());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobObject {
+    fn drop(&mut self) {
+        // SAFETY: we own the handle; closing it kills any remaining members.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl JobObject {
+    fn create() -> io::Result<JobObject> {
+        Ok(JobObject {})
+    }
+
+    fn assign(&self, _child: &tokio::process::Child) {}
+}
+
+/// Real launcher: spawns OS processes, each assigned to a kill-on-close Job Object (Windows).
+///
+/// H1 live-validation notes: the child is assigned to the job just after spawn (a tiny window
+/// where it is not yet a member); on Windows < 8 nested jobs fail, though the explicit
+/// kill-on-stop/drop path still applies.
+pub struct ProcessLauncher {
+    job: Option<JobObject>,
+}
+
+impl ProcessLauncher {
+    pub fn new() -> Self {
+        let job = match JobObject::create() {
+            Ok(j) => Some(j),
+            Err(e) => {
+                eprintln!("job object unavailable, relying on explicit kill: {e}");
+                None
+            }
+        };
+        ProcessLauncher { job }
+    }
+}
+
+impl Default for ProcessLauncher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct ProcessHandle {
+    child: tokio::process::Child,
+}
+
+#[async_trait]
 impl WorkerHandle for ProcessHandle {
     fn kill(&mut self) {
-        let _ = self.child.kill();
+        let _ = self.child.start_kill();
     }
 
     fn try_wait(&mut self) -> Option<ChildExit> {
@@ -545,25 +658,22 @@ impl WorkerHandle for ProcessHandle {
         }
     }
 
-    fn wait(&mut self) {
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for ProcessHandle {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    async fn wait(&mut self) {
+        let _ = self.child.wait().await;
     }
 }
 
 impl WorkerLauncher for ProcessLauncher {
     fn spawn(&self, spec: &ChildSpec) -> io::Result<Box<dyn WorkerHandle>> {
-        let child = Command::new(&spec.exe)
+        let child = tokio::process::Command::new(&spec.exe)
             .args(&spec.args)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .spawn()?;
+        if let Some(job) = &self.job {
+            job.assign(&child);
+        }
         Ok(Box::new(ProcessHandle { child }))
     }
 }
@@ -576,6 +686,8 @@ impl WsProbe {
     const RETRY_DELAY: Duration = Duration::from_millis(500);
     const REQUEST: &'static str = r#"{"id":1,"method":"model_props"}"#;
     const KEY_RESULT: &'static str = "result";
+    const KEY_ID: &'static str = "id";
+    const REQUEST_ID: i64 = 1;
 
     async fn attempt(url: &str) -> bool {
         let Ok((mut ws, _)) = tokio_tungstenite::connect_async(url).await else {
@@ -587,7 +699,10 @@ impl WsProbe {
         while let Some(Ok(frame)) = ws.next().await {
             if let Message::Text(text) = frame {
                 return serde_json::from_str::<serde_json::Value>(text.as_str())
-                    .map(|v| v.get(Self::KEY_RESULT).is_some())
+                    .map(|v| {
+                        v.get(Self::KEY_ID).and_then(|id| id.as_i64()) == Some(Self::REQUEST_ID)
+                            && v.get(Self::KEY_RESULT).is_some()
+                    })
                     .unwrap_or(false);
             }
         }
@@ -624,6 +739,7 @@ mod tests {
         exit: ExitFlag,
     }
 
+    #[async_trait]
     impl WorkerHandle for FakeHandle {
         fn kill(&mut self) {
             self.events
@@ -637,7 +753,7 @@ mod tests {
             *self.exit.lock().unwrap()
         }
 
-        fn wait(&mut self) {
+        async fn wait(&mut self) {
             self.events
                 .lock()
                 .unwrap()
@@ -765,6 +881,7 @@ mod tests {
     fn config() -> ManagerConfig {
         ManagerConfig {
             ready_timeout: Duration::from_millis(60),
+            ready_grace: Duration::from_millis(20),
             poll_interval: Duration::from_millis(5),
             health_interval: Duration::from_secs(3600),
         }
@@ -824,6 +941,18 @@ mod tests {
         let err = m.start("llamacpp", "lla").await.unwrap_err();
         assert!(matches!(err, ManagerError::WorkerExited(Some(1))));
         assert_eq!(m.list()[0].state, HarnessState::Failed);
+    }
+
+    #[tokio::test]
+    async fn start_fails_when_probe_never_returns() {
+        let l = FakeLauncher::default();
+        let m = manager("hang", l.clone(), FakeProbe::new(Mode::Hang));
+        let started = std::time::Instant::now();
+        let err = m.start("llamacpp", "lla").await.unwrap_err();
+        assert!(matches!(err, ManagerError::LoadTimeout));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(m.list()[0].state, HarnessState::Failed);
+        assert!(events(&l).contains(&"kill:llamacpp.exe".to_string()));
     }
 
     #[tokio::test]
