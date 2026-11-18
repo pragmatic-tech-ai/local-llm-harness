@@ -2,6 +2,8 @@ import './fonts.css'
 import { app } from './app.mu.js'
 import { HarnessClient } from './HarnessClient'
 import { ChatViewModel } from './ChatViewModel'
+import { SupervisorClient } from './SupervisorClient'
+import { ShellViewModel } from './ShellViewModel'
 import { HtmlTarget } from '@pragmatic-tech-ai/mural/visual-engine'
 import { ThemeManager, Density } from '@pragmatic-tech-ai/mural/runtime'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework'
@@ -30,17 +32,30 @@ class RendererBootstrap
         }
         const host = document.getElementById(RendererBootstrap.AppElementId) as HTMLElement
         app.initialize(new HtmlTarget(host))
-        const url = await window.harness.BackendUrl()
-        const client = new HarnessClient()
-        if (url !== null)
+        const contentHost = app.Services.getRequired(ContentHostService.Key)
+        const supervisorUrl = await window.harness.SupervisorUrl()
+        if (supervisorUrl !== null)
         {
-            client.Connect(url)
+            const supervisor = new SupervisorClient()
+            supervisor.Connect(supervisorUrl)
+            const shell = new ShellViewModel(supervisor)
+            contentHost.View(shell)
+            shell.Start()
         }
         else
         {
-            console.warn(RendererBootstrap.NoBackendWarning)
+            const url = await window.harness.BackendUrl()
+            const client = new HarnessClient()
+            if (url !== null)
+            {
+                client.Connect(url)
+            }
+            else
+            {
+                console.warn(RendererBootstrap.NoBackendWarning)
+            }
+            contentHost.View(new ChatViewModel(client))
         }
-        app.Services.getRequired(ContentHostService.Key).View(new ChatViewModel(client))
         RendererBootstrap.RemoveSplash()
     }
 

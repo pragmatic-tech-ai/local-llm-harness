@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import { Sidecar } from './sidecar'
 import { BackendUrl } from './backend-url'
+import { SupervisorUrl } from './supervisor-url'
 
 /** Owns the BrowserWindow and the Rust backend sidecar for the app's lifetime. */
 export class MainApplication
@@ -10,6 +11,7 @@ export class MainApplication
     private static readonly AppUserModelId = 'com.local-llm-harness.app'
     private static readonly BackgroundColor = '#0A0A0B'
     private static readonly BackendUrlChannel = 'backend-url'
+    private static readonly SupervisorUrlChannel = 'supervisor-url'
     private static readonly BeforeQuitEvent = 'before-quit'
     private static readonly BrowserWindowCreatedEvent = 'browser-window-created'
     private static readonly ActivateEvent = 'activate'
@@ -34,6 +36,7 @@ export class MainApplication
         bind: process.env[MainApplication.BindEnv],
     })
     private readonly remoteUrl: string | null = MainApplication.ResolveBackendUrl(process.env)
+    private readonly supervisorUrl: string | null = SupervisorUrl.Resolve(process.env)
     private quitting = false
     private startPromise: Promise<unknown> | null = null
 
@@ -52,6 +55,7 @@ export class MainApplication
                 console.error(MainApplication.ExitMessage + code)
             }
         })
+        ipcMain.handle(MainApplication.SupervisorUrlChannel, () => this.supervisorUrl)
         ipcMain.handle(MainApplication.BackendUrlChannel, async () =>
         {
             if (this.remoteUrl)
@@ -92,7 +96,7 @@ export class MainApplication
                 this.CreateWindow()
             }
         })
-        if (this.remoteUrl)
+        if (this.supervisorUrl || this.remoteUrl)
         {
             this.CreateWindow()
             return

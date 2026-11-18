@@ -13,7 +13,7 @@ resources ChatResources {
                     TextBlock [ Text = "Send" ]
                 }
                 TextBox [ Text = $Draft, AcceptsReturn = true, SubmitsOnEnter = true, TextWrapping = Wrap,
-                          MaxHeight = 200, Placeholder = "Message the model…" ]
+                          MaxHeight = 200, IsEnabled = $CanChat, Placeholder = "Message the model (load a harness first)…" ]
             }
             ScrollViewer [ HorizontalScrollEnabled = false, AutoScrollToEnd = true ] {
                 ItemsControl [ ItemsSource = $Transcript, ItemsPanel = @VerticalStackPanel ]
