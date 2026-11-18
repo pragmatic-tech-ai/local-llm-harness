@@ -19,6 +19,7 @@ resources HarnessPanelResources {
                 Button [ DockPanel.Dock = Left, Command = $StopCommand, Margin = (0,0,12,0) ] {
                     TextBlock [ Text = "Stop" ]
                 }
+                TextBlock [ DockPanel.Dock = Left, Text = $State, Style = @BodySm, Foreground = @Fg2, FontFamily = "Consolas", VerticalAlignment = Center, Margin = (0,0,12,0) ]
                 TextBlock [ Text = $StatusText, Foreground = @Fg2, VerticalAlignment = Center, TextWrapping = Wrap ]
             }
         }
