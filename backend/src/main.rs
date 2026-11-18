@@ -24,6 +24,9 @@ struct Config {
     /// GPU layers to offload for the in-process engine.
     #[arg(long, env = "HARNESS_NGL")]
     n_gpu_layers: Option<i32>,
+    /// Path to tokenizer.json (candle engine).
+    #[arg(long, env = "HARNESS_TOKENIZER")]
+    tokenizer: Option<String>,
 }
 
 impl Config {
@@ -34,6 +37,7 @@ impl Config {
             model: self.model.clone(),
             n_ctx: self.n_ctx,
             n_gpu_layers: self.n_gpu_layers,
+            tokenizer: self.tokenizer.clone(),
         }
     }
 }

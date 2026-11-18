@@ -18,6 +18,8 @@ pub enum EngineKind {
     Http,
     /// Run llama.cpp in-process (requires the `llamacpp` feature).
     Llamacpp,
+    /// Run pure-Rust HuggingFace candle in-process (requires the `candle` feature).
+    Candle,
 }
 
 /// Engine-selection inputs, independent of how they were parsed (CLI/env).
@@ -28,6 +30,8 @@ pub struct EngineConfig {
     pub model: Option<String>,
     pub n_ctx: Option<u32>,
     pub n_gpu_layers: Option<i32>,
+    /// Path to a `tokenizer.json` (candle engine).
+    pub tokenizer: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +40,8 @@ pub enum EngineBuildError {
     MissingServerUrl,
     #[error("the llamacpp engine requires a model path (--model / HARNESS_MODEL)")]
     MissingModel,
+    #[error("the candle engine requires a tokenizer path (--tokenizer / HARNESS_TOKENIZER)")]
+    MissingTokenizer,
     #[error("the llamacpp engine is not compiled in (rebuild with --features llamacpp)")]
     FeatureDisabled,
     #[error("failed to load the llamacpp engine: {0}")]
@@ -50,7 +56,19 @@ pub fn validate(cfg: &EngineConfig) -> Result<(), EngineBuildError> {
         EngineKind::Http if cfg.server_url.is_none() => Err(EngineBuildError::MissingServerUrl),
         EngineKind::Http => Ok(()),
         EngineKind::Llamacpp => validate_llamacpp(cfg),
+        EngineKind::Candle => validate_candle(cfg),
     }
+}
+
+/// `Candle` validation: a gguf model path and a tokenizer.json path are both required.
+fn validate_candle(cfg: &EngineConfig) -> Result<(), EngineBuildError> {
+    if cfg.model.is_none() {
+        return Err(EngineBuildError::MissingModel);
+    }
+    if cfg.tokenizer.is_none() {
+        return Err(EngineBuildError::MissingTokenizer);
+    }
+    Ok(())
 }
 
 /// `Llamacpp` validation when the feature is compiled in: a model path is required.
@@ -97,6 +115,13 @@ pub async fn build_engine(
         }
         #[cfg(not(feature = "llamacpp"))]
         EngineKind::Llamacpp => Err(EngineBuildError::FeatureDisabled),
+        #[cfg(feature = "candle")]
+        EngineKind::Candle => {
+            // TODO(Task 3): wire CandleEngine::load
+            Err(EngineBuildError::FeatureDisabled)
+        }
+        #[cfg(not(feature = "candle"))]
+        EngineKind::Candle => Err(EngineBuildError::FeatureDisabled),
     }
 }
 
@@ -111,6 +136,7 @@ mod tests {
             model: None,
             n_ctx: None,
             n_gpu_layers: None,
+            tokenizer: None,
         }
     }
 
@@ -149,6 +175,27 @@ mod tests {
             validate(&c),
             Err(EngineBuildError::FeatureDisabled)
         ));
+    }
+
+    #[test]
+    fn candle_requires_model_and_tokenizer() {
+        let mut c = cfg(EngineKind::Candle);
+        assert!(matches!(validate(&c), Err(EngineBuildError::MissingModel)));
+        c.model = Some("m.gguf".into());
+        assert!(matches!(
+            validate(&c),
+            Err(EngineBuildError::MissingTokenizer)
+        ));
+        c.tokenizer = Some("tokenizer.json".into());
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn engine_kind_parses_candle() {
+        assert_eq!(
+            EngineKind::from_str("candle", true).unwrap(),
+            EngineKind::Candle
+        );
     }
 
     #[test]
