@@ -28,7 +28,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"], 
 # toolchain to build, so it is deliberately absent from the default feature set.
 llamacpp = ["dep:llama-cpp-2", "llama-cpp-2/cuda", "tokio/sync"]
 # In-process pure-Rust candle engine (CPU). No GPU/C toolchain needed.
-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "tokio/sync"]
 # candle plus CUDA kernels; built where the CUDA toolchain exists.
 candle-cuda = ["candle", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 

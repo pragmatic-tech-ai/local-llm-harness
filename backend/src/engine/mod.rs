@@ -1,3 +1,5 @@
+#[cfg(feature = "candle")]
+pub mod candle;
 pub mod factory;
 pub mod http;
 #[cfg(feature = "llamacpp")]
@@ -9,6 +11,8 @@ pub mod types;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+#[cfg(feature = "candle")]
+pub use candle::CandleEngine;
 pub use factory::{build_engine, validate, EngineBuildError, EngineConfig, EngineKind};
 pub use http::HttpEngine;
 #[cfg(feature = "llamacpp")]
