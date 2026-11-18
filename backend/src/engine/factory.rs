@@ -48,9 +48,26 @@ pub enum EngineBuildError {
 pub fn validate(cfg: &EngineConfig) -> Result<(), EngineBuildError> {
     match cfg.kind {
         EngineKind::Http if cfg.server_url.is_none() => Err(EngineBuildError::MissingServerUrl),
-        EngineKind::Llamacpp if cfg.model.is_none() => Err(EngineBuildError::MissingModel),
-        _ => Ok(()),
+        EngineKind::Http => Ok(()),
+        EngineKind::Llamacpp => validate_llamacpp(cfg),
     }
+}
+
+/// `Llamacpp` validation when the feature is compiled in: a model path is required.
+#[cfg(feature = "llamacpp")]
+fn validate_llamacpp(cfg: &EngineConfig) -> Result<(), EngineBuildError> {
+    if cfg.model.is_none() {
+        return Err(EngineBuildError::MissingModel);
+    }
+    Ok(())
+}
+
+/// `Llamacpp` validation when the feature is absent: report that the engine isn't built in,
+/// taking precedence over the missing-model check so the user learns to rebuild with
+/// `--features llamacpp` rather than being asked for an unusable model path.
+#[cfg(not(feature = "llamacpp"))]
+fn validate_llamacpp(_cfg: &EngineConfig) -> Result<(), EngineBuildError> {
+    Err(EngineBuildError::FeatureDisabled)
 }
 
 pub async fn build_engine(
@@ -108,12 +125,30 @@ mod tests {
         assert!(validate(&c).is_ok());
     }
 
+    #[cfg(feature = "llamacpp")]
     #[test]
     fn llamacpp_requires_model_path() {
         let mut c = cfg(EngineKind::Llamacpp);
         assert!(matches!(validate(&c), Err(EngineBuildError::MissingModel)));
         c.model = Some("m.gguf".into());
         assert!(validate(&c).is_ok());
+    }
+
+    #[cfg(not(feature = "llamacpp"))]
+    #[test]
+    fn llamacpp_reports_feature_disabled_when_absent() {
+        // Without the feature the kind is rejected as not-built-in, and that takes precedence
+        // over the missing-model check (model present or not).
+        let mut c = cfg(EngineKind::Llamacpp);
+        assert!(matches!(
+            validate(&c),
+            Err(EngineBuildError::FeatureDisabled)
+        ));
+        c.model = Some("m.gguf".into());
+        assert!(matches!(
+            validate(&c),
+            Err(EngineBuildError::FeatureDisabled)
+        ));
     }
 
     #[test]

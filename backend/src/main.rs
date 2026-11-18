@@ -42,8 +42,13 @@ impl Config {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
     let (engine, mut props) = build_engine(&config.engine_config()).await?;
-    if let Some(model) = &config.model {
-        props.model_name = model.clone();
+    // `--model` is a human label only for the HTTP engine; for the in-process llamacpp engine it
+    // is the gguf file path, so overriding there would leak the absolute path to the client. Keep
+    // the engine-computed label (the file stem) for llamacpp.
+    if config.engine == EngineKind::Http {
+        if let Some(model) = &config.model {
+            props.model_name = model.clone();
+        }
     }
     let listener = TcpListener::bind(&config.bind).await?;
     println!(

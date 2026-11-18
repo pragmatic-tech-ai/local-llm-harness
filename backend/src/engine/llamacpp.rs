@@ -66,8 +66,7 @@ impl LocalLlamaEngine {
         n_ctx: u32,
         n_gpu_layers: i32,
     ) -> Result<Self> {
-        let backend = LlamaBackend::init()
-            .map_err(|e| EngineError::Protocol(format!("llama backend init failed: {e}")))?;
+        let backend = Self::shared_backend()?;
 
         let mut model_params = LlamaModelParams::default();
         // The default is -1 ("all layers on GPU"); only override when the caller gave a concrete,
@@ -84,11 +83,29 @@ impl LocalLlamaEngine {
             .unwrap_or_else(|| Self::file_stem(model_path));
 
         Ok(Self {
-            backend: Arc::new(backend),
+            backend,
             model: Arc::new(model),
             n_ctx,
             model_name,
         })
+    }
+
+    /// Returns the process-global `LlamaBackend`, initializing it on first use.
+    ///
+    /// `LlamaBackend::init` must run exactly once per process; guarding it behind a `OnceLock`
+    /// makes a second `load` (or any future second construction) reuse the first backend instead
+    /// of re-initializing. If two threads race the first init, the first to publish wins and the
+    /// loser's (equivalent) backend is dropped.
+    fn shared_backend() -> Result<Arc<LlamaBackend>> {
+        static BACKEND: std::sync::OnceLock<Arc<LlamaBackend>> = std::sync::OnceLock::new();
+        if let Some(backend) = BACKEND.get() {
+            return Ok(backend.clone());
+        }
+        let backend = Arc::new(
+            LlamaBackend::init()
+                .map_err(|e| EngineError::Protocol(format!("llama backend init failed: {e}")))?,
+        );
+        Ok(BACKEND.get_or_init(|| backend).clone())
     }
 
     /// Model label fallback: the gguf file stem (e.g. `gemma-3-12b-it` from `.../gemma-3-12b-it.gguf`).
@@ -145,8 +162,8 @@ impl LocalLlamaEngine {
     }
 
     /// The decode/sample loop. Sends one non-stop chunk per generated token and always finishes
-    /// with a single `stop: true` chunk (on EOS or the `max_tokens` cap). A dropped receiver is a
-    /// clean early return, not an error.
+    /// with a single `stop: true` chunk (on EOS, the `max_tokens` cap, or context exhaustion). A
+    /// dropped receiver is a clean early return, not an error.
     fn try_generate(
         backend: &LlamaBackend,
         model: &LlamaModel,
@@ -205,8 +222,11 @@ impl LocalLlamaEngine {
 
         loop {
             let idx = batch.n_tokens() - 1;
-            // Raw logits for this step drive the reported logprobs; the sampler reads the same
-            // index, so the distribution we report is exactly the one we sampled from.
+            // The reported logprobs are the raw model logits for this position (via
+            // `get_logits_ith`), matching the HTTP engine's shape. They are NOT the distribution
+            // we actually sampled from: the sampler applies penalties/top-k/top-p/temperature to
+            // this same index before drawing, so the index alignment is correct but the reported
+            // distribution is the pre-sampling (raw) one, not the post-penalty sampling one.
             let logits = ctx.get_logits_ith(idx);
             let token = sampler.sample(&ctx, idx);
             sampler.accept(token);
@@ -238,6 +258,14 @@ impl LocalLlamaEngine {
             }
 
             if max >= 0 && generated >= max {
+                break;
+            }
+
+            // Context window is full: adding the next token at position `n_cur` and decoding it
+            // would push past `n_ctx` and make `ctx.decode` fail. Stop cleanly here so a reply
+            // capped by the context window ends with the terminal stop chunk, like the EOS and
+            // `max_tokens` cases, instead of erroring out and dropping the partial reply.
+            if n_cur >= n_ctx as i32 {
                 break;
             }
 

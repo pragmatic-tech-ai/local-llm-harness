@@ -3,10 +3,10 @@ export class BackendUrl
 {
     private static readonly BackendUrlEnv = 'HARNESS_BACKEND_URL'
 
-    /** The remote backend url from the environment, or null when unset/empty (spawn the local sidecar). */
+    /** The remote backend url from the environment, or null when unset/empty/whitespace (spawn the local sidecar). */
     public static Resolve(env: NodeJS.ProcessEnv): string | null
     {
-        const url = env[BackendUrl.BackendUrlEnv]
+        const url = env[BackendUrl.BackendUrlEnv]?.trim()
         return url ? url : null
     }
 }
