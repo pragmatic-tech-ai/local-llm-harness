@@ -101,14 +101,75 @@ describe('HarnessPickerViewModel', () =>
         expect(rig.Method(4)).toBe('stop')
         expect(rig.picker.State).toBe('stopped')
         expect(rig.cleared).toBe(1)
-        rig.Reply(5, {})
+    })
+
+    it('start_reply_before_harness_changed_raises_ready_once', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.StartCommand.Execute()
+        const info: HarnessInfo = { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://h1' }
+        rig.Reply(4, info)
         await rig.Flush()
+        rig.client.HandleFrame(JSON.stringify({ method: 'harness_changed', params: info }))
+        expect(rig.picker.State).toBe('ready')
+        expect(rig.ready).toEqual(['ws://h1'])
+    })
+
+    it('restart_after_failed_reaches_ready', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.StartCommand.Execute()
+        rig.client.HandleFrame(JSON.stringify({ method: 'harness_changed', params: { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'failed' } }))
+        rig.Fail(4, 'boom')
+        await rig.Flush()
+        rig.picker.StartCommand.Execute()
+        const info: HarnessInfo = { id: 'h2', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://h2' }
+        rig.client.HandleFrame(JSON.stringify({ method: 'harness_changed', params: info }))
+        rig.Reply(5, info)
+        await rig.Flush()
+        expect(rig.picker.State).toBe('ready')
+        expect(rig.ready).toEqual(['ws://h2'])
+    })
+
+    it('restart_after_ready_reaches_ready', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.StartCommand.Execute()
+        rig.Reply(4, { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://h1' })
+        await rig.Flush()
+        rig.picker.StartCommand.Execute()
+        expect(rig.picker.State).toBe('loading')
+        const info: HarnessInfo = { id: 'h2', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://h2' }
+        rig.Reply(5, info)
+        await rig.Flush()
+        expect(rig.picker.State).toBe('ready')
+        expect(rig.ready).toEqual(['ws://h1', 'ws://h2'])
+    })
+
+    it('stop_during_loading_is_final', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.StartCommand.Execute()
+        rig.picker.StopCommand.Execute()
+        expect(rig.picker.State).toBe('stopped')
+        const info: HarnessInfo = { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://h1' }
+        rig.client.HandleFrame(JSON.stringify({ method: 'harness_changed', params: info }))
+        rig.Reply(4, info)
+        await rig.Flush()
+        expect(rig.picker.State).toBe('stopped')
+        expect(rig.ready).toEqual([])
+        expect(rig.Method(rig.socket.sent.length - 1)).toBe('stop')
     })
 
     it('harness_changed_to_failed_updates_state', async () =>
     {
         const rig = new Rig()
         await rig.Populate()
+        rig.picker.StartCommand.Execute()
         rig.client.HandleFrame(JSON.stringify({ method: 'harness_changed', params: { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'failed' } }))
         expect(rig.picker.State).toBe('failed')
         expect(rig.picker.StatusText).not.toBe('')

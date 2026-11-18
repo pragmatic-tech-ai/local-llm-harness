@@ -15,6 +15,12 @@ export class HarnessPickerViewModel extends Observable
     private static readonly StoppedText = 'Stopped'
     private static readonly StopFailedFormat = 'stop failed: {0}'
     private static readonly RefreshFailedFormat = 'refresh failed: {0}'
+    private static readonly PropSelectedRuntime = 'SelectedRuntime'
+    private static readonly PropSelectedModel = 'SelectedModel'
+    private static readonly PropState = 'State'
+    private static readonly PropStatusText = 'StatusText'
+    private static readonly PropCanStart = 'CanStart'
+    private static readonly PropCanStop = 'CanStop'
     private static readonly FormatToken = /\{(\d+)\}/g
 
     private _selectedRuntime: RuntimeInfo | null = null
@@ -24,6 +30,10 @@ export class HarnessPickerViewModel extends Observable
     private _canStart = false
     private _canStop = false
     private currentId: string | null = null
+    /** True while a launch is in flight or a harness is live; events are ignored once the user stops. */
+    private active = false
+    /** Ids of harnesses the user stopped (or whose start was superseded); their late events are dropped. */
+    private readonly ignoredIds = new Set<string>()
     /** Bumped on Stop so a late Start response for a cancelled launch is ignored. */
     private generation = 0
     private readonly _startCommand: RelayCommand
@@ -49,7 +59,7 @@ export class HarnessPickerViewModel extends Observable
 
     public set SelectedRuntime(v: RuntimeInfo | null)
     {
-        this.Change('SelectedRuntime', this._selectedRuntime, v, x => this._selectedRuntime = x)
+        this.Change(HarnessPickerViewModel.PropSelectedRuntime, this._selectedRuntime, v, x => this._selectedRuntime = x)
         this.Reevaluate()
     }
 
@@ -60,7 +70,7 @@ export class HarnessPickerViewModel extends Observable
 
     public set SelectedModel(v: ModelInfo | null)
     {
-        this.Change('SelectedModel', this._selectedModel, v, x => this._selectedModel = x)
+        this.Change(HarnessPickerViewModel.PropSelectedModel, this._selectedModel, v, x => this._selectedModel = x)
         this.Reevaluate()
     }
 
@@ -120,6 +130,8 @@ export class HarnessPickerViewModel extends Observable
             }
             if (harnesses.length > 0)
             {
+                // Single-harness model: the supervisor runs at most one, so adopt the first.
+                this.active = true
                 this.ApplyInfo(harnesses[0])
             }
         }
@@ -138,6 +150,8 @@ export class HarnessPickerViewModel extends Observable
             return
         }
         const gen = ++this.generation
+        this.currentId = null
+        this.active = true
         this.SetState(HarnessPickerViewModel.StateLoading,
             HarnessPickerViewModel.Format(HarnessPickerViewModel.LoadingFormat, runtime.name, model.name))
         try
@@ -147,14 +161,24 @@ export class HarnessPickerViewModel extends Observable
             {
                 this.ApplyInfo(info)
             }
+            else
+            {
+                // Superseded by Stop/Start while loading: shut the orphan down and ignore its events.
+                this.ignoredIds.add(info.id)
+                this.client.Stop(info.id).catch(() => undefined)
+            }
         }
         catch (e)
         {
             if (gen === this.generation)
             {
+                const previous = this._state
                 this.currentId = null
                 this.SetState(HarnessPickerViewModel.StateFailed, HarnessPickerViewModel.Message(e))
-                this.OnCleared.Raise(undefined)
+                if (previous !== HarnessPickerViewModel.StateFailed)
+                {
+                    this.OnCleared.Raise(undefined)
+                }
             }
         }
     }
@@ -163,7 +187,12 @@ export class HarnessPickerViewModel extends Observable
     {
         const id = this.currentId
         this.generation++
+        this.active = false
         this.currentId = null
+        if (id !== null)
+        {
+            this.ignoredIds.add(id)
+        }
         this.SetState(HarnessPickerViewModel.StateStopped, HarnessPickerViewModel.StoppedText)
         this.OnCleared.Raise(undefined)
         if (id === null)
@@ -183,7 +212,7 @@ export class HarnessPickerViewModel extends Observable
     /** State is keyed off the harness info, not message order; transitions fire the signals once. */
     private ApplyInfo(info: HarnessInfo): void
     {
-        if (this.currentId !== null && this.currentId !== info.id)
+        if (!this.active || this.ignoredIds.has(info.id) || (this.currentId !== null && this.currentId !== info.id))
         {
             return
         }
@@ -221,22 +250,22 @@ export class HarnessPickerViewModel extends Observable
 
     private SetState(state: string, text: string): void
     {
-        this.Change('State', this._state, state, x => this._state = x)
+        this.Change(HarnessPickerViewModel.PropState, this._state, state, x => this._state = x)
         this.SetStatus(text)
         this.Reevaluate()
     }
 
     private SetStatus(text: string): void
     {
-        this.Change('StatusText', this._statusText, text, x => this._statusText = x)
+        this.Change(HarnessPickerViewModel.PropStatusText, this._statusText, text, x => this._statusText = x)
     }
 
     private Reevaluate(): void
     {
         const loading = this._state === HarnessPickerViewModel.StateLoading
         const stoppable = loading || this._state === HarnessPickerViewModel.StateReady || this._state === HarnessPickerViewModel.StateFailed
-        this.Change('CanStart', this._canStart, this._selectedRuntime !== null && this._selectedModel !== null && !loading, x => this._canStart = x)
-        this.Change('CanStop', this._canStop, stoppable, x => this._canStop = x)
+        this.Change(HarnessPickerViewModel.PropCanStart, this._canStart, this._selectedRuntime !== null && this._selectedModel !== null && !loading, x => this._canStart = x)
+        this.Change(HarnessPickerViewModel.PropCanStop, this._canStop, stoppable, x => this._canStop = x)
         this._startCommand.RaiseCanExecuteChanged()
         this._stopCommand.RaiseCanExecuteChanged()
     }
