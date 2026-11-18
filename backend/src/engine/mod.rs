@@ -1,9 +1,11 @@
+pub mod factory;
 pub mod http;
 pub mod types;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+pub use factory::{build_engine, validate, EngineBuildError, EngineConfig, EngineKind};
 pub use http::HttpEngine;
 pub use types::{
     ChatMessage, CompletionChunk, ModelProps, Role, SamplingConfig, TokenInfo, TokenizeResult,

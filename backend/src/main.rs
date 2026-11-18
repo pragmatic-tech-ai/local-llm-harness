@@ -1,31 +1,49 @@
-use std::sync::Arc;
-
-use backend::engine::{Engine, HttpEngine};
+use backend::engine::{build_engine, EngineConfig, EngineKind};
 use backend::rpc;
 use clap::Parser;
 use tokio::net::TcpListener;
 
-/// Local LLM harness backend: JSON-RPC over WebSocket in front of a llama.cpp server.
+/// Local LLM harness backend: JSON-RPC over WebSocket in front of an inference engine.
 #[derive(Debug, Parser)]
 struct Config {
     /// Address:port the WebSocket server binds to.
     #[arg(long, env = "HARNESS_BIND", default_value = "127.0.0.1:8777")]
     bind: String,
-    /// Upstream llama-server base URL.
+    /// Which engine implementation to use.
+    #[arg(long, env = "HARNESS_ENGINE", value_enum, default_value = "http")]
+    engine: EngineKind,
+    /// Upstream llama-server base URL (http engine).
     #[arg(long, env = "HARNESS_SERVER_URL")]
-    server_url: String,
-    /// Informational model label.
+    server_url: Option<String>,
+    /// Model label (http engine) or model file path (in-process engine).
     #[arg(long, env = "HARNESS_MODEL")]
     model: Option<String>,
+    /// Context size for the in-process engine.
+    #[arg(long, env = "HARNESS_N_CTX")]
+    n_ctx: Option<u32>,
+    /// GPU layers to offload for the in-process engine.
+    #[arg(long, env = "HARNESS_NGL")]
+    n_gpu_layers: Option<i32>,
+}
+
+impl Config {
+    fn engine_config(&self) -> EngineConfig {
+        EngineConfig {
+            kind: self.engine,
+            server_url: self.server_url.clone(),
+            model: self.model.clone(),
+            n_ctx: self.n_ctx,
+            n_gpu_layers: self.n_gpu_layers,
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
-    let engine: Arc<dyn Engine> = Arc::new(HttpEngine::new(config.server_url.clone()));
-    let mut props = engine.props().await?;
-    if let Some(model) = config.model {
-        props.model_name = model;
+    let (engine, mut props) = build_engine(&config.engine_config()).await?;
+    if let Some(model) = &config.model {
+        props.model_name = model.clone();
     }
     let listener = TcpListener::bind(&config.bind).await?;
     println!(
@@ -33,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener.local_addr()?,
         props.model_name,
         props.n_ctx,
-        config.server_url
+        config.server_url.as_deref().unwrap_or("in-process")
     );
     rpc::serve(listener, engine, props, None).await;
     Ok(())
