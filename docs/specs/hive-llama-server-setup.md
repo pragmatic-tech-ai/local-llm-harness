@@ -31,3 +31,29 @@ Generation works. Throughput at -ngl 28: about 10.9 tok/s decode (about 6.5 to 7
 - Server has no API key and CORS allows all origins; it is open to the whole LAN.
 - Not auto-started on reboot; only 4096 context.
 - Do not start LM Studio concurrently (VRAM contention).
+
+## In-process build toolchain (for the `llamacpp` engine)
+
+Installed 2026-11-18 so the hive can build the backend's in-process llama.cpp
+engine (`cargo build --features llamacpp`) itself. GPU is the RTX 3060 Laptop
+(6 GB, Ampere `sm_86`), driver 621.24.
+
+- **Rust** 1.100 (already present).
+- **Visual Studio Build Tools 2022** 17.14 with the C++ workload — MSVC
+  `cl.exe` 14.44 at
+  `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\`.
+  Install: `winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"`.
+- **CUDA Toolkit** 13.5 (`nvcc` at
+  `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.5\bin\nvcc.exe`).
+  Install: `winget install --id Nvidia.CUDA -e`. CUDA 13 still supports Ampere
+  `sm_86`; driver 621.24 supports CUDA 13.5.
+- **CMake** 4.4.4 (`C:\Program Files\CMake\bin\cmake.exe`). `winget install --id Kitware.CMake -e`.
+- **LLVM/clang** 22.1.8 (`libclang.dll` at `C:\Program Files\LLVM\bin`), needed
+  by bindgen. `winget install --id LLVM.LLVM -e`. Machine env var
+  `LIBCLANG_PATH=C:\Program Files\LLVM\bin` is set so bindgen finds it.
+
+A CUDA build must run from an MSVC developer environment (so `cl.exe` is on
+PATH for nvcc's host compiler). From a plain shell, initialise it with
+`vcvars64.bat` (under the BuildTools `VC\Auxiliary\Build\`) and ensure the CUDA
+and CMake `bin` directories and `LIBCLANG_PATH` are on PATH before invoking
+`cargo`.
