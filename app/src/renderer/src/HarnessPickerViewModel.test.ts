@@ -149,6 +149,22 @@ describe('HarnessPickerViewModel', () =>
         expect(rig.ready).toEqual(['ws://h1', 'ws://h2'])
     })
 
+    it('late_event_from_replaced_harness_is_ignored', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.StartCommand.Execute()
+        rig.Reply(4, { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://h1' })
+        await rig.Flush()
+        rig.picker.StartCommand.Execute()
+        rig.client.HandleFrame(JSON.stringify({ method: 'harness_changed', params: { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'stopped' } }))
+        expect(rig.picker.State).toBe('loading')
+        rig.Reply(5, { id: 'h2', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://h2' })
+        await rig.Flush()
+        expect(rig.picker.State).toBe('ready')
+        expect(rig.ready).toEqual(['ws://h1', 'ws://h2'])
+    })
+
     it('stop_during_loading_is_final', async () =>
     {
         const rig = new Rig()

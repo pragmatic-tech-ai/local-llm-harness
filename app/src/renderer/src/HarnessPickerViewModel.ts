@@ -131,8 +131,12 @@ export class HarnessPickerViewModel extends Observable
             if (harnesses.length > 0)
             {
                 // Single-harness model: the supervisor runs at most one, so adopt the first.
-                this.active = true
-                this.ApplyInfo(harnesses[0])
+                // Only an adopted (non-ignored) harness activates the picker.
+                if (!this.ignoredIds.has(harnesses[0].id))
+                {
+                    this.active = true
+                    this.ApplyInfo(harnesses[0])
+                }
             }
         }
         catch (e)
@@ -150,6 +154,11 @@ export class HarnessPickerViewModel extends Observable
             return
         }
         const gen = ++this.generation
+        if (this.currentId !== null)
+        {
+            // A late event from the harness being replaced must not disturb the new load.
+            this.ignoredIds.add(this.currentId)
+        }
         this.currentId = null
         this.active = true
         this.SetState(HarnessPickerViewModel.StateLoading,
@@ -209,6 +218,9 @@ export class HarnessPickerViewModel extends Observable
         }
     }
 
+    /** Accepted limitation: events carry only a harness id, so a sub-second Stop then Start before the first
+     *  launch's reply can momentarily adopt the first launch's harness_changed as the second launch's;
+     *  the stale reply self-heals this when it lands (it is ignored and its harness stopped). */
     /** State is keyed off the harness info, not message order; transitions fire the signals once. */
     private ApplyInfo(info: HarnessInfo): void
     {
