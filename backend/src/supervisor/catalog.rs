@@ -15,6 +15,7 @@ pub enum RuntimeKind {
 
 /// One launchable runtime (a backend executable plus its default parameters).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeDef {
     pub name: String,
     pub kind: RuntimeKind,
@@ -43,6 +44,7 @@ pub enum CatalogError {
 
 /// The parsed supervisor catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Catalog {
     #[serde(default, rename = "runtime")]
     pub runtimes: Vec<RuntimeDef>,
@@ -158,6 +160,33 @@ internal_port = 8080
         let text = "[[runtime]]\nname = \"x\"\nkind = \"bogus\"\nexe = \"x.exe\"\n";
         assert!(matches!(
             Catalog::from_toml(text),
+            Err(CatalogError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn load_reads_and_parses_a_file() {
+        let path =
+            std::env::temp_dir().join(format!("catalog-load-ok-{}.toml", std::process::id()));
+        std::fs::write(&path, "worker_port = 1234\n").unwrap();
+        let loaded = Catalog::load(&path);
+        std::fs::remove_file(&path).ok();
+        let c = loaded.unwrap();
+        assert_eq!(c.worker_port, 1234);
+        assert_eq!(c.advertise_host, "192.168.1.101");
+    }
+
+    #[test]
+    fn load_missing_file_is_io_error() {
+        let path =
+            std::env::temp_dir().join(format!("catalog-missing-{}.toml", std::process::id()));
+        assert!(matches!(Catalog::load(&path), Err(CatalogError::Io { .. })));
+    }
+
+    #[test]
+    fn unknown_key_errors() {
+        assert!(matches!(
+            Catalog::from_toml("model_dir = []\n"),
             Err(CatalogError::Parse(_))
         ));
     }
