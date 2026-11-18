@@ -1,6 +1,11 @@
 use backend::engine::{build_engine, EngineConfig, EngineKind};
 use backend::rpc;
+use backend::supervisor::catalog::Catalog;
+use backend::supervisor::control;
+use backend::supervisor::manager::{HarnessManager, ManagerConfig, ProcessLauncher, WsProbe};
 use clap::Parser;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// Local LLM harness backend: JSON-RPC over WebSocket in front of an inference engine.
@@ -27,6 +32,18 @@ struct Config {
     /// Path to tokenizer.json (candle engine).
     #[arg(long, env = "HARNESS_TOKENIZER")]
     tokenizer: Option<String>,
+    /// Run as the supervisor (control server managing worker harnesses) instead of an engine.
+    #[arg(long, env = "HARNESS_SUPERVISOR")]
+    supervisor: bool,
+    /// Address:port the supervisor control server binds to.
+    #[arg(long, env = "HARNESS_SUPERVISOR_BIND", default_value = "0.0.0.0:8778")]
+    supervisor_bind: String,
+    /// Path to the supervisor catalog TOML (required with --supervisor).
+    #[arg(long, env = "HARNESS_CATALOG")]
+    catalog: Option<PathBuf>,
+    /// Host advertised to clients; overrides the catalog's advertise_host.
+    #[arg(long, env = "HARNESS_ADVERTISE_HOST")]
+    advertise_host: Option<String>,
 }
 
 impl Config {
@@ -42,9 +59,41 @@ impl Config {
     }
 }
 
+/// Load the catalog, apply the advertise-host override, and run the supervisor control server.
+async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let path = config
+        .catalog
+        .as_ref()
+        .ok_or("--catalog (or HARNESS_CATALOG) is required with --supervisor")?;
+    let mut catalog = Catalog::load(path)?;
+    if let Some(host) = &config.advertise_host {
+        catalog.advertise_host = host.clone();
+    }
+    let catalog = Arc::new(catalog);
+    let manager = HarnessManager::new(
+        (*catalog).clone(),
+        ProcessLauncher::new(),
+        WsProbe,
+        ManagerConfig::default(),
+    );
+    let listener = TcpListener::bind(&config.supervisor_bind).await?;
+    println!(
+        "supervisor listening on ws://{} (advertise {}, {} runtimes, {} model dirs)",
+        listener.local_addr()?,
+        catalog.advertise_host,
+        catalog.runtimes.len(),
+        catalog.model_dirs.len()
+    );
+    control::serve(listener, Arc::new(manager), catalog).await;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
+    if config.supervisor {
+        return run_supervisor(&config).await;
+    }
     let (engine, mut props) = build_engine(&config.engine_config()).await?;
     // `--model` is a human label only for the HTTP engine; for the in-process llamacpp engine it
     // is the gguf file path, so overriding there would leak the absolute path to the client. Keep
@@ -64,4 +113,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     rpc::serve(listener, engine, props, None).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_flag_parses_bind_and_catalog() {
+        let config = Config::try_parse_from([
+            "backend",
+            "--supervisor",
+            "--supervisor-bind",
+            "0.0.0.0:9999",
+            "--catalog",
+            "C:/x/catalog.toml",
+            "--advertise-host",
+            "10.0.0.5",
+        ])
+        .unwrap();
+        assert!(config.supervisor);
+        assert_eq!(config.supervisor_bind, "0.0.0.0:9999");
+        assert_eq!(config.catalog, Some(PathBuf::from("C:/x/catalog.toml")));
+        assert_eq!(config.advertise_host.as_deref(), Some("10.0.0.5"));
+    }
 }
