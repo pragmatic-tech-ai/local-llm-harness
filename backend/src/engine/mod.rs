@@ -1,5 +1,6 @@
 pub mod factory;
 pub mod http;
+pub mod logprobs;
 pub mod template;
 pub mod types;
 
