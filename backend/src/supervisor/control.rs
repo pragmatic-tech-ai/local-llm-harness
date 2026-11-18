@@ -166,7 +166,7 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
             .into_iter()
             .map(|m| {
                 json!({
-                    "display_name": m.display_name,
+                    "name": m.display_name,
                     "runtimes": m.runtimes,
                     "size_hint": m.size_hint,
                 })
@@ -420,6 +420,7 @@ mod tests {
         let s = server("models");
         let v = s.dispatch("list_models", Value::Null).await.unwrap();
         assert!(!v.as_array().unwrap().is_empty());
+        assert!(v[0].get("name").is_some() && v[0].get("display_name").is_none());
         let text = v.to_string();
         assert!(!text.contains('/') && !text.contains('\\'), "{text}");
         assert!(!text.contains(":\\") && !text.contains("ctl-"), "{text}");

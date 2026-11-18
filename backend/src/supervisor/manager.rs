@@ -92,6 +92,8 @@ impl SpawnPlan {
     const ENV_TOKENIZER: &'static str = "HARNESS_TOKENIZER";
     const ENV_N_CTX: &'static str = "HARNESS_N_CTX";
     const ENV_NGL: &'static str = "HARNESS_NGL";
+    const ENV_SUPERVISOR: &'static str = "HARNESS_SUPERVISOR";
+    const SUPERVISOR_OFF: &'static str = "false";
     const ENV_BIND: &'static str = "HARNESS_BIND";
     const ENV_SERVER_URL: &'static str = "HARNESS_SERVER_URL";
     const ENGINE_CANDLE: &'static str = "candle";
@@ -108,11 +110,18 @@ impl SpawnPlan {
     const ARG_PARALLEL: &'static str = "--parallel";
     const PARALLEL_SLOTS: &'static str = "1";
 
+    /// Env for a child. Always forces `HARNESS_SUPERVISOR=false` so a worker never inherits
+    /// the supervisor's own mode flag (which would make it try to bind the supervisor port).
     fn env(pairs: &[(&str, String)]) -> Vec<(String, String)> {
-        pairs
+        let mut env: Vec<(String, String)> = pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))
-            .collect()
+            .collect();
+        env.push((
+            Self::ENV_SUPERVISOR.to_string(),
+            Self::SUPERVISOR_OFF.to_string(),
+        ));
+        env
     }
 
     fn missing(def: &RuntimeDef, missing: &'static str) -> ManagerError {
@@ -194,7 +203,7 @@ impl SpawnPlan {
                     .iter()
                     .map(|a| (*a).to_string())
                     .collect(),
-                    env: Vec::new(),
+                    env: Self::env(&[]),
                 };
                 let proxy = ChildSpec {
                     exe: def.exe.clone(),
@@ -988,6 +997,21 @@ mod tests {
         assert!(ev.contains(&"kill:llama-server.exe".to_string()));
         assert!(ev.contains(&"kill:proxy.exe".to_string()));
         assert!(m.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_child_env_disables_supervisor_mode() {
+        let flag = ("HARNESS_SUPERVISOR".to_string(), "false".to_string());
+        for (runtime, model) in [("candle", "gem"), ("llamacpp", "lla"), ("http", "lla")] {
+            let l = FakeLauncher::default();
+            let m = manager("supenv", l.clone(), FakeProbe::new(Mode::Ready));
+            m.start(runtime, model).await.unwrap();
+            let specs = l.specs.lock().unwrap().clone();
+            assert!(!specs.is_empty());
+            for spec in specs {
+                assert!(spec.env.contains(&flag), "{runtime}: {:?}", spec.exe);
+            }
+        }
     }
 
     #[tokio::test]
