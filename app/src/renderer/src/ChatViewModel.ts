@@ -8,6 +8,9 @@ export class ChatViewModel extends Observable
 {
     private static readonly DraftProperty = 'Draft'
     private static readonly CanChatProperty = 'CanChat'
+    private static readonly ComposerPlaceholderProperty = 'ComposerPlaceholder'
+    private static readonly NoHarnessHint = 'Start a harness to chat'
+    private static readonly ComposerHint = 'Message the model…'
     private static readonly ErrorFormat = '\n[error: {0}]'
     private static readonly RejectedFormat = '\n[context window full: needed {0} of {1} tokens]'
     private static readonly DisconnectedNote = '\n[disconnected]'
@@ -72,6 +75,13 @@ export class ChatViewModel extends Observable
         this._sendCommand.RaiseCanExecuteChanged()
         this._submitCommand.RaiseCanExecuteChanged()
         this.RaisePropertyChanged(ChatViewModel.CanChatProperty, old, this.CanChat)
+        this.RaisePropertyChanged(ChatViewModel.ComposerPlaceholderProperty, old ? ChatViewModel.ComposerHint : ChatViewModel.NoHarnessHint, this.ComposerPlaceholder)
+    }
+
+    /** Composer hint: explains why the box is disabled when no harness is bound. */
+    public get ComposerPlaceholder(): string
+    {
+        return this.CanChat ? ChatViewModel.ComposerHint : ChatViewModel.NoHarnessHint
     }
 
     public get Draft(): string

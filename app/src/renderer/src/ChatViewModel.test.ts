@@ -131,6 +131,23 @@ describe('ChatViewModel', () =>
         expect(vm.Transcript.ToArray().length).toBe(0)
     })
 
+    it('composer_placeholder_tracks_binding', () =>
+    {
+        const socket = new FakeSocket()
+        const client = new HarnessClient(() => socket)
+        client.Connect('ws://x')
+        socket.Open()
+        const vm = new ChatViewModel()
+        let raised = 0
+        vm.PropertyChanged('ComposerPlaceholder').subscribe(() => { raised++ })
+        expect(vm.ComposerPlaceholder).toBe('Start a harness to chat')
+        vm.Bind(client)
+        expect(vm.ComposerPlaceholder).toBe('Message the model…')
+        expect(raised).toBe(1)
+        vm.Bind(null)
+        expect(vm.ComposerPlaceholder).toBe('Start a harness to chat')
+    })
+
     it('bind_enables_chat_and_routes_chunks', () =>
     {
         const socket = new FakeSocket()
