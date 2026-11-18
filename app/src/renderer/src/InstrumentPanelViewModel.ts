@@ -42,7 +42,7 @@ export class InstrumentPanelViewModel extends Observable
         client.OnTurnStarted.Subscribe(p =>
         {
             this.Logprobs.Clear()
-            this._prompt = this.Change('Prompt', this._prompt, p.prompt)
+            this.Change('Prompt', this._prompt, p.prompt, x => this._prompt = x)
             this.SetContext(p.prompt_tokens, p.n_ctx)
         })
         client.OnTurnChunk.Subscribe(p =>
@@ -73,7 +73,7 @@ export class InstrumentPanelViewModel extends Observable
 
     public set Temperature(v: number)
     {
-        this._temperature = this.Change('Temperature', this._temperature, v)
+        this.Change('Temperature', this._temperature, v, x => this._temperature = x)
     }
 
     public get TopP(): number
@@ -83,7 +83,7 @@ export class InstrumentPanelViewModel extends Observable
 
     public set TopP(v: number)
     {
-        this._topP = this.Change('TopP', this._topP, v)
+        this.Change('TopP', this._topP, v, x => this._topP = x)
     }
 
     public get TopK(): number
@@ -93,7 +93,7 @@ export class InstrumentPanelViewModel extends Observable
 
     public set TopK(v: number)
     {
-        this._topK = this.Change('TopK', this._topK, v)
+        this.Change('TopK', this._topK, v, x => this._topK = x)
     }
 
     public get RepeatPenalty(): number
@@ -103,7 +103,7 @@ export class InstrumentPanelViewModel extends Observable
 
     public set RepeatPenalty(v: number)
     {
-        this._repeatPenalty = this.Change('RepeatPenalty', this._repeatPenalty, v)
+        this.Change('RepeatPenalty', this._repeatPenalty, v, x => this._repeatPenalty = x)
     }
 
     public get Seed(): number
@@ -113,7 +113,7 @@ export class InstrumentPanelViewModel extends Observable
 
     public set Seed(v: number)
     {
-        this._seed = this.Change('Seed', this._seed, v)
+        this.Change('Seed', this._seed, v, x => this._seed = x)
     }
 
     public get MaxTokens(): number
@@ -123,7 +123,7 @@ export class InstrumentPanelViewModel extends Observable
 
     public set MaxTokens(v: number)
     {
-        this._maxTokens = this.Change('MaxTokens', this._maxTokens, v)
+        this.Change('MaxTokens', this._maxTokens, v, x => this._maxTokens = x)
     }
 
     public get EnableThinking(): boolean
@@ -133,7 +133,7 @@ export class InstrumentPanelViewModel extends Observable
 
     public set EnableThinking(v: boolean)
     {
-        this._enableThinking = this.Change('EnableThinking', this._enableThinking, v)
+        this.Change('EnableThinking', this._enableThinking, v, x => this._enableThinking = x)
     }
 
     /** The current knobs as the wire DTO; applied per turn by ChatViewModel.Send. */
@@ -222,7 +222,7 @@ export class InstrumentPanelViewModel extends Observable
 
     public set TokenizeInput(v: string)
     {
-        this._tokenizeInput = this.Change('TokenizeInput', this._tokenizeInput, v)
+        this.Change('TokenizeInput', this._tokenizeInput, v, x => this._tokenizeInput = x)
     }
 
     public get TokenizeResult(): string
@@ -251,19 +251,19 @@ export class InstrumentPanelViewModel extends Observable
 
     private SetTokenizeResult(v: string): void
     {
-        this._tokenizeResult = this.Change('TokenizeResult', this._tokenizeResult, v)
+        this.Change('TokenizeResult', this._tokenizeResult, v, x => this._tokenizeResult = x)
     }
 
-    private SetModelName(full: string): void
+    private SetModelName(full: string | undefined): void
     {
-        const parts = full.split(InstrumentPanelViewModel.PathSeparators)
-        this._modelName = this.Change('ModelName', this._modelName, parts[parts.length - 1])
+        const parts = (full ?? '').split(InstrumentPanelViewModel.PathSeparators)
+        this.Change('ModelName', this._modelName, parts[parts.length - 1], x => this._modelName = x)
     }
 
     private SetWarning(v: string): void
     {
         const oldHas = this.HasWarning
-        this._warning = this.Change('Warning', this._warning, v)
+        this.Change('Warning', this._warning, v, x => this._warning = x)
         if (oldHas !== this.HasWarning)
         {
             this.RaisePropertyChanged('HasWarning', oldHas, this.HasWarning)
@@ -272,21 +272,25 @@ export class InstrumentPanelViewModel extends Observable
 
     private SetContext(used: number, total: number): void
     {
-        this._contextUsed = this.Change('ContextUsed', this._contextUsed, used)
-        this._contextTotal = this.Change('ContextTotal', this._contextTotal, total)
+        this.Change('ContextUsed', this._contextUsed, used, x => this._contextUsed = x)
+        this.Change('ContextTotal', this._contextTotal, total, x => this._contextTotal = x)
         this.RaisePropertyChanged('ContextFraction', undefined, this.ContextFraction)
         this.RaisePropertyChanged('ContextBarWidth', undefined, this.ContextBarWidth)
         this.RaisePropertyChanged('ContextLabel', undefined, this.ContextLabel)
     }
 
-    /** Raises INPC for a changed value and returns it, so setters stay one line. */
-    private Change<T>(name: string, old: T, value: T): T
+    /** Assigns the new value (via `assign`) BEFORE raising INPC. A TwoWay binding re-reads the
+     *  source synchronously while PropertyChanged fires; if the field were still the old value
+     *  then (as it is when the setter assigns the return of a notify-first helper), the binding
+     *  writes that stale value back to the control — the "knob snaps back / won't move" bug. */
+    private Change<T>(name: string, old: T, value: T, assign: (v: T) => void): void
     {
-        if (old !== value)
+        if (old === value)
         {
-            this.RaisePropertyChanged(name, old, value)
+            return
         }
-        return value
+        assign(value)
+        this.RaisePropertyChanged(name, old, value)
     }
 
     private static Format(template: string, ...values: unknown[]): string

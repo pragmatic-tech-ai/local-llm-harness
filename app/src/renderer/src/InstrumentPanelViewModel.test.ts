@@ -68,6 +68,33 @@ describe('InstrumentPanelViewModel', () =>
         expect(turn.params.enable_thinking).toBe(true)
     })
 
+    it('KnobSetterAssignsBeforeNotifying', () =>
+    {
+        // Regression: a two-way spin control re-reads the source SYNCHRONOUSLY while
+        // PropertyChanged fires. The field must already hold the new value by then, or the
+        // binding writes the stale value back to the control and the knob "snaps back" — looking
+        // like a dead button. Reading the property inside its own change notification must see new.
+        const rig = new Rig()
+        let observedDuringNotify = -1
+        rig.vm.Panel.PropertyChanged('Temperature').subscribe(() => { observedDuringNotify = rig.vm.Panel.Temperature })
+        rig.vm.Panel.Temperature = 1.5
+        expect(observedDuringNotify).toBe(1.5)
+        expect(rig.vm.Panel.Temperature).toBe(1.5)
+    })
+
+    it('ToleratesUndefinedModelName', async () =>
+    {
+        // Defensive: if model_props ever delivers no model_name, the basename split must not throw
+        // (it did: `undefined.split`). The ModelProps().then runs as a microtask, so await it.
+        const rig = new Rig()
+        rig.client.HandleFrame(JSON.stringify({ id: 1, result: { n_ctx: 10 } }))
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(rig.vm.Panel.ModelName).toBe('')
+        // Proves SetContext ran AFTER the guarded SetModelName (it wouldn't, if the split threw).
+        expect(rig.vm.Panel.ContextTotal).toBe(10)
+    })
+
     it('WindowFullSurfacesWarning', () =>
     {
         const rig = new Rig()

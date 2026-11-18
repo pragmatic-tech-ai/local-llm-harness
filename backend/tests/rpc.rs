@@ -129,6 +129,17 @@ async fn ws_tokenize_roundtrips() {
 }
 
 #[tokio::test]
+async fn ws_model_props_returns_client_shape() {
+    // The client expects the flat {n_ctx, model_name}; ModelProps's own Serialize goes
+    // `into RawProps` (the llama-server /props shape), which must NOT leak over the RPC.
+    let mut ws = connect(3).await;
+    send(&mut ws, 1, "model_props", json!({})).await;
+    let (notes, resp) = collect(&mut ws, 1).await;
+    assert!(notes.is_empty());
+    assert_eq!(resp["result"], json!({"n_ctx": 100, "model_name": "fake"}));
+}
+
+#[tokio::test]
 async fn ws_send_turn_streams_started_then_done() {
     let mut ws = connect(7).await;
     let params = json!({"content": "hi", "enable_thinking": true});

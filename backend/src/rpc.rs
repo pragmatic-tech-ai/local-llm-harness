@@ -158,7 +158,13 @@ impl Connection {
 
     async fn dispatch(&mut self, ws: &mut Ws, req: &Request) -> Result<Value, Failure> {
         match req.method.as_str() {
-            "model_props" => Ok(Self::to_value(&self.props)?),
+            // Send the clean client shape {n_ctx, model_name}; ModelProps's own Serialize goes
+            // `into RawProps` (the llama-server /props shape) for round-tripping, which is NOT
+            // what the frontend wants.
+            "model_props" => Ok(json!({
+                "n_ctx": self.props.n_ctx,
+                "model_name": self.props.model_name,
+            })),
             "tokenize" => {
                 let p: TokenizeParams = Self::params(req)?;
                 let result = self
