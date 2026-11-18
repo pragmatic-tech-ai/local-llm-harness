@@ -7,6 +7,11 @@ pub const TOP_LOGPROBS: usize = 5;
 
 /// Builds the `TokenInfo` for `sampled_id` from raw `logits`. An out-of-range
 /// `sampled_id` yields the `f32::MIN` ("n/a") sentinel logprob.
+///
+/// Degenerate inputs: all-`-inf` or NaN logits yield NaN logprobs; empty
+/// `logits` gives `log_sum = -inf`, which is harmless because every index is
+/// then out of range and returns the `f32::MIN` sentinel. Tied logits order
+/// non-increasing (stable sort keeps index order).
 pub fn token_info(
     logits: &[f32],
     sampled_id: usize,
@@ -64,6 +69,13 @@ mod tests {
         assert_eq!(info.top.len(), 5);
         assert!(info.top.windows(2).all(|w| w[0].1 > w[1].1));
         assert!(info.top.iter().all(|(_, lp)| *lp <= 0.0));
+    }
+
+    #[test]
+    fn top_n_handles_ties() {
+        let result = token_info(&[1.0, 1.0, 0.0], 0, piece, 3);
+        assert_eq!(result.top.len(), 3);
+        assert!(result.top.windows(2).all(|w| w[0].1 >= w[1].1));
     }
 
     #[test]
