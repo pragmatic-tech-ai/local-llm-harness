@@ -177,7 +177,11 @@ mod tests {
     #[test]
     fn candle_requires_gemma_arch_and_tokenizer() {
         assert!(runtime_can_load(RuntimeKind::Candle, &meta("gemma3"), true));
-        assert!(!runtime_can_load(RuntimeKind::Candle, &meta("gemma3"), false));
+        assert!(!runtime_can_load(
+            RuntimeKind::Candle,
+            &meta("gemma3"),
+            false
+        ));
         assert!(!runtime_can_load(RuntimeKind::Candle, &meta("llama"), true));
     }
 
