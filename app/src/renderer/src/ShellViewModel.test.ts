@@ -40,6 +40,13 @@ class Rig
             this.clients.push(c)
             return c
         })
+        const chat = this.shell.Chat
+        const bind = chat.Bind.bind(chat)
+        chat.Bind = (client) =>
+        {
+            this.log.push(client === null ? 'bind:null' : `bind${(client as SpyClient).Id}`)
+            bind(client)
+        }
     }
 }
 
@@ -63,6 +70,8 @@ describe('ShellViewModel', () =>
         expect(rig.clients).toHaveLength(2)
         expect(rig.log.indexOf('disconnect1')).toBeGreaterThanOrEqual(0)
         expect(rig.log.indexOf('disconnect1')).toBeLessThan(rig.log.indexOf('connect2:ws://b'))
+        expect(rig.log.indexOf('connect2:ws://b')).toBeLessThan(rig.log.indexOf('bind2'))
+        expect(rig.log.indexOf('disconnect1')).toBeLessThan(rig.log.indexOf('bind2'))
         expect(rig.shell.Chat.CanChat).toBe(true)
     })
 
@@ -73,6 +82,6 @@ describe('ShellViewModel', () =>
         rig.log.length = 0
         rig.shell.Picker.OnCleared.Raise(undefined)
         expect(rig.shell.Chat.CanChat).toBe(false)
-        expect(rig.log).toEqual(['disconnect1'])
+        expect(rig.log).toEqual(['bind:null', 'disconnect1'])
     })
 })
