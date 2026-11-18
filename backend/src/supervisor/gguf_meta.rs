@@ -1,7 +1,7 @@
 //! Minimal self-contained gguf header reader (architecture + name only).
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 /// Errors reading a gguf header or scanning for models.
@@ -9,8 +9,10 @@ use std::path::Path;
 pub enum DiscoveryError {
     #[error("not a gguf file (bad magic)")]
     NotGguf,
-    #[error("truncated or unreadable gguf header: {0}")]
-    Truncated(#[from] std::io::Error),
+    #[error("truncated gguf header: {0}")]
+    Truncated(std::io::Error),
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("unsupported gguf version {0}")]
     UnsupportedVersion(u32),
     #[error("gguf header missing general.architecture")]
@@ -27,12 +29,12 @@ pub struct GgufMeta {
     pub size_bytes: u64,
 }
 
-/// Walks a gguf header from any seekable reader.
-struct HeaderReader<R: Read + Seek> {
-    inner: R,
+/// Walks a gguf header through a buffered file reader.
+struct HeaderReader {
+    inner: BufReader<File>,
 }
 
-impl<R: Read + Seek> HeaderReader<R> {
+impl HeaderReader {
     const MAGIC: [u8; 4] = *b"GGUF";
     const MIN_VERSION: u32 = 2;
     const MAX_VERSION: u32 = 3;
@@ -45,25 +47,34 @@ impl<R: Read + Seek> HeaderReader<R> {
     /// Sanity cap on array nesting depth.
     const MAX_DEPTH: u32 = 8;
 
-    fn new(inner: R) -> Self {
+    fn new(inner: BufReader<File>) -> Self {
         Self { inner }
+    }
+
+    /// Fill `buf`; any failure mid-header means a truncated/corrupt file.
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), DiscoveryError> {
+        self.inner
+            .read_exact(buf)
+            .map_err(DiscoveryError::Truncated)
     }
 
     fn read_u32(&mut self) -> Result<u32, DiscoveryError> {
         let mut b = [0u8; 4];
-        self.inner.read_exact(&mut b)?;
+        self.fill(&mut b)?;
         Ok(u32::from_le_bytes(b))
     }
 
     fn read_u64(&mut self) -> Result<u64, DiscoveryError> {
         let mut b = [0u8; 8];
-        self.inner.read_exact(&mut b)?;
+        self.fill(&mut b)?;
         Ok(u64::from_le_bytes(b))
     }
 
     fn skip(&mut self, n: u64) -> Result<(), DiscoveryError> {
         let n = i64::try_from(n).map_err(|_| DiscoveryError::Malformed("skip too large"))?;
-        self.inner.seek(SeekFrom::Current(n))?;
+        self.inner
+            .seek_relative(n)
+            .map_err(DiscoveryError::Truncated)?;
         Ok(())
     }
 
@@ -74,7 +85,7 @@ impl<R: Read + Seek> HeaderReader<R> {
             return Err(DiscoveryError::Malformed("string too long"));
         }
         let mut buf = vec![0u8; len as usize];
-        self.inner.read_exact(&mut buf)?;
+        self.fill(&mut buf)?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
@@ -122,7 +133,7 @@ impl<R: Read + Seek> HeaderReader<R> {
 
     fn read_meta(&mut self, size_bytes: u64) -> Result<GgufMeta, DiscoveryError> {
         let mut magic = [0u8; 4];
-        self.inner.read_exact(&mut magic)?;
+        self.fill(&mut magic)?;
         if magic != Self::MAGIC {
             return Err(DiscoveryError::NotGguf);
         }
@@ -146,7 +157,7 @@ impl<R: Read + Seek> HeaderReader<R> {
                 } else {
                     name = Some(value);
                 }
-                if architecture.is_some() && name.is_some() {
+                if architecture.is_some() {
                     break;
                 }
             } else {
@@ -163,8 +174,8 @@ impl<R: Read + Seek> HeaderReader<R> {
 
 /// Read the architecture/name from a gguf file header without decoding tensors.
 pub fn read_gguf_meta(path: &Path) -> Result<GgufMeta, DiscoveryError> {
-    let size_bytes = std::fs::metadata(path)?.len();
-    let file = File::open(path)?;
+    let size_bytes = std::fs::metadata(path).map_err(DiscoveryError::Io)?.len();
+    let file = File::open(path).map_err(DiscoveryError::Io)?;
     HeaderReader::new(BufReader::new(file)).read_meta(size_bytes)
 }
 
@@ -260,6 +271,84 @@ mod tests {
         assert!(matches!(
             read_gguf_meta(&p),
             Err(DiscoveryError::UnsupportedVersion(1))
+        ));
+    }
+
+    fn kv_file(tag: &str, kvs: &[u8], count: u64) -> PathBuf {
+        let dir = temp_dir(tag);
+        let mut b = header(3, count);
+        b.extend_from_slice(kvs);
+        write(&dir, "k.gguf", &b)
+    }
+
+    #[test]
+    fn huge_array_count_is_error_not_panic() {
+        let mut kv = Vec::new();
+        gstr(&mut kv, "x.arr");
+        kv.extend_from_slice(&9u32.to_le_bytes());
+        kv.extend_from_slice(&4u32.to_le_bytes());
+        kv.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(read_gguf_meta(&kv_file("hugearr", &kv, 1)).is_err());
+        // Array of strings with a huge count hits EOF instead of looping forever.
+        let mut kv = Vec::new();
+        gstr(&mut kv, "x.arr");
+        kv.extend_from_slice(&9u32.to_le_bytes());
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        kv.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(read_gguf_meta(&kv_file("hugearr2", &kv, 1)).is_err());
+    }
+
+    #[test]
+    fn huge_string_length_is_error_not_panic() {
+        let mut kv = Vec::new();
+        gstr(&mut kv, "general.architecture");
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        kv.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            read_gguf_meta(&kv_file("hugestr", &kv, 1)),
+            Err(DiscoveryError::Malformed(_))
+        ));
+        let mut kv = Vec::new();
+        gstr(&mut kv, "x.s");
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        kv.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(read_gguf_meta(&kv_file("hugestr2", &kv, 1)).is_err());
+    }
+
+    #[test]
+    fn scalar_array_is_skipped() {
+        let mut kv = Vec::new();
+        gstr(&mut kv, "x.ints");
+        kv.extend_from_slice(&9u32.to_le_bytes());
+        kv.extend_from_slice(&4u32.to_le_bytes());
+        kv.extend_from_slice(&3u64.to_le_bytes());
+        kv.extend_from_slice(&[0u8; 12]);
+        gstr(&mut kv, "general.architecture");
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        gstr(&mut kv, "llama");
+        let meta = read_gguf_meta(&kv_file("intarr", &kv, 2)).unwrap();
+        assert_eq!(meta.architecture, "llama");
+        assert_eq!(meta.name, None);
+    }
+
+    #[test]
+    fn missing_architecture_is_error() {
+        let mut kv = Vec::new();
+        gstr(&mut kv, "general.name");
+        kv.extend_from_slice(&8u32.to_le_bytes());
+        gstr(&mut kv, "Only Name");
+        assert!(matches!(
+            read_gguf_meta(&kv_file("noarch", &kv, 1)),
+            Err(DiscoveryError::MissingArchitecture)
+        ));
+    }
+
+    #[test]
+    fn missing_file_is_io_error() {
+        let dir = temp_dir("nofile");
+        assert!(matches!(
+            read_gguf_meta(&dir.join("absent.gguf")),
+            Err(DiscoveryError::Io(_))
         ));
     }
 }

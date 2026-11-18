@@ -75,7 +75,11 @@ impl Scanner {
         let mut paths: Vec<_> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == Self::GGUF_EXT))
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case(Self::GGUF_EXT))
+            })
             .collect();
         paths.sort();
         for path in paths {
@@ -224,6 +228,15 @@ mod tests {
         std::fs::write(d.join("my-model.Q4.gguf"), gguf("llama")).unwrap();
         let found = discover(&catalog(vec![d]));
         assert_eq!(found[0].display_name, "my-model.Q4");
+    }
+
+    #[test]
+    fn uppercase_extension_is_found() {
+        let d = dir("upper");
+        std::fs::write(d.join("BIG.GGUF"), gguf("llama")).unwrap();
+        let found = discover(&catalog(vec![d]));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].display_name, "BIG");
     }
 
     #[test]
