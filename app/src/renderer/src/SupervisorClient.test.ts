@@ -62,4 +62,30 @@ describe('SupervisorClient', () =>
         client.HandleFrame(JSON.stringify({ id: 1, error: { code: -1, message: 'unknown harness' } }))
         await expect(pending).rejects.toThrow('unknown harness')
     })
+
+    it('stop_sends_id_on_the_wire', () =>
+    {
+        const socket = new FakeSocket()
+        const client = new SupervisorClient(() => socket)
+        client.Connect('ws://x')
+        void client.Stop('candle:gemma-3-4b').catch(() => undefined)
+        socket.Open()
+        expect(JSON.parse(socket.sent[0])).toEqual({ id: 1, method: 'stop', params: { id: 'candle:gemma-3-4b' } })
+    })
+
+    it('list_harnesses_parses', async () =>
+    {
+        const socket = new FakeSocket()
+        const client = new SupervisorClient(() => socket)
+        client.Connect('ws://x')
+        socket.Open()
+        const pending = client.ListHarnesses()
+        expect(JSON.parse(socket.sent[0]).method).toBe('list_harnesses')
+        const expected: HarnessInfo[] = [
+            { id: 'a', runtime: 'llamacpp', model: 'gemma', state: 'running', url: 'ws://a' },
+            { id: 'b', runtime: 'candle', model: 'm', state: 'stopped' }
+        ]
+        client.HandleFrame(JSON.stringify({ id: 1, result: expected }))
+        await expect(pending).resolves.toEqual(expected)
+    })
 })
