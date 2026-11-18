@@ -93,3 +93,16 @@ Verified 2026-11-18: `apply_template` output is byte-identical to llama-server's
 `/apply-template` for both `enable_thinking` values; `model_props`, streaming
 `turn_chunk`s with top-5 per-token logprobs, and the `max_tokens` cap-stop all work;
 model offloaded to GPU (~4.7 GB VRAM).
+
+## candle engine assets (Phase B)
+
+The pure-Rust `candle` engine runs a smaller model (candle has no layer-offload, so
+the 12B Q4_0 does not fit 6 GB). Downloaded 2026-11-18, both non-gated:
+
+- GGUF: `C:\llm-harness\models\gemma-3-4B-it-QAT-Q4_0.gguf` (2.2 GB) from
+  `lmstudio-community/gemma-3-4B-it-qat-GGUF` (QAT Q4_0, same source family as the 12B).
+- Tokenizer: `C:\llm-harness\models\gemma-3-4b-tokenizer.json` (31.8 MB) from
+  `unsloth/gemma-3-4b-it` (candle's Gemma gguf loader does not build a tokenizer from
+  the gguf, so it is supplied separately). NB: PowerShell `ConvertFrom-Json` wrongly
+  rejects this file (case-insensitive key clash on Gemma byte tokens); the Rust
+  `tokenizers` crate reads it fine — round-trip confirmed at engine load.
