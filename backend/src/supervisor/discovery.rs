@@ -1,6 +1,6 @@
 //! Scan model directories and report which catalog runtimes can load each model.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::catalog::{Catalog, RuntimeKind};
 use super::gguf_meta::{read_gguf_meta, GgufMeta};
@@ -38,19 +38,27 @@ impl Scanner {
     const JSON_EXT: &'static str = "json";
     const UNITS: [&'static str; 5] = ["B", "KB", "MB", "GB", "TB"];
 
-    fn tokenizer_present(dir: &Path) -> bool {
-        if dir.join(Self::TOKENIZER_JSON).is_file() {
-            return true;
+    fn tokenizer_path(dir: &Path) -> Option<PathBuf> {
+        let direct = dir.join(Self::TOKENIZER_JSON);
+        if direct.is_file() {
+            return Some(direct);
         }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        entries.flatten().any(|e| {
-            let p = e.path();
-            let name = e.file_name().to_string_lossy().to_lowercase();
-            p.extension().is_some_and(|x| x == Self::JSON_EXT)
-                && name.contains(Self::TOKENIZER_MARK)
-        })
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                e.path().extension().is_some_and(|x| x == Self::JSON_EXT)
+                    && name.contains(Self::TOKENIZER_MARK)
+            })
+            .map(|e| e.path())
+            .collect();
+        found.sort();
+        found.into_iter().next()
+    }
+
+    fn tokenizer_present(dir: &Path) -> bool {
+        Self::tokenizer_path(dir).is_some()
     }
 
     fn human_size(bytes: u64) -> String {
@@ -117,6 +125,44 @@ pub fn discover(catalog: &Catalog) -> Vec<DiscoveredModel> {
     out
 }
 
+/// A model resolved to real server-side paths. Never sent to clients.
+#[derive(Debug, Clone)]
+pub struct ResolvedModel {
+    pub gguf: PathBuf,
+    pub tokenizer: Option<PathBuf>,
+    pub meta: GgufMeta,
+}
+
+/// Find the `*.gguf` whose file stem equals `display_name` across the catalog's model dirs.
+pub fn resolve_model(catalog: &Catalog, display_name: &str) -> Option<ResolvedModel> {
+    for dir in &catalog.model_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case(Scanner::GGUF_EXT))
+                    && p.file_stem().is_some_and(|s| s == display_name)
+            })
+            .collect();
+        paths.sort();
+        for gguf in paths {
+            if let Ok(meta) = read_gguf_meta(&gguf) {
+                return Some(ResolvedModel {
+                    tokenizer: Scanner::tokenizer_path(dir),
+                    gguf,
+                    meta,
+                });
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::catalog::RuntimeDef;
@@ -140,6 +186,7 @@ mod tests {
             n_ctx: None,
             n_gpu_layers: None,
             internal_port: None,
+            server_exe: None,
         }
     }
 
@@ -248,6 +295,19 @@ mod tests {
         let found = discover(&catalog(vec![missing, d]));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].display_name, "ok");
+    }
+
+    #[test]
+    fn resolve_model_returns_real_paths() {
+        let d = dir("resolve");
+        std::fs::write(d.join("gem.gguf"), gguf("gemma3")).unwrap();
+        std::fs::write(d.join("tokenizer.json"), b"{}").unwrap();
+        let c = catalog(vec![d.clone()]);
+        let r = resolve_model(&c, "gem").unwrap();
+        assert_eq!(r.gguf, d.join("gem.gguf"));
+        assert_eq!(r.tokenizer, Some(d.join("tokenizer.json")));
+        assert_eq!(r.meta.architecture, "gemma3");
+        assert!(resolve_model(&c, "nope").is_none());
     }
 
     #[test]

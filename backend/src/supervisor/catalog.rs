@@ -28,6 +28,9 @@ pub struct RuntimeDef {
     pub n_gpu_layers: Option<i32>,
     #[serde(default)]
     pub internal_port: Option<u16>,
+    /// For `http`: the llama-server binary (`exe` is then the http-proxy backend).
+    #[serde(default)]
+    pub server_exe: Option<PathBuf>,
 }
 
 /// Errors loading or parsing a catalog.
@@ -138,6 +141,7 @@ internal_port = 8080
                 n_ctx: Some(4096),
                 n_gpu_layers: None,
                 internal_port: None,
+                server_exe: None,
             }
         );
         assert_eq!(c.runtimes[1].kind, RuntimeKind::Llamacpp);
