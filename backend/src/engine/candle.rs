@@ -161,6 +161,9 @@ impl CandleEngine {
 
     /// Worker-thread entry point: runs generation and funnels any setup/decode error into a single
     /// terminal `Err` on the channel.
+    // reason: these decode-loop helpers take the full per-run context (model, tokenizer, device,
+    // n_ctx, eos ids, prompt, config, sender); bundling it into a struct would not improve clarity
+    // and would diverge from the sibling llama.cpp engine's matching helper shape.
     #[allow(clippy::too_many_arguments)]
     fn run_generation(
         model: &mut ModelWeights,
@@ -185,6 +188,8 @@ impl CandleEngine {
     /// chunk, and the loop always finishes with a single `stop: true` chunk — on EOS, the
     /// `max_tokens` cap (`max_tokens < 0` = unbounded), or context exhaustion. A dropped receiver
     /// is a clean early return, not an error.
+    // reason: same as `run_generation` — this carries the full per-run decode context by value;
+    // a struct wrapper would add indirection without improving clarity, mirroring llama.cpp.
     #[allow(clippy::too_many_arguments)]
     fn try_generate(
         model: &mut ModelWeights,
