@@ -184,6 +184,13 @@ impl SpawnPlan {
                     .internal_port
                     .ok_or_else(|| Self::missing(def, Self::MISSING_INTERNAL_PORT))?;
                 let ngl = def.n_gpu_layers.unwrap_or(Self::DEFAULT_NGL_SERVER);
+                // The proxy reports this as `model_name`; use the clean display name (the gguf file
+                // stem), never llama-server's absolute path.
+                let display_name = model
+                    .gguf
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let server = ChildSpec {
                     exe: server_exe,
                     args: [
@@ -210,6 +217,7 @@ impl SpawnPlan {
                     args: Vec::new(),
                     env: Self::env(&[
                         (Self::ENV_ENGINE, Self::ENGINE_HTTP.to_string()),
+                        (Self::ENV_MODEL, display_name),
                         (
                             Self::ENV_SERVER_URL,
                             format!("http://{}:{}", Self::LOOPBACK, port),
@@ -988,6 +996,13 @@ mod tests {
         assert_eq!(specs[0].exe, PathBuf::from("llama-server.exe"));
         assert!(specs[0].args.windows(2).any(|w| w == ["--port", "8080"]));
         assert_eq!(specs[1].exe, PathBuf::from("proxy.exe"));
+        assert!(specs[1]
+            .env
+            .contains(&("HARNESS_MODEL".to_string(), "lla".to_string())));
+        assert!(!specs[1]
+            .env
+            .iter()
+            .any(|(k, v)| k == "HARNESS_MODEL" && (v.contains('/') || v.contains('\\'))));
         assert!(specs[1].env.contains(&(
             "HARNESS_SERVER_URL".to_string(),
             "http://127.0.0.1:8080".to_string()
