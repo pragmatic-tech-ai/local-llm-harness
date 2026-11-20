@@ -299,8 +299,14 @@ describe('RuntimeManagementService', () =>
         const rig = new Rig('ws://s1')
         rig.picker.OnReady.Raise('ws://a')
         expect(rig.chat.CanChat).toBe(true)
+        rig.picker.SelectedRuntime = { name: 'r', kind: 'http', available: true }
+        rig.picker.SelectedModel = { name: 'm', runtimes: ['r'], size_hint: '' }
         rig.settings.Change('ws://s2')
         expect(rig.chat.CanChat).toBe(false)
+        expect(rig.picker.State).toBe('stopped')
+        expect(rig.picker.CanStop).toBe(false)
+        expect(rig.picker.CanStart).toBe(false)
+        expect(rig.picker.Runtimes.Count).toBe(0)
         expect(rig.log.indexOf('disconnect1')).toBeGreaterThanOrEqual(0)
     })
 

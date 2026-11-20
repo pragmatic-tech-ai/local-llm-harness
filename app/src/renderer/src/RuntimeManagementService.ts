@@ -77,13 +77,14 @@ export class RuntimeManagementService extends ServiceBase
     /** Reconnect to the supervisor named by the setting: drop the old connection, then connect anew (or go inert when empty). */
     private ApplyConnection(url: string): void
     {
-        // The live harness belongs to the connection being dropped.
+        // The live harness and the picker's state belong to the connection being dropped; Unbind's
+        // generation bump also invalidates any in-flight Start against the old client.
         this.DetachClient()
+        this.picker.Unbind()
         this.supervisor?.Disconnect()
         this.supervisor = null
         if (url.length === 0)
         {
-            this.picker.Unbind()
             return
         }
         const client = this.supervisorFactory()
@@ -96,9 +97,8 @@ export class RuntimeManagementService extends ServiceBase
         catch
         {
             // A bad url must not escape the change handler or leave the service half-wired.
-            client.Disconnect()
+            this.supervisor?.Disconnect()
             this.supervisor = null
-            this.picker.Unbind()
         }
     }
 
