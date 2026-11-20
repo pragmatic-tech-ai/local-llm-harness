@@ -1,4 +1,5 @@
 import type { ISettingsStore } from '@pragmatic-tech-ai/mural/framework'
+import type { IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
 import type { ISettingsBridge } from '../../shared/settings-api'
 
 /** Renderer-side ISettingsStore backed by the preload settings bridge (window.harness.settings). */
@@ -8,7 +9,7 @@ export class HarnessSettingsStore implements ISettingsStore
 
     private readonly bridge: ISettingsBridge
 
-    public constructor(accessor: () => ISettingsBridge | undefined = HarnessSettingsStore.DefaultAccessor)
+    public constructor(_provider?: IServiceProvider, accessor: () => ISettingsBridge | undefined = HarnessSettingsStore.DefaultAccessor)
     {
         const bridge = accessor()
         if (!bridge)

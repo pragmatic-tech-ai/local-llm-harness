@@ -18,14 +18,14 @@ describe('HarnessSettingsStore', () =>
     it('load_returns_bridge_snapshot', () =>
     {
         const bridge = new FakeBridge()
-        const store = new HarnessSettingsStore(() => bridge)
+        const store = new HarnessSettingsStore(undefined, () => bridge)
         expect(store.Load()).toEqual({ 'a': 1 })
     })
 
     it('save_forwards_values_to_bridge', () =>
     {
         const bridge = new FakeBridge()
-        const store = new HarnessSettingsStore(() => bridge)
+        const store = new HarnessSettingsStore(undefined, () => bridge)
         const values = { 'b': 'x' }
         store.Save(values)
         expect(bridge.saved).toEqual([values])
@@ -33,6 +33,6 @@ describe('HarnessSettingsStore', () =>
 
     it('throws_when_bridge_absent', () =>
     {
-        expect(() => new HarnessSettingsStore(() => undefined)).toThrow(/settings bridge/i)
+        expect(() => new HarnessSettingsStore(undefined, () => undefined)).toThrow(/settings bridge/i)
     })
 })
