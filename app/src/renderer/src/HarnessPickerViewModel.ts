@@ -44,11 +44,23 @@ export class HarnessPickerViewModel extends Observable
     public readonly OnReady = new TurnSignal<string>()
     public readonly OnCleared = new TurnSignal<void>()
 
-    constructor(private readonly client: SupervisorClient)
+    private client: SupervisorClient | null = null
+
+    constructor(client?: SupervisorClient)
     {
         super()
         this._startCommand = new RelayCommand(() => void this.Start(), () => this._canStart)
         this._stopCommand = new RelayCommand(() => void this.Stop(), () => this._canStop)
+        if (client !== undefined)
+        {
+            this.Bind(client)
+        }
+    }
+
+    /** Attach the supervisor connection. Until bound the picker is inert (no listing, no start/stop). */
+    public Bind(client: SupervisorClient): void
+    {
+        this.client = client
         client.OnHarnessChanged.Subscribe(info => this.ApplyInfo(info))
     }
 
@@ -112,12 +124,17 @@ export class HarnessPickerViewModel extends Observable
 
     private async RefreshAsync(): Promise<void>
     {
+        const client = this.client
+        if (client === null)
+        {
+            return
+        }
         try
         {
             const [runtimes, models, harnesses] = await Promise.all([
-                this.client.ListRuntimes(),
-                this.client.ListModels(),
-                this.client.ListHarnesses()])
+                client.ListRuntimes(),
+                client.ListModels(),
+                client.ListHarnesses()])
             this.Runtimes.Clear()
             for (const r of runtimes)
             {
@@ -147,9 +164,10 @@ export class HarnessPickerViewModel extends Observable
 
     private async Start(): Promise<void>
     {
+        const client = this.client
         const runtime = this._selectedRuntime
         const model = this._selectedModel
-        if (runtime === null || model === null)
+        if (client === null || runtime === null || model === null)
         {
             return
         }
@@ -165,7 +183,7 @@ export class HarnessPickerViewModel extends Observable
             HarnessPickerViewModel.Format(HarnessPickerViewModel.LoadingFormat, runtime.name, model.name))
         try
         {
-            const info = await this.client.Start(runtime.name, model.name)
+            const info = await client.Start(runtime.name, model.name)
             if (gen === this.generation)
             {
                 this.ApplyInfo(info)
@@ -174,7 +192,7 @@ export class HarnessPickerViewModel extends Observable
             {
                 // Superseded by Stop/Start while loading: shut the orphan down and ignore its events.
                 this.ignoredIds.add(info.id)
-                this.client.Stop(info.id).catch(() => undefined)
+                client.Stop(info.id).catch(() => undefined)
             }
         }
         catch (e)
@@ -204,7 +222,7 @@ export class HarnessPickerViewModel extends Observable
         }
         this.SetState(HarnessPickerViewModel.StateStopped, HarnessPickerViewModel.StoppedText)
         this.OnCleared.Raise(undefined)
-        if (id === null)
+        if (id === null || this.client === null)
         {
             return
         }

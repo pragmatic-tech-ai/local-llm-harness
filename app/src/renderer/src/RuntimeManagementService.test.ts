@@ -4,6 +4,7 @@ import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/ser
 import { RuntimeManagementService } from './RuntimeManagementService'
 import { ChatViewModel } from './ChatViewModel'
 import { HarnessClient } from './HarnessClient'
+import { HarnessPickerViewModel } from './HarnessPickerViewModel'
 import { SupervisorClient } from './SupervisorClient'
 import { FakeSocket } from './FakeSocket'
 
@@ -39,13 +40,8 @@ class FakeContentHost
 
 class StubProvider
 {
-    constructor(private readonly client: SupervisorClient | undefined, private readonly host: FakeContentHost)
+    constructor(private readonly host: FakeContentHost)
     {
-    }
-
-    public get<T>(token: unknown): T | undefined
-    {
-        return token === SupervisorClient.Key ? (this.client as unknown as T | undefined) : undefined
     }
 
     public getRequired<T>(token: unknown): T
@@ -56,11 +52,6 @@ class StubProvider
         }
         throw new Error('unexpected token')
     }
-
-    public has(token: unknown): boolean
-    {
-        return token === SupervisorClient.Key && this.client !== undefined
-    }
 }
 
 class Rig
@@ -70,17 +61,15 @@ class Rig
     public readonly socket = new FakeSocket()
     public readonly host = new FakeContentHost()
     public readonly chat = new ChatViewModel()
+    public readonly picker = new HarnessPickerViewModel()
+    public readonly supervisor: SupervisorClient
     public readonly service: RuntimeManagementService
 
-    constructor(withClient = true)
+    constructor()
     {
-        let supervisor: SupervisorClient | undefined
-        if (withClient)
-        {
-            supervisor = new SupervisorClient(() => this.socket)
-            supervisor.Connect('ws://supervisor')
-            this.socket.Open()
-        }
+        this.supervisor = new SupervisorClient(() => this.socket)
+        this.supervisor.Connect('ws://supervisor')
+        this.socket.Open()
         const bind = this.chat.Bind.bind(this.chat)
         this.chat.Bind = (client) =>
         {
@@ -88,8 +77,9 @@ class Rig
             bind(client)
         }
         this.service = new RuntimeManagementService(
-            new StubProvider(supervisor, this.host) as unknown as IServiceProvider,
+            new StubProvider(this.host) as unknown as IServiceProvider,
             () => this.chat,
+            () => this.picker,
             () =>
             {
                 const c = new SpyClient(this.clients.length + 1, this.log)
@@ -97,33 +87,45 @@ class Rig
                 return c
             })
     }
+
+    public Attach(): void
+    {
+        this.service.Attach(this.supervisor)
+    }
 }
 
 describe('RuntimeManagementService', () =>
 {
-    it('with_client_views_chat_and_creates_picker', () =>
+    it('ctor_views_chat_and_exposes_stable_picker', () =>
     {
         const rig = new Rig()
         expect(rig.host.viewed).toEqual([rig.chat])
-        expect(rig.service.Picker).not.toBeNull()
+        expect(rig.service.Picker).toBe(rig.picker)
+    })
+
+    it('inert_until_attached', () =>
+    {
+        const rig = new Rig()
+        rig.service.Picker.Refresh()
+        expect(rig.socket.sent).toHaveLength(0)
+    })
+
+    it('attach_binds_connection_and_refreshes', () =>
+    {
+        const rig = new Rig()
+        rig.Attach()
         const sent = JSON.stringify(rig.socket.sent)
         expect(sent).toContain('list_runtimes')
         expect(sent).toContain('list_models')
         expect(sent).toContain('list_harnesses')
     })
 
-    it('without_client_does_nothing', () =>
-    {
-        const rig = new Rig(false)
-        expect(rig.host.viewed).toEqual([])
-        expect(rig.service.Picker).toBeNull()
-    })
-
     it('ready_binds_fresh_client_to_chat', () =>
     {
         const rig = new Rig()
-                expect(rig.chat.CanChat).toBe(false)
-        rig.service.Picker!.OnReady.Raise('ws://a')
+        rig.Attach()
+        expect(rig.chat.CanChat).toBe(false)
+        rig.picker.OnReady.Raise('ws://a')
         expect(rig.clients).toHaveLength(1)
         expect(rig.log[0]).toBe('connect1:ws://a')
         expect(rig.log).toContain('bind1')
@@ -133,8 +135,9 @@ describe('RuntimeManagementService', () =>
     it('second_ready_disconnects_previous_before_binding_new', () =>
     {
         const rig = new Rig()
-                rig.service.Picker!.OnReady.Raise('ws://a')
-        rig.service.Picker!.OnReady.Raise('ws://b')
+        rig.Attach()
+        rig.picker.OnReady.Raise('ws://a')
+        rig.picker.OnReady.Raise('ws://b')
         expect(rig.clients).toHaveLength(2)
         expect(rig.log.indexOf('disconnect1')).toBeGreaterThanOrEqual(0)
         expect(rig.log.indexOf('disconnect1')).toBeLessThan(rig.log.indexOf('connect2:ws://b'))
@@ -144,10 +147,21 @@ describe('RuntimeManagementService', () =>
     it('cleared_unbinds_chat_and_disconnects', () =>
     {
         const rig = new Rig()
-                rig.service.Picker!.OnReady.Raise('ws://a')
+        rig.Attach()
+        rig.picker.OnReady.Raise('ws://a')
         rig.log.length = 0
-        rig.service.Picker!.OnCleared.Raise(undefined)
+        rig.picker.OnCleared.Raise(undefined)
         expect(rig.chat.CanChat).toBe(false)
         expect(rig.log).toEqual(['bind:null', 'disconnect1'])
+    })
+
+    it('bind_backend_binds_chat_without_supervisor', () =>
+    {
+        const rig = new Rig()
+        const client = new SpyClient(9, rig.log)
+        client.Connect('ws://direct')
+        rig.service.BindBackend(client)
+        expect(rig.chat.CanChat).toBe(true)
+        expect(rig.log).toContain('bind9')
     })
 })

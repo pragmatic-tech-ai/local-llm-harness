@@ -7,56 +7,50 @@ import { HarnessPickerViewModel } from './HarnessPickerViewModel'
 import { SupervisorClient } from './SupervisorClient'
 
 /**
- * Runtime-management capability. Self-initializes from DI: when a SupervisorClient is registered it shows the chat in the
- * content host and owns the harness picker, coordinating it with the chat (a ready harness gets a fresh client bound to
- * the chat; clearing unbinds it). Without a supervisor it does nothing and Picker stays null.
+ * Runtime-management capability. Owns the chat (shown as the content host's content) and the harness picker rendered in
+ * the capability's side pane, coordinating the two: a harness reaching ready gets a fresh client bound to the chat;
+ * clearing unbinds it. The side pane is a view-reusing ContentControl that builds its view for this service once, so the
+ * Picker must be a stable object from construction — Attach feeds it the supervisor connection later (its runtime/model
+ * lists then populate over the ObservableCollection change-notifications), never swapping the Picker instance.
  */
 export class RuntimeManagementService extends ServiceBase
 {
     public static readonly Key = new ServiceKey<RuntimeManagementService>('RuntimeManagementService')
-    private static readonly PickerProperty = 'Picker'
 
-    private picker: HarnessPickerViewModel | null = null
-    private chat: ChatViewModel | null = null
+    private readonly chat: ChatViewModel
+    private readonly picker: HarnessPickerViewModel
     private chatClient: HarnessClient | null = null
-    private pickerSubscriptions: { Dispose(): void }[] = []
 
     constructor(
         provider: IServiceProvider,
         chatFactory: () => ChatViewModel = () => new ChatViewModel(),
+        pickerFactory: () => HarnessPickerViewModel = () => new HarnessPickerViewModel(),
         private readonly harnessFactory: () => HarnessClient = () => new HarnessClient())
     {
         super(provider)
-        const client = provider.get(SupervisorClient.Key)
-        if (client !== undefined)
-        {
-            const chat = chatFactory()
-            provider.getRequired(ContentHostService.Key).View(chat)
-            this.Initialize(client, chat)
-        }
+        this.chat = chatFactory()
+        this.picker = pickerFactory()
+        this.picker.OnReady.Subscribe(url => this.AttachClient(url))
+        this.picker.OnCleared.Subscribe(() => this.DetachClient())
+        provider.getRequired(ContentHostService.Key).View(this.chat)
     }
 
-    public get Picker(): HarnessPickerViewModel | null
+    public get Picker(): HarnessPickerViewModel
     {
         return this.picker
     }
 
-    private Initialize(client: SupervisorClient, chat: ChatViewModel): void
+    /** Give the picker its supervisor connection and begin discovery. */
+    public Attach(client: SupervisorClient): void
     {
-        for (const subscription of this.pickerSubscriptions)
-        {
-            subscription.Dispose()
-        }
-        const picker = new HarnessPickerViewModel(client)
-        this.pickerSubscriptions = [
-            picker.OnReady.Subscribe(url => this.AttachClient(url)),
-            picker.OnCleared.Subscribe(() => this.DetachClient()),
-        ]
-        this.chat = chat
-        const old = this.picker
-        this.picker = picker
-        this.RaisePropertyChanged(RuntimeManagementService.PickerProperty, old, picker)
-        picker.Refresh()
+        this.picker.Bind(client)
+        this.picker.Refresh()
+    }
+
+    /** Bind the chat to a directly-connected backend (no supervisor); used by the direct-backend fallback. */
+    public BindBackend(client: HarnessClient): void
+    {
+        this.chat.Bind(client)
     }
 
     private AttachClient(url: string): void
@@ -65,12 +59,12 @@ export class RuntimeManagementService extends ServiceBase
         const client = this.harnessFactory()
         client.Connect(url)
         this.chatClient = client
-        this.chat?.Bind(client)
+        this.chat.Bind(client)
     }
 
     private DetachClient(): void
     {
-        this.chat?.Bind(null)
+        this.chat.Bind(null)
         this.chatClient?.Disconnect()
         this.chatClient = null
     }

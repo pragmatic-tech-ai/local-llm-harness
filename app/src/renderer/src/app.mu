@@ -21,7 +21,7 @@ Application [ Theme = Pragmatic, Scheme = PragmaticDark ] {
         merge InstrumentPanelResources
         merge HarnessPanelResources
         DataTemplate [ DataType = RuntimeManagementService ] {
-            ContentControl [ Content = $Picker ]
+            ContentPresenter [ Content = $Picker ]
         }
         EditorShell x:root { }
     }

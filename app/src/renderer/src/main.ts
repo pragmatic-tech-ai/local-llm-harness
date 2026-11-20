@@ -1,13 +1,12 @@
 import './fonts.css'
 import { app } from './app.mu.js'
 import { HarnessClient } from './HarnessClient'
-import { ChatViewModel } from './ChatViewModel'
 import { SupervisorClient } from './SupervisorClient'
+import { RuntimeManagementService } from './RuntimeManagementService'
 import { HtmlTarget } from '@pragmatic-tech-ai/mural/visual-engine'
-import { ThemeManager, Density, ServiceLifetime } from '@pragmatic-tech-ai/mural/runtime'
-import { ContentHostService } from '@pragmatic-tech-ai/mural/framework'
+import { ThemeManager, Density } from '@pragmatic-tech-ai/mural/runtime'
 
-/** Renderer bootstrap: mounts the mural shell and hands the ContentHost its first view. */
+/** Renderer bootstrap: mounts the mural shell and wires the runtime-management capability to its data source. */
 class RendererBootstrap
 {
     private static readonly IconFont = '24px "Material Symbols Outlined"'
@@ -31,28 +30,32 @@ class RendererBootstrap
         }
         const host = document.getElementById(RendererBootstrap.AppElementId) as HTMLElement
         const supervisorUrl = await window.harness.SupervisorUrl()
+        // Resolve and wire the capability before mounting so discovery is already
+        // under way when its side pane first renders. The pane is a view-reusing
+        // ContentControl, so the service exposes a stable Picker (set in its ctor);
+        // Attach only feeds it the connection, never swaps the instance.
+        const runtime = app.Services.getRequired(RuntimeManagementService.Key)
         if (supervisorUrl !== null)
         {
             const supervisor = new SupervisorClient()
             supervisor.Connect(supervisorUrl)
-            app.Services.register(SupervisorClient.Key, () => supervisor, ServiceLifetime.Singleton)
+            runtime.Attach(supervisor)
         }
-        app.initialize(new HtmlTarget(host))
-        const contentHost = app.Services.getRequired(ContentHostService.Key)
-        if (supervisorUrl === null)
+        else
         {
             const url = await window.harness.BackendUrl()
-            const client = new HarnessClient()
             if (url !== null)
             {
+                const client = new HarnessClient()
                 client.Connect(url)
+                runtime.BindBackend(client)
             }
             else
             {
                 console.warn(RendererBootstrap.NoBackendWarning)
             }
-            contentHost.View(new ChatViewModel(client))
         }
+        app.initialize(new HtmlTarget(host))
         RendererBootstrap.RemoveSplash()
     }
 
