@@ -1,11 +1,16 @@
 import { ServiceBase, ServiceKey } from '@pragmatic-tech-ai/mural/runtime'
 import type { IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
+import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/services/content-host-service.js'
+import { ChatViewModel } from './ChatViewModel'
 import { HarnessClient } from './HarnessClient'
 import { HarnessPickerViewModel } from './HarnessPickerViewModel'
-import type { ChatViewModel } from './ChatViewModel'
-import type { SupervisorClient } from './SupervisorClient'
+import { SupervisorClient } from './SupervisorClient'
 
-/** Runtime-management capability: owns the harness picker and coordinates it with the chat (a ready harness gets a fresh client bound to the chat; clearing unbinds it). */
+/**
+ * Runtime-management capability. Self-initializes from DI: when a SupervisorClient is registered it shows the chat in the
+ * content host and owns the harness picker, coordinating it with the chat (a ready harness gets a fresh client bound to
+ * the chat; clearing unbinds it). Without a supervisor it does nothing and Picker stays null.
+ */
 export class RuntimeManagementService extends ServiceBase
 {
     public static readonly Key = new ServiceKey<RuntimeManagementService>('RuntimeManagementService')
@@ -16,9 +21,19 @@ export class RuntimeManagementService extends ServiceBase
     private chatClient: HarnessClient | null = null
     private pickerSubscriptions: { Dispose(): void }[] = []
 
-    constructor(provider: IServiceProvider, private readonly harnessFactory: () => HarnessClient = () => new HarnessClient())
+    constructor(
+        provider: IServiceProvider,
+        chatFactory: () => ChatViewModel = () => new ChatViewModel(),
+        private readonly harnessFactory: () => HarnessClient = () => new HarnessClient())
     {
         super(provider)
+        const client = provider.get(SupervisorClient.Key)
+        if (client !== undefined)
+        {
+            const chat = chatFactory()
+            provider.getRequired(ContentHostService.Key).View(chat)
+            this.Initialize(client, chat)
+        }
     }
 
     public get Picker(): HarnessPickerViewModel | null
@@ -26,16 +41,11 @@ export class RuntimeManagementService extends ServiceBase
         return this.picker
     }
 
-    /** Creates the picker over the supervisor, wires it to the given chat, and kicks off discovery. */
-    public Attach(client: SupervisorClient, chat: ChatViewModel): void
+    private Initialize(client: SupervisorClient, chat: ChatViewModel): void
     {
-        if (this.picker !== null)
+        for (const subscription of this.pickerSubscriptions)
         {
-            for (const subscription of this.pickerSubscriptions)
-            {
-                subscription.Dispose()
-            }
-            this.DetachClient()
+            subscription.Dispose()
         }
         const picker = new HarnessPickerViewModel(client)
         this.pickerSubscriptions = [

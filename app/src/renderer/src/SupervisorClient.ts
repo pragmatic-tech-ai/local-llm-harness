@@ -1,3 +1,4 @@
+import { ServiceKey } from '@pragmatic-tech-ai/mural/runtime'
 import { JsonRpcConnection, TurnSignal } from './JsonRpcConnection'
 
 export interface RuntimeInfo
@@ -26,6 +27,7 @@ export interface HarnessInfo
 /** JSON-RPC client for the supervisor control server: list/start/stop harnesses. */
 export class SupervisorClient extends JsonRpcConnection
 {
+    public static readonly Key = new ServiceKey<SupervisorClient>('SupervisorClient')
     private static readonly MethodListRuntimes = 'list_runtimes'
     private static readonly MethodListModels = 'list_models'
     private static readonly MethodListHarnesses = 'list_harnesses'
