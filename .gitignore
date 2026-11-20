@@ -12,3 +12,6 @@ out/
 *.log
 # SDD scratch (git-ignored)
 .superpowers/
+
+# git worktrees (superpowers)
+.claude/worktrees/
