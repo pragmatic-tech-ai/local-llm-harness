@@ -3,7 +3,7 @@ import { app } from './app.mu.js'
 import { HarnessClient } from './HarnessClient'
 import { ChatViewModel } from './ChatViewModel'
 import { SupervisorClient } from './SupervisorClient'
-import { ShellViewModel } from './ShellViewModel'
+import { RuntimeManagementService } from './RuntimeManagementService'
 import { HtmlTarget } from '@pragmatic-tech-ai/mural/visual-engine'
 import { ThemeManager, Density } from '@pragmatic-tech-ai/mural/runtime'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework'
@@ -38,9 +38,10 @@ class RendererBootstrap
         {
             const supervisor = new SupervisorClient()
             supervisor.Connect(supervisorUrl)
-            const shell = new ShellViewModel(supervisor)
-            contentHost.View(shell)
-            shell.Start()
+            const chat = new ChatViewModel()
+            contentHost.View(chat)
+            const runtime = app.Services.getRequired(RuntimeManagementService.Key)
+            runtime.Attach(supervisor, chat)
         }
         else
         {
