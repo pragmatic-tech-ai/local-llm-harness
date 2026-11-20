@@ -6,6 +6,7 @@ import { ChatViewModel } from './ChatViewModel'
 import { HarnessClient } from './HarnessClient'
 import { HarnessPickerViewModel } from './HarnessPickerViewModel'
 import { SupervisorClient } from './SupervisorClient'
+import { ApplicationSettings } from '@pragmatic-tech-ai/mural/framework'
 
 /**
  * Runtime-management capability. Owns the chat (shown as the content host's content) and the harness picker rendered in
@@ -17,17 +18,20 @@ import { SupervisorClient } from './SupervisorClient'
 export class RuntimeManagementService extends ServiceBase
 {
     public static readonly Key = new ServiceKey<RuntimeManagementService>('RuntimeManagementService')
+    private static readonly SupervisorUrlKey = 'supervisor.url'
 
     private readonly chat: ChatViewModel
     private readonly picker: HarnessPickerViewModel
     private readonly subscriptions: IDisposable[]
     private chatClient: HarnessClient | null = null
+    private supervisor: SupervisorClient | null = null
 
     constructor(
         provider: IServiceProvider,
         chatFactory: () => ChatViewModel = () => new ChatViewModel(),
         pickerFactory: () => HarnessPickerViewModel = () => new HarnessPickerViewModel(),
-        private readonly harnessFactory: () => HarnessClient = () => new HarnessClient())
+        private readonly harnessFactory: () => HarnessClient = () => new HarnessClient(),
+        private readonly supervisorFactory: () => SupervisorClient = () => new SupervisorClient())
     {
         super(provider)
         this.chat = chatFactory()
@@ -37,6 +41,11 @@ export class RuntimeManagementService extends ServiceBase
             this.picker.OnCleared.Subscribe(() => this.DetachClient()),
         ]
         provider.getRequired(ContentHostService.Key).View(this.chat)
+        const settings = provider.getRequired(ApplicationSettings.Key)
+        this.ApplyConnection(this.ReadUrl(settings))
+        const changed = settings.Changed(RuntimeManagementService.SupervisorUrlKey)
+            .subscribe(() => this.ApplyConnection(this.ReadUrl(settings)))
+        this.subscriptions.push({ Dispose: () => changed.dispose() })
     }
 
     public get Picker(): HarnessPickerViewModel
@@ -57,6 +66,30 @@ export class RuntimeManagementService extends ServiceBase
         this.chatClient?.Disconnect()
         this.chatClient = client
         this.chat.Bind(client)
+    }
+
+    private ReadUrl(settings: ApplicationSettings): string
+    {
+        const value = settings.Get(RuntimeManagementService.SupervisorUrlKey)
+        return typeof value === 'string' ? value.trim() : ''
+    }
+
+    /** Reconnect to the supervisor named by the setting: drop the old connection, then connect anew (or go inert when empty). */
+    private ApplyConnection(url: string): void
+    {
+        this.supervisor?.Disconnect()
+        this.supervisor = null
+        if (url.length > 0)
+        {
+            const client = this.supervisorFactory()
+            client.Connect(url)
+            this.supervisor = client
+            this.Attach(client)
+        }
+        else
+        {
+            this.DetachClient()
+        }
     }
 
     private AttachClient(url: string): void
@@ -83,5 +116,7 @@ export class RuntimeManagementService extends ServiceBase
         }
         this.chatClient?.Disconnect()
         this.chatClient = null
+        this.supervisor?.Disconnect()
+        this.supervisor = null
     }
 }

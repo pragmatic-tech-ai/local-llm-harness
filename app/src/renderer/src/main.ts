@@ -1,9 +1,10 @@
 import './fonts.css'
 import { app } from './app.mu.js'
 import { HarnessClient } from './HarnessClient'
-import { SupervisorClient } from './SupervisorClient'
+import { SupervisorUrlSeed } from './SupervisorUrlSeed'
 import { RuntimeManagementService } from './RuntimeManagementService'
 import { HtmlTarget } from '@pragmatic-tech-ai/mural/visual-engine'
+import { ApplicationSettings } from '@pragmatic-tech-ai/mural/framework'
 import { ThemeManager, Density } from '@pragmatic-tech-ai/mural/runtime'
 
 /** Renderer bootstrap: mounts the mural shell and wires the runtime-management capability to its data source. */
@@ -29,19 +30,13 @@ class RendererBootstrap
             // non-fatal
         }
         const host = document.getElementById(RendererBootstrap.AppElementId) as HTMLElement
-        const supervisorUrl = await window.harness.SupervisorUrl()
-        // Resolve and wire the capability before mounting so discovery is already
-        // under way when its side pane first renders. The pane is a view-reusing
-        // ContentControl, so the service exposes a stable Picker (set in its ctor);
-        // Attach only feeds it the connection, never swaps the instance.
+        // The runtime service owns the supervisor connection, driven by the persisted
+        // supervisor.url setting; constructing it applies the saved value and subscribes.
+        const settings = app.Services.getRequired(ApplicationSettings.Key)
         const runtime = app.Services.getRequired(RuntimeManagementService.Key)
-        if (supervisorUrl !== null)
-        {
-            const supervisor = new SupervisorClient()
-            supervisor.Connect(supervisorUrl)
-            runtime.Attach(supervisor)
-        }
-        else
+        // First run: seed the setting from the env default (the Set connects live).
+        SupervisorUrlSeed.Seed(settings, await window.harness.SupervisorUrl())
+        if (SupervisorUrlSeed.IsEmpty(settings.Get(SupervisorUrlSeed.SettingKey)))
         {
             const url = await window.harness.BackendUrl()
             if (url !== null)

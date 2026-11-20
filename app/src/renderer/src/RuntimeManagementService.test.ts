@@ -7,6 +7,56 @@ import { HarnessClient } from './HarnessClient'
 import { HarnessPickerViewModel } from './HarnessPickerViewModel'
 import { SupervisorClient } from './SupervisorClient'
 import { FakeSocket } from './FakeSocket'
+import { ApplicationSettings } from '@pragmatic-tech-ai/mural/framework'
+import { Signal } from '@pragmatic-tech-ai/mural/runtime'
+
+class SpySupervisor extends SupervisorClient
+{
+    public readonly Socket = new FakeSocket()
+
+    constructor(public readonly Id: number, private readonly log: string[])
+    {
+        super(() => this.Socket)
+    }
+
+    public override Connect(url: string): void
+    {
+        this.log.push(`sconnect${this.Id}:${url}`)
+        super.Connect(url)
+        this.Socket.Open()
+    }
+
+    public override Disconnect(): void
+    {
+        this.log.push(`sdisconnect${this.Id}`)
+        super.Disconnect()
+    }
+}
+
+class FakeSettings
+{
+    private readonly signal = new Signal<unknown>()
+
+    constructor(public Value: unknown)
+    {
+    }
+
+    public Get(): unknown
+    {
+        return this.Value
+    }
+
+    public Changed(): Signal<unknown>
+    {
+        return this.signal
+    }
+
+    public Change(value: unknown): void
+    {
+        this.Value = value
+        this.signal.emit(undefined)
+    }
+}
 
 class SpyClient extends HarnessClient
 {
@@ -40,7 +90,7 @@ class FakeContentHost
 
 class StubProvider
 {
-    constructor(private readonly host: FakeContentHost)
+    constructor(private readonly host: FakeContentHost, private readonly settings: FakeSettings)
     {
     }
 
@@ -49,6 +99,10 @@ class StubProvider
         if (token === ContentHostService.Key)
         {
             return this.host as unknown as T
+        }
+        if (token === ApplicationSettings.Key)
+        {
+            return this.settings as unknown as T
         }
         throw new Error('unexpected token')
     }
@@ -63,10 +117,13 @@ class Rig
     public readonly chat = new ChatViewModel()
     public readonly picker = new HarnessPickerViewModel()
     public readonly supervisor: SupervisorClient
+    public readonly supervisors: SpySupervisor[] = []
+    public readonly settings: FakeSettings
     public readonly service: RuntimeManagementService
 
-    constructor()
+    constructor(url: string = '')
     {
+        this.settings = new FakeSettings(url)
         this.supervisor = new SupervisorClient(() => this.socket)
         this.supervisor.Connect('ws://supervisor')
         this.socket.Open()
@@ -77,7 +134,7 @@ class Rig
             bind(client)
         }
         this.service = new RuntimeManagementService(
-            new StubProvider(this.host) as unknown as IServiceProvider,
+            new StubProvider(this.host, this.settings) as unknown as IServiceProvider,
             () => this.chat,
             () => this.picker,
             () =>
@@ -85,7 +142,18 @@ class Rig
                 const c = new SpyClient(this.clients.length + 1, this.log)
                 this.clients.push(c)
                 return c
+            },
+            () =>
+            {
+                const c = new SpySupervisor(this.supervisors.length + 1, this.log)
+                this.supervisors.push(c)
+                return c
             })
+        if (url === '')
+        {
+            // The empty-url ctor path unbinds the (already unbound) chat; drop that noise.
+            this.log.length = 0
+        }
     }
 
     public Attach(): void
@@ -167,5 +235,51 @@ describe('RuntimeManagementService', () =>
         rig.service.BindBackend(client)
         expect(rig.chat.CanChat).toBe(true)
         expect(rig.log).toContain('bind9')
+    })
+
+    it('empty_url_creates_no_supervisor', () =>
+    {
+        const rig = new Rig('')
+        expect(rig.supervisors).toHaveLength(0)
+        expect(rig.service.Picker.State).toBe('stopped')
+    })
+
+    it('nonempty_url_connects_and_attaches', () =>
+    {
+        const rig = new Rig('ws://s1')
+        expect(rig.supervisors).toHaveLength(1)
+        expect(rig.log).toContain('sconnect1:ws://s1')
+        expect(JSON.stringify(rig.supervisors[0].Socket.sent)).toContain('list_runtimes')
+    })
+
+    it('change_disconnects_old_before_connecting_new_and_reattaches', () =>
+    {
+        const rig = new Rig('ws://s1')
+        rig.settings.Change('ws://s2')
+        expect(rig.supervisors).toHaveLength(2)
+        expect(rig.log.indexOf('sdisconnect1')).toBeGreaterThanOrEqual(0)
+        expect(rig.log.indexOf('sdisconnect1')).toBeLessThan(rig.log.indexOf('sconnect2:ws://s2'))
+        expect(JSON.stringify(rig.supervisors[1].Socket.sent)).toContain('list_harnesses')
+    })
+
+    it('change_to_empty_disconnects_and_unbinds_chat', () =>
+    {
+        const rig = new Rig('ws://s1')
+        rig.picker.OnReady.Raise('ws://a')
+        rig.log.length = 0
+        rig.settings.Change('  ')
+        expect(rig.log).toContain('sdisconnect1')
+        expect(rig.log).toContain('bind:null')
+        expect(rig.chat.CanChat).toBe(false)
+        expect(rig.supervisors).toHaveLength(1)
+    })
+
+    it('rapid_second_change_disconnects_first_before_connecting_second', () =>
+    {
+        const rig = new Rig('')
+        rig.settings.Change('ws://a')
+        rig.settings.Change('ws://b')
+        expect(rig.supervisors).toHaveLength(2)
+        expect(rig.log.indexOf('sdisconnect1')).toBeLessThan(rig.log.indexOf('sconnect2:ws://b'))
     })
 })
