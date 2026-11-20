@@ -73,7 +73,7 @@ describe('RuntimeManagementService', () =>
         rig.service.PropertyChanged('Picker').subscribe(e => changed.push(e.property))
         rig.Attach()
         expect(rig.service.Picker).not.toBeNull()
-        const sent = JSON.stringify(rig.socket.sent ?? [])
+        const sent = JSON.stringify(rig.socket.sent)
         expect(sent).toContain('list_runtimes')
         expect(sent).toContain('list_models')
         expect(sent).toContain('list_harnesses')
@@ -102,6 +102,20 @@ describe('RuntimeManagementService', () =>
         expect(rig.log.indexOf('disconnect1')).toBeGreaterThanOrEqual(0)
         expect(rig.log.indexOf('disconnect1')).toBeLessThan(rig.log.indexOf('connect2:ws://b'))
         expect(rig.log.indexOf('disconnect1')).toBeLessThan(rig.log.indexOf('bind2'))
+    })
+
+    it('second_attach_detaches_stale_picker', () =>
+    {
+        const rig = new Rig()
+        rig.Attach()
+        const first = rig.service.Picker!
+        first.OnReady.Raise('ws://a')
+        rig.Attach()
+        expect(rig.service.Picker).not.toBe(first)
+        rig.log.length = 0
+        first.OnReady.Raise('ws://stale')
+        expect(rig.clients).toHaveLength(1)
+        expect(rig.log).toEqual([])
     })
 
     it('cleared_unbinds_chat_and_disconnects', () =>

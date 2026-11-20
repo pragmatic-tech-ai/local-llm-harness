@@ -14,6 +14,7 @@ export class RuntimeManagementService extends ServiceBase
     private picker: HarnessPickerViewModel | null = null
     private chat: ChatViewModel | null = null
     private chatClient: HarnessClient | null = null
+    private pickerSubscriptions: { Dispose(): void }[] = []
 
     constructor(provider: IServiceProvider, private readonly harnessFactory: () => HarnessClient = () => new HarnessClient())
     {
@@ -28,9 +29,19 @@ export class RuntimeManagementService extends ServiceBase
     /** Creates the picker over the supervisor, wires it to the given chat, and kicks off discovery. */
     public Attach(client: SupervisorClient, chat: ChatViewModel): void
     {
+        if (this.picker !== null)
+        {
+            for (const subscription of this.pickerSubscriptions)
+            {
+                subscription.Dispose()
+            }
+            this.DetachClient()
+        }
         const picker = new HarnessPickerViewModel(client)
-        picker.OnReady.Subscribe(url => this.AttachClient(url))
-        picker.OnCleared.Subscribe(() => this.DetachClient())
+        this.pickerSubscriptions = [
+            picker.OnReady.Subscribe(url => this.AttachClient(url)),
+            picker.OnCleared.Subscribe(() => this.DetachClient()),
+        ]
         this.chat = chat
         const old = this.picker
         this.picker = picker
