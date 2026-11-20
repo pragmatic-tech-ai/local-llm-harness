@@ -22,6 +22,6 @@ export class HarnessSettingsContribution implements ISettingsContribution
 
     public CreateView(): IDocument
     {
-        return new SettingsPageViewModel(this.provider.get(ApplicationSettings.Key)!)
+        return new SettingsPageViewModel(this.provider.getRequired(ApplicationSettings.Key))
     }
 }
