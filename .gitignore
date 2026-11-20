@@ -15,3 +15,11 @@ out/
 
 # git worktrees (superpowers)
 .claude/worktrees/
+
+# --- Vendored dependencies (backend/vendor, via `cargo vendor`) ---
+# The tree must be committed COMPLETE — cargo verifies a per-file checksum, so a
+# single dropped file fails the build. Some crates legitimately ship a `target/`
+# dir (e.g. `cc`'s `src/target/`) that the `**/target` rule above would otherwise
+# exclude. Re-include every `target/` under the vendor tree.
+!backend/vendor/**/target/
+!backend/vendor/**/target/**
