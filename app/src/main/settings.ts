@@ -1,12 +1,13 @@
 import { readFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import type { IpcMain } from 'electron'
 import { SettingsChannel } from '../shared/settings-api'
 
 /** Persists the app settings to userData/settings.json; Resolve/Write are Electron-free over a passed-in directory. */
 export class SettingsFile
 {
-    private static readonly FileName = 'settings.json'
+    public static readonly FileName = 'settings.json'
     private static readonly Encoding = 'utf8'
     private static readonly JsonIndent = 2
 
@@ -28,6 +29,7 @@ export class SettingsFile
         }
     }
 
+    /** Writes values to dir/settings.json as pretty-printed JSON, creating dir if needed. */
     public static async Write(dir: string, values: Record<string, unknown>): Promise<void>
     {
         await mkdir(dir, { recursive: true })
@@ -35,7 +37,7 @@ export class SettingsFile
     }
 
     /** Wires the snapshot (sync) and save (async) channels. */
-    public static Register(ipcMain: Pick<Electron.IpcMain, 'on' | 'handle'>, userDataDir: string): void
+    public static Register(ipcMain: Pick<IpcMain, 'on' | 'handle'>, userDataDir: string): void
     {
         ipcMain.on(SettingsChannel.GetSnapshot, event =>
         {
