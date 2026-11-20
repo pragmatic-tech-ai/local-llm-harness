@@ -1,0 +1,9 @@
+# Build every dependency from the in-repo `vendor/` tree instead of fetching from
+# crates.io, so the whole buildable project — our code and all third-party source —
+# travels together and builds identically on this machine and the hive (offline,
+# reproducible). Regenerate after dependency changes with `cargo vendor vendor`.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

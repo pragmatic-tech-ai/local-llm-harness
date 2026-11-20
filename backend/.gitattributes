@@ -1,0 +1,5 @@
+# Vendored third-party sources (`cargo vendor`) must be stored byte-for-byte: cargo
+# records each file's checksum in `.cargo-checksum.json`, so any line-ending rewrite
+# (the repo-wide `* text=auto eol=lf`) would break the checksum and fail the build on
+# checkout — notably on the Windows hive. Keep these verbatim and out of diffs/stats.
+vendor/** -text -diff linguist-vendored linguist-generated
