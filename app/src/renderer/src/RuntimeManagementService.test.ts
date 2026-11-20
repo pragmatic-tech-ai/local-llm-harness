@@ -167,6 +167,16 @@ class Rig
         }
     }
 
+    /** Answer the attached supervisor's three discovery requests so a ready harness (and a runtime) is adopted. */
+    public async DriveReady(supervisor: SpySupervisor): Promise<void>
+    {
+        const ready = { id: 'h1', runtime: 'r', model: 'm', state: 'ready', url: 'ws://h' }
+        supervisor.HandleFrame(JSON.stringify({ id: 1, result: [{ name: 'r', kind: 'http', available: true }] }))
+        supervisor.HandleFrame(JSON.stringify({ id: 2, result: [{ name: 'm', runtimes: ['r'], size_hint: '' }] }))
+        supervisor.HandleFrame(JSON.stringify({ id: 3, result: [ready] }))
+        await new Promise(r => setTimeout(r, 0))
+    }
+
     public Attach(): void
     {
         this.service.Attach(this.supervisor)
@@ -294,15 +304,17 @@ describe('RuntimeManagementService', () =>
         expect(rig.log.indexOf('sdisconnect1')).toBeLessThan(rig.log.indexOf('sconnect2:ws://b'))
     })
 
-    it('valid_to_valid_change_unbinds_old_harness_chat', () =>
+    it('valid_to_valid_change_unbinds_old_harness_chat', async () =>
     {
         const rig = new Rig('ws://s1')
-        rig.picker.OnReady.Raise('ws://a')
+        await rig.DriveReady(rig.supervisors[0])
+        expect(rig.picker.State).toBe('ready')
+        expect(rig.picker.CanStop).toBe(true)
+        expect(rig.picker.Runtimes.Count).toBe(1)
         expect(rig.chat.CanChat).toBe(true)
-        rig.picker.SelectedRuntime = { name: 'r', kind: 'http', available: true }
-        rig.picker.SelectedModel = { name: 'm', runtimes: ['r'], size_hint: '' }
         rig.settings.Change('ws://s2')
         expect(rig.chat.CanChat).toBe(false)
+        expect(rig.log).toContain('bind:null')
         expect(rig.picker.State).toBe('stopped')
         expect(rig.picker.CanStop).toBe(false)
         expect(rig.picker.CanStart).toBe(false)
@@ -313,9 +325,14 @@ describe('RuntimeManagementService', () =>
     it('change_to_empty_leaves_picker_inert', async () =>
     {
         const rig = new Rig('ws://s1')
+        await rig.DriveReady(rig.supervisors[0])
+        expect(rig.picker.State).toBe('ready')
+        expect(rig.chat.CanChat).toBe(true)
         rig.settings.Change('')
         expect(rig.picker.Runtimes.Count).toBe(0)
         expect(rig.picker.State).toBe('stopped')
+        expect(rig.picker.CanStop).toBe(false)
+        expect(rig.chat.CanChat).toBe(false)
     })
 
     it('other_key_change_does_not_reconnect', () =>

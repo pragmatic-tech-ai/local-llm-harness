@@ -6,7 +6,7 @@ import { ChatViewModel } from './ChatViewModel'
 import { HarnessClient } from './HarnessClient'
 import { HarnessPickerViewModel } from './HarnessPickerViewModel'
 import { SupervisorClient } from './SupervisorClient'
-import { SupervisorUrlSeed } from './SupervisorUrlSeed'
+import { SupervisorUrlSettingKey } from './SettingsKeys'
 import { ApplicationSettings } from '@pragmatic-tech-ai/mural/framework'
 
 /**
@@ -43,7 +43,7 @@ export class RuntimeManagementService extends ServiceBase
         provider.getRequired(ContentHostService.Key).View(this.chat)
         const settings = provider.getRequired(ApplicationSettings.Key)
         this.ApplyConnection(this.ReadUrl(settings))
-        const changed = settings.Changed(SupervisorUrlSeed.SettingKey)
+        const changed = settings.Changed(SupervisorUrlSettingKey)
             .subscribe(() => this.ApplyConnection(this.ReadUrl(settings)))
         this.subscriptions.push({ Dispose: () => changed.dispose() })
     }
@@ -70,7 +70,7 @@ export class RuntimeManagementService extends ServiceBase
 
     private ReadUrl(settings: ApplicationSettings): string
     {
-        const value = settings.Get(SupervisorUrlSeed.SettingKey)
+        const value = settings.Get(SupervisorUrlSettingKey)
         return typeof value === 'string' ? value.trim() : ''
     }
 

@@ -2,6 +2,7 @@ import './fonts.css'
 import { app } from './app.mu.js'
 import { HarnessClient } from './HarnessClient'
 import { SupervisorUrlSeed } from './SupervisorUrlSeed'
+import { SupervisorUrlSettingKey } from './SettingsKeys'
 import { RuntimeManagementService } from './RuntimeManagementService'
 import { HtmlTarget } from '@pragmatic-tech-ai/mural/visual-engine'
 import { ApplicationSettings } from '@pragmatic-tech-ai/mural/framework'
@@ -36,7 +37,7 @@ class RendererBootstrap
         const runtime = app.Services.getRequired(RuntimeManagementService.Key)
         // First run: seed the setting from the env default (the Set connects live).
         SupervisorUrlSeed.Seed(settings, await window.harness.SupervisorUrl())
-        if (SupervisorUrlSeed.IsEmpty(settings.Get(SupervisorUrlSeed.SettingKey)))
+        if (SupervisorUrlSeed.IsEmpty(settings.Get(SupervisorUrlSettingKey)))
         {
             const url = await window.harness.BackendUrl()
             if (url !== null)
