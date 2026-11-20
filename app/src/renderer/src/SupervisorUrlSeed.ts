@@ -14,11 +14,11 @@ export class SupervisorUrlSeed
     /** Set the saved url from the env default only when nothing is saved yet; returns whether it seeded. */
     public static Seed(settings: ApplicationSettings, envUrl: string | null): boolean
     {
-        if (envUrl === null || !SupervisorUrlSeed.IsEmpty(settings.Get(SupervisorUrlSeed.SettingKey)))
+        if (SupervisorUrlSeed.IsEmpty(envUrl) || !SupervisorUrlSeed.IsEmpty(settings.Get(SupervisorUrlSeed.SettingKey)))
         {
             return false
         }
-        settings.Set(SupervisorUrlSeed.SettingKey, envUrl)
+        settings.Set(SupervisorUrlSeed.SettingKey, (envUrl as string).trim())
         return true
     }
 }

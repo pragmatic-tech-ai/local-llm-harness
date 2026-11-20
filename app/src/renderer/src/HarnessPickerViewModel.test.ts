@@ -65,6 +65,22 @@ describe('HarnessPickerViewModel', () =>
         expect(rig.picker.State).toBe('stopped')
     })
 
+    it('unbind_resets_to_inert_state', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.Unbind()
+        expect(rig.picker.Runtimes.Count).toBe(0)
+        expect(rig.picker.Models.Count).toBe(0)
+        expect(rig.picker.SelectedRuntime).toBeNull()
+        expect(rig.picker.State).toBe('stopped')
+        expect(rig.picker.CanStart).toBe(false)
+        const sent = rig.socket.sent.length
+        rig.picker.StartCommand.Execute()
+        await rig.Flush()
+        expect(rig.socket.sent).toHaveLength(sent)
+    })
+
     it('start_disabled_without_selection', () =>
     {
         const rig = new Rig()

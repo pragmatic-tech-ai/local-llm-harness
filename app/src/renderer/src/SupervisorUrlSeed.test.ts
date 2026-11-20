@@ -37,6 +37,13 @@ describe('SupervisorUrlSeed', () =>
         expect(s.sets).toHaveLength(0)
     })
 
+    it('does_not_seed_when_env_blank', () =>
+    {
+        const s = new FakeSettings('')
+        SupervisorUrlSeed.Seed(s as unknown as ApplicationSettings, '   ')
+        expect(s.sets).toHaveLength(0)
+    })
+
     it('does_not_seed_when_env_null', () =>
     {
         const s = new FakeSettings(undefined)

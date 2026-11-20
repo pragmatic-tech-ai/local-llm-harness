@@ -66,6 +66,22 @@ export class HarnessPickerViewModel extends Observable
         this.harnessSubscription = client.OnHarnessChanged.Subscribe(info => this.ApplyInfo(info))
     }
 
+    /** Detach from the supervisor and return to the pristine inert state (no lists, no selection, nothing startable). */
+    public Unbind(): void
+    {
+        this.harnessSubscription?.Dispose()
+        this.harnessSubscription = null
+        this.client = null
+        this.generation++
+        this.Runtimes.Clear()
+        this.Models.Clear()
+        this.SelectedRuntime = null
+        this.SelectedModel = null
+        this.active = false
+        this.currentId = null
+        this.SetState(HarnessPickerViewModel.StateStopped, HarnessPickerViewModel.StoppedText)
+    }
+
     public get SelectedRuntime(): RuntimeInfo | null
     {
         return this._selectedRuntime
@@ -137,6 +153,11 @@ export class HarnessPickerViewModel extends Observable
                 client.ListRuntimes(),
                 client.ListModels(),
                 client.ListHarnesses()])
+            if (this.client !== client)
+            {
+                // Unbound or rebound while the listing was in flight: drop the stale reply.
+                return
+            }
             this.Runtimes.Clear()
             for (const r of runtimes)
             {

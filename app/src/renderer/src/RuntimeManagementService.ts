@@ -6,6 +6,7 @@ import { ChatViewModel } from './ChatViewModel'
 import { HarnessClient } from './HarnessClient'
 import { HarnessPickerViewModel } from './HarnessPickerViewModel'
 import { SupervisorClient } from './SupervisorClient'
+import { SupervisorUrlSeed } from './SupervisorUrlSeed'
 import { ApplicationSettings } from '@pragmatic-tech-ai/mural/framework'
 
 /**
@@ -18,7 +19,6 @@ import { ApplicationSettings } from '@pragmatic-tech-ai/mural/framework'
 export class RuntimeManagementService extends ServiceBase
 {
     public static readonly Key = new ServiceKey<RuntimeManagementService>('RuntimeManagementService')
-    private static readonly SupervisorUrlKey = 'supervisor.url'
 
     private readonly chat: ChatViewModel
     private readonly picker: HarnessPickerViewModel
@@ -43,7 +43,7 @@ export class RuntimeManagementService extends ServiceBase
         provider.getRequired(ContentHostService.Key).View(this.chat)
         const settings = provider.getRequired(ApplicationSettings.Key)
         this.ApplyConnection(this.ReadUrl(settings))
-        const changed = settings.Changed(RuntimeManagementService.SupervisorUrlKey)
+        const changed = settings.Changed(SupervisorUrlSeed.SettingKey)
             .subscribe(() => this.ApplyConnection(this.ReadUrl(settings)))
         this.subscriptions.push({ Dispose: () => changed.dispose() })
     }
@@ -70,25 +70,35 @@ export class RuntimeManagementService extends ServiceBase
 
     private ReadUrl(settings: ApplicationSettings): string
     {
-        const value = settings.Get(RuntimeManagementService.SupervisorUrlKey)
+        const value = settings.Get(SupervisorUrlSeed.SettingKey)
         return typeof value === 'string' ? value.trim() : ''
     }
 
     /** Reconnect to the supervisor named by the setting: drop the old connection, then connect anew (or go inert when empty). */
     private ApplyConnection(url: string): void
     {
+        // The live harness belongs to the connection being dropped.
+        this.DetachClient()
         this.supervisor?.Disconnect()
         this.supervisor = null
-        if (url.length > 0)
+        if (url.length === 0)
         {
-            const client = this.supervisorFactory()
+            this.picker.Unbind()
+            return
+        }
+        const client = this.supervisorFactory()
+        this.supervisor = client
+        try
+        {
             client.Connect(url)
-            this.supervisor = client
             this.Attach(client)
         }
-        else
+        catch
         {
-            this.DetachClient()
+            // A bad url must not escape the change handler or leave the service half-wired.
+            client.Disconnect()
+            this.supervisor = null
+            this.picker.Unbind()
         }
     }
 

@@ -14,7 +14,7 @@ class SpySupervisor extends SupervisorClient
 {
     public readonly Socket = new FakeSocket()
 
-    constructor(public readonly Id: number, private readonly log: string[])
+    constructor(public readonly Id: number, private readonly log: string[], private readonly fails: () => boolean = () => false)
     {
         super(() => this.Socket)
     }
@@ -22,6 +22,10 @@ class SpySupervisor extends SupervisorClient
     public override Connect(url: string): void
     {
         this.log.push(`sconnect${this.Id}:${url}`)
+        if (this.fails())
+        {
+            throw new Error('bad url')
+        }
         super.Connect(url)
         this.Socket.Open()
     }
@@ -35,7 +39,7 @@ class SpySupervisor extends SupervisorClient
 
 class FakeSettings
 {
-    private readonly signal = new Signal<unknown>()
+    private readonly signals = new Map<string, Signal<unknown>>()
 
     constructor(public Value: unknown)
     {
@@ -46,15 +50,21 @@ class FakeSettings
         return this.Value
     }
 
-    public Changed(): Signal<unknown>
+    public Changed(key: string): Signal<unknown>
     {
-        return this.signal
+        let signal = this.signals.get(key)
+        if (signal === undefined)
+        {
+            signal = new Signal<unknown>()
+            this.signals.set(key, signal)
+        }
+        return signal
     }
 
-    public Change(value: unknown): void
+    public Change(value: unknown, key: string = 'supervisor.url'): void
     {
         this.Value = value
-        this.signal.emit(undefined)
+        this.Changed(key).emit(undefined)
     }
 }
 
@@ -119,6 +129,7 @@ class Rig
     public readonly supervisor: SupervisorClient
     public readonly supervisors: SpySupervisor[] = []
     public readonly settings: FakeSettings
+    public ThrowOnConnect = false
     public readonly service: RuntimeManagementService
 
     constructor(url: string = '')
@@ -145,7 +156,7 @@ class Rig
             },
             () =>
             {
-                const c = new SpySupervisor(this.supervisors.length + 1, this.log)
+                const c = new SpySupervisor(this.supervisors.length + 1, this.log, () => this.ThrowOnConnect)
                 this.supervisors.push(c)
                 return c
             })
@@ -179,7 +190,7 @@ describe('RuntimeManagementService', () =>
         // caught failure would surface as an error status; the guard keeps it inert.
         expect(rig.socket.sent).toHaveLength(0)
         expect(rig.service.Picker.State).toBe('stopped')
-        expect(rig.service.Picker.StatusText).toBe('')
+        expect(rig.service.Picker.StatusText).toBe('Stopped')
     })
 
     it('attach_binds_connection_and_refreshes', () =>
@@ -281,5 +292,40 @@ describe('RuntimeManagementService', () =>
         rig.settings.Change('ws://b')
         expect(rig.supervisors).toHaveLength(2)
         expect(rig.log.indexOf('sdisconnect1')).toBeLessThan(rig.log.indexOf('sconnect2:ws://b'))
+    })
+
+    it('valid_to_valid_change_unbinds_old_harness_chat', () =>
+    {
+        const rig = new Rig('ws://s1')
+        rig.picker.OnReady.Raise('ws://a')
+        expect(rig.chat.CanChat).toBe(true)
+        rig.settings.Change('ws://s2')
+        expect(rig.chat.CanChat).toBe(false)
+        expect(rig.log.indexOf('disconnect1')).toBeGreaterThanOrEqual(0)
+    })
+
+    it('change_to_empty_leaves_picker_inert', async () =>
+    {
+        const rig = new Rig('ws://s1')
+        rig.settings.Change('')
+        expect(rig.picker.Runtimes.Count).toBe(0)
+        expect(rig.picker.State).toBe('stopped')
+    })
+
+    it('other_key_change_does_not_reconnect', () =>
+    {
+        const rig = new Rig('ws://s1')
+        const before = [...rig.log]
+        rig.settings.Change('ws://other', 'some.other.key')
+        expect(rig.supervisors).toHaveLength(1)
+        expect(rig.log).toEqual(before)
+    })
+
+    it('throwing_connect_goes_inert', () =>
+    {
+        const rig = new Rig('')
+        rig.ThrowOnConnect = true
+        expect(() => rig.settings.Change('bad')).not.toThrow()
+        expect(rig.picker.State).toBe('stopped')
     })
 })
