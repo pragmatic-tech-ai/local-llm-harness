@@ -4,6 +4,7 @@ import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import { Sidecar } from './sidecar'
 import { BackendUrl } from './backend-url'
 import { SupervisorUrl } from './supervisor-url'
+import { SettingsFile } from './settings'
 
 /** Owns the BrowserWindow and the Rust backend sidecar for the app's lifetime. */
 export class MainApplication
@@ -55,6 +56,7 @@ export class MainApplication
                 console.error(MainApplication.ExitMessage + code)
             }
         })
+        SettingsFile.Register(ipcMain, app.getPath('userData'))
         ipcMain.handle(MainApplication.SupervisorUrlChannel, () => this.supervisorUrl)
         ipcMain.handle(MainApplication.BackendUrlChannel, async () =>
         {
