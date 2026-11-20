@@ -1,5 +1,5 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { TurnSignal } from './JsonRpcConnection'
+import { TurnSignal, type IDisposable } from './JsonRpcConnection'
 import type { HarnessInfo, ModelInfo, RuntimeInfo, SupervisorClient } from './SupervisorClient'
 
 /** Runtime/model picker over the supervisor: lists choices, starts/stops a harness, tracks its lifecycle state. */
@@ -45,6 +45,7 @@ export class HarnessPickerViewModel extends Observable
     public readonly OnCleared = new TurnSignal<void>()
 
     private client: SupervisorClient | null = null
+    private harnessSubscription: IDisposable | null = null
 
     constructor(client?: SupervisorClient)
     {
@@ -60,8 +61,9 @@ export class HarnessPickerViewModel extends Observable
     /** Attach the supervisor connection. Until bound the picker is inert (no listing, no start/stop). */
     public Bind(client: SupervisorClient): void
     {
+        this.harnessSubscription?.Dispose()
         this.client = client
-        client.OnHarnessChanged.Subscribe(info => this.ApplyInfo(info))
+        this.harnessSubscription = client.OnHarnessChanged.Subscribe(info => this.ApplyInfo(info))
     }
 
     public get SelectedRuntime(): RuntimeInfo | null

@@ -107,7 +107,11 @@ describe('RuntimeManagementService', () =>
     {
         const rig = new Rig()
         rig.service.Picker.Refresh()
+        // Without the client guard, Refresh would dereference a null client and the
+        // caught failure would surface as an error status; the guard keeps it inert.
         expect(rig.socket.sent).toHaveLength(0)
+        expect(rig.service.Picker.State).toBe('stopped')
+        expect(rig.service.Picker.StatusText).toBe('')
     })
 
     it('attach_binds_connection_and_refreshes', () =>

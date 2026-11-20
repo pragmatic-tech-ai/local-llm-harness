@@ -1,5 +1,6 @@
 import { ServiceBase, ServiceKey } from '@pragmatic-tech-ai/mural/runtime'
 import type { IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
+import type { IDisposable } from './JsonRpcConnection'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/services/content-host-service.js'
 import { ChatViewModel } from './ChatViewModel'
 import { HarnessClient } from './HarnessClient'
@@ -19,6 +20,7 @@ export class RuntimeManagementService extends ServiceBase
 
     private readonly chat: ChatViewModel
     private readonly picker: HarnessPickerViewModel
+    private readonly subscriptions: IDisposable[]
     private chatClient: HarnessClient | null = null
 
     constructor(
@@ -30,8 +32,10 @@ export class RuntimeManagementService extends ServiceBase
         super(provider)
         this.chat = chatFactory()
         this.picker = pickerFactory()
-        this.picker.OnReady.Subscribe(url => this.AttachClient(url))
-        this.picker.OnCleared.Subscribe(() => this.DetachClient())
+        this.subscriptions = [
+            this.picker.OnReady.Subscribe(url => this.AttachClient(url)),
+            this.picker.OnCleared.Subscribe(() => this.DetachClient()),
+        ]
         provider.getRequired(ContentHostService.Key).View(this.chat)
     }
 
@@ -50,6 +54,8 @@ export class RuntimeManagementService extends ServiceBase
     /** Bind the chat to a directly-connected backend (no supervisor); used by the direct-backend fallback. */
     public BindBackend(client: HarnessClient): void
     {
+        this.chatClient?.Disconnect()
+        this.chatClient = client
         this.chat.Bind(client)
     }
 
@@ -65,6 +71,16 @@ export class RuntimeManagementService extends ServiceBase
     private DetachClient(): void
     {
         this.chat.Bind(null)
+        this.chatClient?.Disconnect()
+        this.chatClient = null
+    }
+
+    public override dispose(): void
+    {
+        for (const subscription of this.subscriptions)
+        {
+            subscription.Dispose()
+        }
         this.chatClient?.Disconnect()
         this.chatClient = null
     }
