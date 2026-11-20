@@ -7,16 +7,21 @@ class HarnessBridge
     private static readonly GlobalName = 'harness'
     private static readonly BackendUrlChannel = 'backend-url'
     private static readonly SupervisorUrlChannel = 'supervisor-url'
+    private static readonly SaveFailedMessage = 'Failed to save settings'
 
     public static Expose(): void
     {
+        // Only guards the preload-side reference: exposeInMainWorld structurally clones, so the renderer's copy is not frozen.
         const snapshot = Object.freeze(ipcRenderer.sendSync(SettingsChannel.GetSnapshot) as Record<string, unknown>)
         contextBridge.exposeInMainWorld(HarnessBridge.GlobalName, {
             BackendUrl: (): Promise<string | null> => ipcRenderer.invoke(HarnessBridge.BackendUrlChannel),
             SupervisorUrl: (): Promise<string | null> => ipcRenderer.invoke(HarnessBridge.SupervisorUrlChannel),
             settings: {
                 snapshot,
-                Save: (values: Record<string, unknown>): Promise<void> => ipcRenderer.invoke(SettingsChannel.Save, values),
+                Save: (values: Record<string, unknown>): void =>
+                {
+                    ipcRenderer.invoke(SettingsChannel.Save, values).catch(e => console.warn(HarnessBridge.SaveFailedMessage, e))
+                },
             },
         })
     }
