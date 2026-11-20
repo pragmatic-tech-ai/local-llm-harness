@@ -3,9 +3,8 @@ import { app } from './app.mu.js'
 import { HarnessClient } from './HarnessClient'
 import { ChatViewModel } from './ChatViewModel'
 import { SupervisorClient } from './SupervisorClient'
-import { RuntimeManagementService } from './RuntimeManagementService'
 import { HtmlTarget } from '@pragmatic-tech-ai/mural/visual-engine'
-import { ThemeManager, Density } from '@pragmatic-tech-ai/mural/runtime'
+import { ThemeManager, Density, ServiceLifetime } from '@pragmatic-tech-ai/mural/runtime'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework'
 
 /** Renderer bootstrap: mounts the mural shell and hands the ContentHost its first view. */
@@ -31,19 +30,16 @@ class RendererBootstrap
             // non-fatal
         }
         const host = document.getElementById(RendererBootstrap.AppElementId) as HTMLElement
-        app.initialize(new HtmlTarget(host))
-        const contentHost = app.Services.getRequired(ContentHostService.Key)
         const supervisorUrl = await window.harness.SupervisorUrl()
         if (supervisorUrl !== null)
         {
             const supervisor = new SupervisorClient()
             supervisor.Connect(supervisorUrl)
-            const chat = new ChatViewModel()
-            contentHost.View(chat)
-            const runtime = app.Services.getRequired(RuntimeManagementService.Key)
-            runtime.Attach(supervisor, chat)
+            app.Services.register(SupervisorClient.Key, () => supervisor, ServiceLifetime.Singleton)
         }
-        else
+        app.initialize(new HtmlTarget(host))
+        const contentHost = app.Services.getRequired(ContentHostService.Key)
+        if (supervisorUrl === null)
         {
             const url = await window.harness.BackendUrl()
             const client = new HarnessClient()
