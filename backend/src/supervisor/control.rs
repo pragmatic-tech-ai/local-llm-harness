@@ -73,6 +73,10 @@ struct Request {
 struct StartParams {
     runtime: String,
     model: String,
+    /// Optional per-launch context-size override from the UI. Absent means "fall back to the
+    /// catalog, else the model's trained length"; the engine caps it at the trained length.
+    #[serde(default)]
+    n_ctx: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,7 +119,7 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
                     serde_json::from_value(params).map_err(RpcError::invalid_params)?;
                 let info = self
                     .manager
-                    .start(&p.runtime, &p.model)
+                    .start(&p.runtime, &p.model, p.n_ctx)
                     .await
                     .map_err(RpcError::from_manager)?;
                 serde_json::to_value(info).map_err(RpcError::internal)
@@ -380,6 +384,17 @@ mod tests {
         assert_eq!(v["id"], "candle:gem");
         assert_eq!(v["state"], "ready");
         assert_eq!(v["url"], "ws://192.168.1.101:8777");
+    }
+
+    #[tokio::test]
+    async fn start_accepts_n_ctx_override() {
+        let s = server("nctx");
+        let v = s
+            .dispatch("start", json!({"runtime": "candle", "model": "gem", "n_ctx": 8192}))
+            .await
+            .unwrap();
+        assert_eq!(v["id"], "candle:gem");
+        assert_eq!(v["state"], "ready");
     }
 
     #[tokio::test]

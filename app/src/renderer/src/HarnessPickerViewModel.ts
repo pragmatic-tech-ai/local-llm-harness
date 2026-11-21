@@ -21,6 +21,9 @@ export class HarnessPickerViewModel extends Observable
     private static readonly PropStatusText = 'StatusText'
     private static readonly PropCanStart = 'CanStart'
     private static readonly PropCanStop = 'CanStop'
+    private static readonly PropContextSizeText = 'ContextSizeText'
+    private static readonly DefaultContextSize = 8192
+    private static readonly DefaultContextText = '8192'
     private static readonly FormatToken = /\{(\d+)\}/g
 
     private _selectedRuntime: RuntimeInfo | null = null
@@ -29,6 +32,8 @@ export class HarnessPickerViewModel extends Observable
     private _statusText = ''
     private _canStart = false
     private _canStop = false
+    /** Context-window size for the next launch, as typed; parsed to a positive int on Start. */
+    private _contextSizeText = HarnessPickerViewModel.DefaultContextText
     private currentId: string | null = null
     /** True while a launch is in flight or a harness is live; events are ignored once the user stops. */
     private active = false
@@ -102,6 +107,23 @@ export class HarnessPickerViewModel extends Observable
     {
         this.Change(HarnessPickerViewModel.PropSelectedModel, this._selectedModel, v, x => this._selectedModel = x)
         this.Reevaluate()
+    }
+
+    public get ContextSizeText(): string
+    {
+        return this._contextSizeText
+    }
+
+    public set ContextSizeText(v: string)
+    {
+        this.Change(HarnessPickerViewModel.PropContextSizeText, this._contextSizeText, v, x => this._contextSizeText = x)
+    }
+
+    /** The context size sent on the next launch: the typed value parsed to a positive integer, or the safe default. */
+    private ParsedContextSize(): number
+    {
+        const n = Number.parseInt(this._contextSizeText, 10)
+        return Number.isFinite(n) && n > 0 ? n : HarnessPickerViewModel.DefaultContextSize
     }
 
     public get State(): string
@@ -206,7 +228,7 @@ export class HarnessPickerViewModel extends Observable
             HarnessPickerViewModel.Format(HarnessPickerViewModel.LoadingFormat, runtime.name, model.name))
         try
         {
-            const info = await client.Start(runtime.name, model.name)
+            const info = await client.Start(runtime.name, model.name, this.ParsedContextSize())
             if (gen === this.generation)
             {
                 this.ApplyInfo(info)

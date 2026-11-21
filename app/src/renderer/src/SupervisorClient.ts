@@ -32,6 +32,7 @@ export class SupervisorClient extends JsonRpcConnection
     private static readonly MethodStart = 'start'
     private static readonly MethodStop = 'stop'
     private static readonly NoteHarnessChanged = 'harness_changed'
+    private static readonly ParamNCtx = 'n_ctx'
 
     public readonly OnHarnessChanged = new TurnSignal<HarnessInfo>()
 
@@ -50,9 +51,14 @@ export class SupervisorClient extends JsonRpcConnection
         return this.Request<HarnessInfo[]>(SupervisorClient.MethodListHarnesses, {})
     }
 
-    public Start(runtime: string, model: string): Promise<HarnessInfo>
+    public Start(runtime: string, model: string, nCtx?: number): Promise<HarnessInfo>
     {
-        return this.Request<HarnessInfo>(SupervisorClient.MethodStart, { runtime, model })
+        const params: Record<string, unknown> = { runtime, model }
+        if (nCtx !== undefined)
+        {
+            params[SupervisorClient.ParamNCtx] = nCtx
+        }
+        return this.Request<HarnessInfo>(SupervisorClient.MethodStart, params)
     }
 
     public async Stop(id: string): Promise<void>

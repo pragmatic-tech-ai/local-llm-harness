@@ -13,6 +13,10 @@ resources HarnessPanelResources {
                 ComboBox [ ItemsSource = $Models, DisplayMemberPath = "name", SelectedItem = $SelectedModel ]
             }
             DockPanel [ LastChildFill = true, Margin = (0,0,0,4) ] {
+                TextBlock [ DockPanel.Dock = Left, Text = "Context", Margin = (0,0,8,0), VerticalAlignment = Center ]
+                TextBox [ Text = $ContextSizeText, VerticalAlignment = Center ]
+            }
+            DockPanel [ LastChildFill = true, Margin = (0,0,0,4) ] {
                 Button [ DockPanel.Dock = Left, Command = $StartCommand, Margin = (0,0,6,0) ] {
                     TextBlock [ Text = "Start" ]
                 }

@@ -135,10 +135,13 @@ impl SpawnPlan {
         def: &RuntimeDef,
         model: &ResolvedModel,
         catalog: &Catalog,
+        n_ctx_override: Option<u32>,
     ) -> Result<SpawnPlan, ManagerError> {
-        // An unset catalog `n_ctx` means "let the engine default to the model's trained context
-        // length": omit `HARNESS_N_CTX` for the in-process engines, and pass `-c 0` (llama.cpp's
-        // "use trained context" convention) to the external llama-server.
+        // A per-launch UI override wins over the catalog's `n_ctx`; an unset value (neither given)
+        // means "let the engine default to the model's trained context length": omit
+        // `HARNESS_N_CTX` for the in-process engines, and pass `-c 0` (llama.cpp's "use trained
+        // context" convention) to the external llama-server.
+        let n_ctx = n_ctx_override.or(def.n_ctx);
         let gguf = model.gguf.to_string_lossy().into_owned();
         let bind = format!("{}:{}", Self::BIND_ALL, catalog.worker_port);
         let children = match def.kind {
@@ -155,7 +158,7 @@ impl SpawnPlan {
                         tokenizer.to_string_lossy().into_owned(),
                     ),
                 ];
-                if let Some(n) = def.n_ctx {
+                if let Some(n) = n_ctx {
                     pairs.push((Self::ENV_N_CTX, n.to_string()));
                 }
                 pairs.push((Self::ENV_BIND, bind));
@@ -171,7 +174,7 @@ impl SpawnPlan {
                     (Self::ENV_ENGINE, Self::ENGINE_LLAMACPP.to_string()),
                     (Self::ENV_MODEL, gguf),
                 ];
-                if let Some(n) = def.n_ctx {
+                if let Some(n) = n_ctx {
                     pairs.push((Self::ENV_N_CTX, n.to_string()));
                 }
                 pairs.push((Self::ENV_NGL, ngl.to_string()));
@@ -193,7 +196,7 @@ impl SpawnPlan {
                 let ngl = def.n_gpu_layers.unwrap_or(Self::DEFAULT_NGL_SERVER);
                 // `-c 0` tells llama-server to use the model's trained context length; an explicit
                 // catalog value is passed through as-is.
-                let ctx_arg = def.n_ctx.unwrap_or(0).to_string();
+                let ctx_arg = n_ctx.unwrap_or(0).to_string();
                 // The proxy reports this as `model_name`; use the clean display name (the gguf file
                 // stem), never llama-server's absolute path.
                 let display_name = model
@@ -449,7 +452,12 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
     }
 
     /// Start `model` on `runtime`, evicting any live harness first.
-    pub async fn start(&self, runtime: &str, model: &str) -> Result<HarnessInfo, ManagerError> {
+    pub async fn start(
+        &self,
+        runtime: &str,
+        model: &str,
+        n_ctx_override: Option<u32>,
+    ) -> Result<HarnessInfo, ManagerError> {
         let def = self
             .catalog
             .runtimes
@@ -464,7 +472,7 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
                 model: model.to_string(),
             });
         }
-        let plan = SpawnPlan::build(def, &resolved, &self.catalog)?;
+        let plan = SpawnPlan::build(def, &resolved, &self.catalog, n_ctx_override)?;
 
         // Held for the whole start so start/stop/crash-handling are serialised.
         let mut live = self.shared.live.lock().await;
@@ -931,8 +939,8 @@ mod tests {
     async fn start_evicts_then_spawns() {
         let l = FakeLauncher::default();
         let m = manager("evict", l.clone(), FakeProbe::new(Mode::Ready));
-        m.start("candle", "gem").await.unwrap();
-        m.start("llamacpp", "gem").await.unwrap();
+        m.start("candle", "gem", None).await.unwrap();
+        m.start("llamacpp", "gem", None).await.unwrap();
         assert_eq!(
             events(&l),
             vec![
@@ -951,7 +959,7 @@ mod tests {
     async fn start_times_out_to_failed() {
         let l = FakeLauncher::default();
         let m = manager("timeout", l.clone(), FakeProbe::new(Mode::Never));
-        let err = m.start("llamacpp", "lla").await.unwrap_err();
+        let err = m.start("llamacpp", "lla", None).await.unwrap_err();
         assert!(matches!(err, ManagerError::LoadTimeout));
         let list = m.list();
         assert_eq!(list[0].state, HarnessState::Failed);
@@ -966,7 +974,7 @@ mod tests {
             ..FakeLauncher::default()
         };
         let m = manager("early", l.clone(), FakeProbe::new(Mode::Hang));
-        let err = m.start("llamacpp", "lla").await.unwrap_err();
+        let err = m.start("llamacpp", "lla", None).await.unwrap_err();
         assert!(matches!(err, ManagerError::WorkerExited(Some(1))));
         assert_eq!(m.list()[0].state, HarnessState::Failed);
     }
@@ -976,7 +984,7 @@ mod tests {
         let l = FakeLauncher::default();
         let m = manager("hang", l.clone(), FakeProbe::new(Mode::Hang));
         let started = std::time::Instant::now();
-        let err = m.start("llamacpp", "lla").await.unwrap_err();
+        let err = m.start("llamacpp", "lla", None).await.unwrap_err();
         assert!(matches!(err, ManagerError::LoadTimeout));
         assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(m.list()[0].state, HarnessState::Failed);
@@ -987,7 +995,7 @@ mod tests {
     async fn ready_url_uses_advertise_host() {
         let probe = FakeProbe::new(Mode::Ready);
         let m = manager("url", FakeLauncher::default(), probe.clone());
-        let info = m.start("llamacpp", "lla").await.unwrap();
+        let info = m.start("llamacpp", "lla", None).await.unwrap();
         assert_eq!(info.state, HarnessState::Ready);
         assert_eq!(info.url.as_deref(), Some("ws://192.168.1.101:8777"));
         assert_eq!(
@@ -1000,7 +1008,7 @@ mod tests {
     async fn http_runtime_spawns_two_children() {
         let l = FakeLauncher::default();
         let m = manager("http", l.clone(), FakeProbe::new(Mode::Ready));
-        m.start("http", "lla").await.unwrap();
+        m.start("http", "lla", None).await.unwrap();
         let specs = l.specs.lock().unwrap().clone();
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].exe, PathBuf::from("llama-server.exe"));
@@ -1030,7 +1038,7 @@ mod tests {
         for (runtime, model) in [("candle", "gem"), ("llamacpp", "lla"), ("http", "lla")] {
             let l = FakeLauncher::default();
             let m = manager("supenv", l.clone(), FakeProbe::new(Mode::Ready));
-            m.start(runtime, model).await.unwrap();
+            m.start(runtime, model, None).await.unwrap();
             let specs = l.specs.lock().unwrap().clone();
             assert!(!specs.is_empty());
             for spec in specs {
@@ -1047,7 +1055,7 @@ mod tests {
 
         // Unset catalog n_ctx → no HARNESS_N_CTX env (engine defaults to the trained length).
         let mut lla = def("llamacpp", RuntimeKind::Llamacpp, "llamacpp.exe");
-        let plan = SpawnPlan::build(&lla, &model, &cat).unwrap();
+        let plan = SpawnPlan::build(&lla, &model, &cat, None).unwrap();
         assert!(!plan.children[0]
             .env
             .iter()
@@ -1055,7 +1063,7 @@ mod tests {
 
         // Explicit catalog n_ctx → HARNESS_N_CTX carries it verbatim.
         lla.n_ctx = Some(2048);
-        let plan = SpawnPlan::build(&lla, &model, &cat).unwrap();
+        let plan = SpawnPlan::build(&lla, &model, &cat, None).unwrap();
         assert!(plan.children[0]
             .env
             .contains(&("HARNESS_N_CTX".to_string(), "2048".to_string())));
@@ -1072,20 +1080,52 @@ mod tests {
         http.server_exe = Some(PathBuf::from("llama-server.exe"));
 
         // Unset → llama-server gets `-c 0` (use the model's trained context length).
-        let plan = SpawnPlan::build(&http, &model, &cat).unwrap();
+        let plan = SpawnPlan::build(&http, &model, &cat, None).unwrap();
         assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "0"]));
 
         // Explicit → `-c <n>`.
         http.n_ctx = Some(2048);
-        let plan = SpawnPlan::build(&http, &model, &cat).unwrap();
+        let plan = SpawnPlan::build(&http, &model, &cat, None).unwrap();
         assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "2048"]));
+    }
+
+    #[test]
+    fn n_ctx_override_wins_over_catalog() {
+        let dir = model_dir("override");
+        let cat = catalog(&dir);
+        let model = resolve_model(&cat, "gem").expect("gem.gguf resolves");
+
+        // A per-launch override is used even when the catalog leaves n_ctx unset (llamacpp).
+        let lla = def("llamacpp", RuntimeKind::Llamacpp, "llamacpp.exe");
+        let plan = SpawnPlan::build(&lla, &model, &cat, Some(8192)).unwrap();
+        assert!(plan.children[0]
+            .env
+            .contains(&("HARNESS_N_CTX".to_string(), "8192".to_string())));
+
+        // And it beats an explicit catalog value.
+        let mut lla_set = def("llamacpp", RuntimeKind::Llamacpp, "llamacpp.exe");
+        lla_set.n_ctx = Some(2048);
+        let plan = SpawnPlan::build(&lla_set, &model, &cat, Some(8192)).unwrap();
+        assert!(plan.children[0]
+            .env
+            .contains(&("HARNESS_N_CTX".to_string(), "8192".to_string())));
+        assert!(!plan.children[0]
+            .env
+            .contains(&("HARNESS_N_CTX".to_string(), "2048".to_string())));
+
+        // For the http arm the override reaches llama-server's `-c`.
+        let mut http = def("http", RuntimeKind::Http, "proxy.exe");
+        http.internal_port = Some(8080);
+        http.server_exe = Some(PathBuf::from("llama-server.exe"));
+        let plan = SpawnPlan::build(&http, &model, &cat, Some(8192)).unwrap();
+        assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "8192"]));
     }
 
     #[tokio::test]
     async fn start_rejects_incompatible_pair() {
         let l = FakeLauncher::default();
         let m = manager("incompat", l.clone(), FakeProbe::new(Mode::Ready));
-        let err = m.start("candle", "lla").await.unwrap_err();
+        let err = m.start("candle", "lla", None).await.unwrap_err();
         assert!(matches!(err, ManagerError::Incompatible { .. }));
         assert!(events(&l).is_empty());
         assert!(m.list().is_empty());
@@ -1094,7 +1134,7 @@ mod tests {
     #[tokio::test]
     async fn id_is_runtime_colon_model() {
         let m = manager("id", FakeLauncher::default(), FakeProbe::new(Mode::Ready));
-        let info = m.start("candle", "gem").await.unwrap();
+        let info = m.start("candle", "gem", None).await.unwrap();
         assert_eq!(info.id, "candle:gem");
     }
 
@@ -1103,7 +1143,7 @@ mod tests {
         let l = FakeLauncher::default();
         let m = manager("crash", l.clone(), FakeProbe::new(Mode::Ready));
         let mut rx = m.subscribe();
-        m.start("llamacpp", "lla").await.unwrap();
+        m.start("llamacpp", "lla", None).await.unwrap();
         *l.exits.lock().unwrap()[0].lock().unwrap() = Some(ChildExit { code: Some(139) });
         m.poll_health().await;
         assert_eq!(m.list()[0].state, HarnessState::Failed);

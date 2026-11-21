@@ -17,6 +17,30 @@ describe('SupervisorClient', () =>
         await expect(pending).resolves.toEqual(expected)
     })
 
+    it('start_includes_n_ctx_when_given', () =>
+    {
+        const socket = new FakeSocket()
+        const client = new SupervisorClient(() => socket)
+        client.Connect('ws://x')
+        socket.Open()
+        void client.Start('llamacpp', 'gemma', 8192)
+        expect(JSON.parse(socket.sent[0])).toEqual({
+            id: 1,
+            method: 'start',
+            params: { runtime: 'llamacpp', model: 'gemma', n_ctx: 8192 }
+        })
+    })
+
+    it('start_omits_n_ctx_when_absent', () =>
+    {
+        const socket = new FakeSocket()
+        const client = new SupervisorClient(() => socket)
+        client.Connect('ws://x')
+        socket.Open()
+        void client.Start('llamacpp', 'gemma')
+        expect(JSON.parse(socket.sent[0]).params).toEqual({ runtime: 'llamacpp', model: 'gemma' })
+    })
+
     it('list_models_parses', async () =>
     {
         const socket = new FakeSocket()

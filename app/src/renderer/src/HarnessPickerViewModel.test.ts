@@ -106,6 +106,46 @@ describe('HarnessPickerViewModel', () =>
         expect(rig.ready).toEqual(['ws://h1'])
     })
 
+    it('start_sends_default_context_size', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        expect(rig.picker.ContextSizeText).toBe('8192')
+        rig.picker.StartCommand.Execute()
+        const params = JSON.parse(rig.socket.sent[rig.socket.sent.length - 1]).params
+        expect(params.n_ctx).toBe(8192)
+    })
+
+    it('start_sends_custom_context_size', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.ContextSizeText = '16384'
+        rig.picker.StartCommand.Execute()
+        const params = JSON.parse(rig.socket.sent[rig.socket.sent.length - 1]).params
+        expect(params.n_ctx).toBe(16384)
+    })
+
+    it('blank_context_falls_back_to_default', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.ContextSizeText = ''
+        rig.picker.StartCommand.Execute()
+        const params = JSON.parse(rig.socket.sent[rig.socket.sent.length - 1]).params
+        expect(params.n_ctx).toBe(8192)
+    })
+
+    it('non_positive_context_falls_back_to_default', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.ContextSizeText = '0'
+        rig.picker.StartCommand.Execute()
+        const params = JSON.parse(rig.socket.sent[rig.socket.sent.length - 1]).params
+        expect(params.n_ctx).toBe(8192)
+    })
+
     it('stop_clears_and_raises_cleared', async () =>
     {
         const rig = new Rig()
