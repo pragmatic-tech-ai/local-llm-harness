@@ -82,7 +82,6 @@ pub struct SpawnPlan {
 }
 
 impl SpawnPlan {
-    const DEFAULT_N_CTX: u32 = 4096;
     const DEFAULT_NGL_WORKER: i32 = -1;
     const DEFAULT_NGL_SERVER: i32 = 28;
     const BIND_ALL: &'static str = "0.0.0.0";
@@ -137,7 +136,9 @@ impl SpawnPlan {
         model: &ResolvedModel,
         catalog: &Catalog,
     ) -> Result<SpawnPlan, ManagerError> {
-        let n_ctx = def.n_ctx.unwrap_or(Self::DEFAULT_N_CTX);
+        // An unset catalog `n_ctx` means "let the engine default to the model's trained context
+        // length": omit `HARNESS_N_CTX` for the in-process engines, and pass `-c 0` (llama.cpp's
+        // "use trained context" convention) to the external llama-server.
         let gguf = model.gguf.to_string_lossy().into_owned();
         let bind = format!("{}:{}", Self::BIND_ALL, catalog.worker_port);
         let children = match def.kind {
@@ -146,33 +147,39 @@ impl SpawnPlan {
                     .tokenizer
                     .as_ref()
                     .ok_or_else(|| Self::missing(def, Self::MISSING_TOKENIZER))?;
+                let mut pairs = vec![
+                    (Self::ENV_ENGINE, Self::ENGINE_CANDLE.to_string()),
+                    (Self::ENV_MODEL, gguf),
+                    (
+                        Self::ENV_TOKENIZER,
+                        tokenizer.to_string_lossy().into_owned(),
+                    ),
+                ];
+                if let Some(n) = def.n_ctx {
+                    pairs.push((Self::ENV_N_CTX, n.to_string()));
+                }
+                pairs.push((Self::ENV_BIND, bind));
                 vec![ChildSpec {
                     exe: def.exe.clone(),
                     args: Vec::new(),
-                    env: Self::env(&[
-                        (Self::ENV_ENGINE, Self::ENGINE_CANDLE.to_string()),
-                        (Self::ENV_MODEL, gguf),
-                        (
-                            Self::ENV_TOKENIZER,
-                            tokenizer.to_string_lossy().into_owned(),
-                        ),
-                        (Self::ENV_N_CTX, n_ctx.to_string()),
-                        (Self::ENV_BIND, bind),
-                    ]),
+                    env: Self::env(&pairs),
                 }]
             }
             RuntimeKind::Llamacpp => {
                 let ngl = def.n_gpu_layers.unwrap_or(Self::DEFAULT_NGL_WORKER);
+                let mut pairs = vec![
+                    (Self::ENV_ENGINE, Self::ENGINE_LLAMACPP.to_string()),
+                    (Self::ENV_MODEL, gguf),
+                ];
+                if let Some(n) = def.n_ctx {
+                    pairs.push((Self::ENV_N_CTX, n.to_string()));
+                }
+                pairs.push((Self::ENV_NGL, ngl.to_string()));
+                pairs.push((Self::ENV_BIND, bind));
                 vec![ChildSpec {
                     exe: def.exe.clone(),
                     args: Vec::new(),
-                    env: Self::env(&[
-                        (Self::ENV_ENGINE, Self::ENGINE_LLAMACPP.to_string()),
-                        (Self::ENV_MODEL, gguf),
-                        (Self::ENV_N_CTX, n_ctx.to_string()),
-                        (Self::ENV_NGL, ngl.to_string()),
-                        (Self::ENV_BIND, bind),
-                    ]),
+                    env: Self::env(&pairs),
                 }]
             }
             RuntimeKind::Http => {
@@ -184,6 +191,9 @@ impl SpawnPlan {
                     .internal_port
                     .ok_or_else(|| Self::missing(def, Self::MISSING_INTERNAL_PORT))?;
                 let ngl = def.n_gpu_layers.unwrap_or(Self::DEFAULT_NGL_SERVER);
+                // `-c 0` tells llama-server to use the model's trained context length; an explicit
+                // catalog value is passed through as-is.
+                let ctx_arg = def.n_ctx.unwrap_or(0).to_string();
                 // The proxy reports this as `model_name`; use the clean display name (the gguf file
                 // stem), never llama-server's absolute path.
                 let display_name = model
@@ -203,7 +213,7 @@ impl SpawnPlan {
                         Self::ARG_NGL,
                         &ngl.to_string(),
                         Self::ARG_CTX,
-                        &n_ctx.to_string(),
+                        &ctx_arg,
                         Self::ARG_PARALLEL,
                         Self::PARALLEL_SLOTS,
                     ]
@@ -1027,6 +1037,48 @@ mod tests {
                 assert!(spec.env.contains(&flag), "{runtime}: {:?}", spec.exe);
             }
         }
+    }
+
+    #[test]
+    fn in_process_n_ctx_omitted_when_unset_present_when_set() {
+        let dir = model_dir("nctx");
+        let cat = catalog(&dir);
+        let model = resolve_model(&cat, "gem").expect("gem.gguf resolves");
+
+        // Unset catalog n_ctx → no HARNESS_N_CTX env (engine defaults to the trained length).
+        let mut lla = def("llamacpp", RuntimeKind::Llamacpp, "llamacpp.exe");
+        let plan = SpawnPlan::build(&lla, &model, &cat).unwrap();
+        assert!(!plan.children[0]
+            .env
+            .iter()
+            .any(|(k, _)| k == "HARNESS_N_CTX"));
+
+        // Explicit catalog n_ctx → HARNESS_N_CTX carries it verbatim.
+        lla.n_ctx = Some(2048);
+        let plan = SpawnPlan::build(&lla, &model, &cat).unwrap();
+        assert!(plan.children[0]
+            .env
+            .contains(&("HARNESS_N_CTX".to_string(), "2048".to_string())));
+    }
+
+    #[test]
+    fn http_server_ctx_arg_is_zero_when_unset() {
+        let dir = model_dir("httpctx");
+        let cat = catalog(&dir);
+        let model = resolve_model(&cat, "gem").expect("gem.gguf resolves");
+
+        let mut http = def("http", RuntimeKind::Http, "proxy.exe");
+        http.internal_port = Some(8080);
+        http.server_exe = Some(PathBuf::from("llama-server.exe"));
+
+        // Unset → llama-server gets `-c 0` (use the model's trained context length).
+        let plan = SpawnPlan::build(&http, &model, &cat).unwrap();
+        assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "0"]));
+
+        // Explicit → `-c <n>`.
+        http.n_ctx = Some(2048);
+        let plan = SpawnPlan::build(&http, &model, &cat).unwrap();
+        assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "2048"]));
     }
 
     #[tokio::test]

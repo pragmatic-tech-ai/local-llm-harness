@@ -5,9 +5,6 @@ use clap::ValueEnum;
 
 use super::{Engine, HttpEngine, ModelProps};
 
-/// Context size used for the in-process engine when the caller gives none.
-#[cfg(feature = "llamacpp")]
-const DEFAULT_N_CTX: u32 = 4096;
 /// GPU-layer count used for the in-process engine when the caller gives none (-1 = all layers).
 #[cfg(feature = "llamacpp")]
 const DEFAULT_N_GPU_LAYERS: i32 = -1;
@@ -178,9 +175,11 @@ pub async fn build_engine_with(
         #[cfg(feature = "llamacpp")]
         EngineKind::Llamacpp => {
             let model = cfg.model.clone().ok_or(EngineBuildError::MissingModel)?;
-            let n_ctx = cfg.n_ctx.unwrap_or(DEFAULT_N_CTX);
             let n_gpu_layers = cfg.n_gpu_layers.unwrap_or(DEFAULT_N_GPU_LAYERS);
-            let engine = super::llamacpp::LocalLlamaEngine::load(&model, None, n_ctx, n_gpu_layers)
+            // `None` here means "default to the model's trained context length" (resolved in
+            // `load` once the GGUF is open); an explicit value is honored, capped at that length.
+            let engine =
+                super::llamacpp::LocalLlamaEngine::load(&model, None, cfg.n_ctx, n_gpu_layers)
                 .map_err(|source| EngineBuildError::Load {
                     engine: "llamacpp",
                     source,

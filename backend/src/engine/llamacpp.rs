@@ -58,12 +58,16 @@ pub struct LocalLlamaEngine {
 
 impl LocalLlamaEngine {
     /// Initializes the llama.cpp backend, loads `model_path`, and keeps both alive for the engine's
-    /// lifetime. `n_ctx` is the context size reported by `props` and used for every generation
-    /// context; `n_gpu_layers < 0` keeps llama.cpp's "offload everything" default.
+    /// lifetime. `requested_n_ctx` is the caller's context-size request: `None` (or `Some(0)`)
+    /// defaults to the model's trained context length (`n_ctx_train`, the window its RoPE was
+    /// trained for), so each model gets its real maximum rather than a flat guess; an explicit
+    /// request is honored but capped at the trained length, since exceeding it only degrades
+    /// quality via RoPE extrapolation. The resolved size is reported by `props` and used for every
+    /// generation context; `n_gpu_layers < 0` keeps llama.cpp's "offload everything" default.
     pub fn load(
         model_path: &str,
         model_label: Option<&str>,
-        n_ctx: u32,
+        requested_n_ctx: Option<u32>,
         n_gpu_layers: i32,
     ) -> Result<Self> {
         let backend = Self::shared_backend()?;
@@ -78,6 +82,8 @@ impl LocalLlamaEngine {
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
             .map_err(|e| EngineError::Protocol(format!("model load failed: {e}")))?;
 
+        let n_ctx = Self::resolve_n_ctx(model.n_ctx_train(), requested_n_ctx);
+
         let model_name = model_label
             .map(str::to_owned)
             .unwrap_or_else(|| Self::file_stem(model_path));
@@ -88,6 +94,26 @@ impl LocalLlamaEngine {
             n_ctx,
             model_name,
         })
+    }
+
+    /// Resolves the context size from the model's trained length and the caller's request.
+    ///
+    /// `None` or `Some(0)` yields the trained length (floored at 1, so a model that reports 0 still
+    /// produces a usable context). An explicit request above the trained length is capped to it
+    /// with a stderr warning, since RoPE was only trained to that window; a request at or below it
+    /// is used verbatim.
+    fn resolve_n_ctx(trained_n_ctx: u32, requested_n_ctx: Option<u32>) -> u32 {
+        let trained = trained_n_ctx.max(1);
+        match requested_n_ctx {
+            None | Some(0) => trained,
+            Some(req) if req > trained => {
+                eprintln!(
+                    "requested n_ctx {req} exceeds the model's trained context length {trained}; using {trained}"
+                );
+                trained
+            }
+            Some(req) => req,
+        }
     }
 
     /// Returns the process-global `LlamaBackend`, initializing it on first use.
@@ -436,5 +462,27 @@ mod tests {
             "gemma-3-12b-it"
         );
         assert_eq!(LocalLlamaEngine::file_stem("bare"), "bare");
+    }
+
+    #[test]
+    fn resolve_n_ctx_defaults_to_trained_when_unset() {
+        assert_eq!(LocalLlamaEngine::resolve_n_ctx(8192, None), 8192);
+        assert_eq!(LocalLlamaEngine::resolve_n_ctx(8192, Some(0)), 8192);
+    }
+
+    #[test]
+    fn resolve_n_ctx_honors_request_within_trained() {
+        assert_eq!(LocalLlamaEngine::resolve_n_ctx(8192, Some(2048)), 2048);
+        assert_eq!(LocalLlamaEngine::resolve_n_ctx(8192, Some(8192)), 8192);
+    }
+
+    #[test]
+    fn resolve_n_ctx_caps_request_at_trained() {
+        assert_eq!(LocalLlamaEngine::resolve_n_ctx(4096, Some(99999)), 4096);
+    }
+
+    #[test]
+    fn resolve_n_ctx_floors_trained_at_one() {
+        assert_eq!(LocalLlamaEngine::resolve_n_ctx(0, None), 1);
     }
 }
