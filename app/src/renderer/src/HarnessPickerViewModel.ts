@@ -216,6 +216,12 @@ export class HarnessPickerViewModel extends Observable
         {
             return
         }
+        // A deliberate launch commits to a fresh harness, so drop ids ignored from a prior
+        // stop/supersede. Supervisor ids are deterministic (runtime:model), so restarting the
+        // same model reuses the id Stop added to the ignore set; without this, the new harness's
+        // Ready would be dropped and the picker would hang on "loading". Events from the stopped
+        // period are already suppressed by the `active` flag (set false on Stop, true just below).
+        this.ignoredIds.clear()
         const gen = ++this.generation
         if (this.currentId !== null)
         {

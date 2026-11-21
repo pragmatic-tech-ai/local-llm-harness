@@ -205,6 +205,28 @@ describe('HarnessPickerViewModel', () =>
         expect(rig.ready).toEqual(['ws://h1', 'ws://h2'])
     })
 
+    it('restart_same_model_after_stop_reaches_ready', async () =>
+    {
+        // The real supervisor uses deterministic ids (runtime:model), so a restart of the same
+        // model reuses the id that Stop added to the ignore set. The Ready must not be dropped.
+        const rig = new Rig()
+        await rig.Populate()
+        const sameId = 'llamacpp:gemma'
+        rig.picker.StartCommand.Execute()
+        rig.Reply(4, { id: sameId, runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://h1' })
+        await rig.Flush()
+        expect(rig.picker.State).toBe('ready')
+        rig.picker.StopCommand.Execute()
+        await rig.Flush()
+        expect(rig.picker.State).toBe('stopped')
+        rig.picker.StartCommand.Execute()
+        expect(rig.picker.State).toBe('loading')
+        rig.Reply(6, { id: sameId, runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://h2' })
+        await rig.Flush()
+        expect(rig.picker.State).toBe('ready')
+        expect(rig.ready).toEqual(['ws://h1', 'ws://h2'])
+    })
+
     it('late_event_from_replaced_harness_is_ignored', async () =>
     {
         const rig = new Rig()
