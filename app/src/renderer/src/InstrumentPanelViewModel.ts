@@ -2,6 +2,7 @@ import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@
 import { RuntimeClient, type IDisposable } from './RuntimeClient'
 import type { SamplingConfig } from './agents'
 import { LogprobVM } from './LogprobVM'
+import { TextFormat } from './TextFormat'
 
 /** Low-level state of the model: sampling knobs, raw prompt, context fill, logprobs, tokenization. */
 export class InstrumentPanelViewModel extends Observable
@@ -88,7 +89,7 @@ export class InstrumentPanelViewModel extends Observable
             }))
             this.subscriptions.push(client.OnTurnRejected.Subscribe(p =>
             {
-                this.SetWarning(InstrumentPanelViewModel.Format(InstrumentPanelViewModel.WarningFormat, p.needed, p.total))
+                this.SetWarning(TextFormat.Format(InstrumentPanelViewModel.WarningFormat, p.needed, p.total))
             }))
             this.RefreshModelProps()
         }
@@ -274,7 +275,7 @@ export class InstrumentPanelViewModel extends Observable
         // What the session runs with is unknown again: the next send re-applies both.
         this.appliedSampling = null
         this.appliedThinking = null
-        this.SetWarning(InstrumentPanelViewModel.Format(InstrumentPanelViewModel.SamplingFailedFormat, message))
+        this.SetWarning(TextFormat.Format(InstrumentPanelViewModel.SamplingFailedFormat, message))
     }
 
     /** Fill width in pixels for the bar (clamped to the track). */
@@ -286,7 +287,7 @@ export class InstrumentPanelViewModel extends Observable
     public get ContextLabel(): string
     {
         const pct = Math.round(this.ContextFraction * InstrumentPanelViewModel.PercentScale)
-        return InstrumentPanelViewModel.Format(InstrumentPanelViewModel.ContextFormat, this._contextUsed, this._contextTotal, pct)
+        return TextFormat.Format(InstrumentPanelViewModel.ContextFormat, this._contextUsed, this._contextTotal, pct)
     }
 
     /** Basename only: the backend reports a full path. */
@@ -335,11 +336,11 @@ export class InstrumentPanelViewModel extends Observable
             r =>
             {
                 const ids = r.tokens.join(InstrumentPanelViewModel.TokenSeparator)
-                this.SetTokenizeResult(InstrumentPanelViewModel.Format(InstrumentPanelViewModel.TokenizeFormat, r.count, ids))
+                this.SetTokenizeResult(TextFormat.Format(InstrumentPanelViewModel.TokenizeFormat, r.count, ids))
             },
-            (e: Error) =>
+            (e: unknown) =>
             {
-                this.SetTokenizeResult(InstrumentPanelViewModel.Format(InstrumentPanelViewModel.TokenizeFailedFormat, e.message))
+                this.SetTokenizeResult(TextFormat.Format(InstrumentPanelViewModel.TokenizeFailedFormat, TextFormat.Message(e)))
             })
     }
 
@@ -385,10 +386,5 @@ export class InstrumentPanelViewModel extends Observable
         }
         assign(value)
         this.RaisePropertyChanged(name, old, value)
-    }
-
-    private static Format(template: string, ...values: unknown[]): string
-    {
-        return template.replace(/\{(\d+)\}/g, (_m, i: string) => String(values[Number(i)]))
     }
 }

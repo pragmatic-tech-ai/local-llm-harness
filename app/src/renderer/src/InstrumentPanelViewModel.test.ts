@@ -248,6 +248,4 @@ describe('LogprobVM', () =>
         expect(rig.vm.Panel.ModelName).toBe('B.gguf')
         expect(rig.vm.Panel.ContextTotal).toBe(222)
     })
-
 })
-

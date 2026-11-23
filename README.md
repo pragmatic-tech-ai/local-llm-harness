@@ -20,7 +20,7 @@ talks to a llama.cpp `llama-server`, plus the Electron shell that spawns it:
 - WebSocket/JSON-RPC server: `model_props`, `tokenize`, `set_sampling`, `send_turn`
   (emits `turn_started{prompt,prompt_tokens,n_ctx}` → `turn_chunk*` →
   `turn_done`/`turn_error`, or `turn_rejected`); a thinking on/off toggle.
-- Electron `Sidecar` that spawns/stops the backend binary.
+- ~~Electron `Sidecar` that spawns/stops the backend binary~~: removed with the agent-templates slice; the app now reaches the agent runtime through the supervisor (`supervisor.url`).
 - 27 backend tests, clippy-clean; validated end-to-end against the real Gemma model
   (both thinking modes).
 

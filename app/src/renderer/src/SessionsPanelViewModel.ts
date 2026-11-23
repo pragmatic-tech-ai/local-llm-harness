@@ -3,20 +3,28 @@ import { TypedSignal, type IDisposable } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
 import type { SessionSummary } from './agents'
 import { SessionRowViewModel, type ISessionRowOwner } from './SessionRowViewModel'
+import { ConnectionState } from './ConnectionState'
+import { TextFormat } from './TextFormat'
 
 /**
  * The Sessions side panel: a New session button over the session list. Selecting a row raises OnOpen; the list
  * refreshes on `sessions_changed` (which also follows every committed turn), updating rows in place so the selection
  * is kept and nothing is re-opened. Row states follow `placement_changed` and `session_busy`. The dialogs behind
- * New / Rename / Delete belong to the owning service, which the panel only signals.
+ * New / Rename / Delete belong to the owning service, which the panel only signals. While the shown session runs a
+ * turn the owner locks switching: a click on another row snaps back with a notice (switching would abort the turn).
  */
 export class SessionsPanelViewModel extends Observable implements ISessionRowOwner
 {
     private static readonly PropSelectedSession = 'SelectedSession'
     private static readonly PropStatusText = 'StatusText'
     private static readonly PropIsEmpty = 'IsEmpty'
+    private static readonly PropEmptyText = 'EmptyText'
+    private static readonly PropShowsEmptyText = 'ShowsEmptyText'
     private static readonly RefreshFailedFormat = 'sessions unavailable: {0}'
-    private static readonly FormatToken = '{0}'
+    private static readonly SwitchLockedText = 'Finish the running turn before switching sessions.'
+    private static readonly NoSessionsText = 'No sessions yet.'
+    private static readonly ReconnectingText = 'Connecting to the runtime…'
+    private static readonly DisconnectedText = 'Not connected: set the supervisor URL in Settings.'
 
     public readonly Sessions = new ObservableCollection<SessionRowViewModel>()
     /** A row was chosen by the user: open that session. */
@@ -35,6 +43,9 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
     private readonly newSessionCommand: RelayCommand
     private _selected: SessionRowViewModel | null = null
     private _statusText = ''
+    private connection = ConnectionState.Disconnected
+    /** The shown session runs a turn: switching to another row is refused. */
+    private switchLocked = false
     private client: RuntimeClient | null = null
     private subscriptions: IDisposable[] = []
     /** Orders refreshes so a slow early reply cannot overwrite a newer one. */
@@ -82,15 +93,78 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
         return this._selected
     }
 
-    /** A user selection opens the session; clearing it (or re-selecting the same row) does nothing. */
+    /**
+     * A user selection opens the session. Clearing it, or a switch refused while a turn runs, keeps the current row
+     * and re-announces it so the list's two-way binding shows it again.
+     */
     public set SelectedSession(row: SessionRowViewModel | null)
     {
-        if (row === this._selected || row === null || row === undefined)
+        if (row === this._selected)
         {
+            return
+        }
+        if (row === null || row === undefined)
+        {
+            this.ReannounceSelection()
+            return
+        }
+        if (this.switchLocked && this._selected !== null)
+        {
+            this.SetStatus(SessionsPanelViewModel.SwitchLockedText)
+            this.ReannounceSelection()
             return
         }
         this.SetSelected(row)
         this.OnOpen.Raise(row.Id)
+    }
+
+    /** Locks (a turn runs in the shown session) or unlocks switching to another row. */
+    public SetSwitchLocked(locked: boolean): void
+    {
+        this.switchLocked = locked
+        if (!locked && this._statusText === SessionsPanelViewModel.SwitchLockedText)
+        {
+            this.SetStatus('')
+        }
+    }
+
+    /** Shows a failed action (rename, delete, ...) on the panel's status line. */
+    public ReportError(text: string): void
+    {
+        this.SetStatus(text)
+    }
+
+    /** The runtime connection as the owner reports it; anything but Connected replaces the empty-list hint. */
+    public SetConnection(state: ConnectionState): void
+    {
+        if (this.connection === state)
+        {
+            return
+        }
+        const oldText = this.EmptyText
+        const oldShows = this.ShowsEmptyText
+        this.connection = state
+        this.RaisePropertyChanged(SessionsPanelViewModel.PropEmptyText, oldText, this.EmptyText)
+        this.RaisePropertyChanged(SessionsPanelViewModel.PropShowsEmptyText, oldShows, this.ShowsEmptyText)
+    }
+
+    /** The hint shown above the list: the connection state, or that there are no sessions. */
+    public get EmptyText(): string
+    {
+        switch (this.connection)
+        {
+            case ConnectionState.Connected:
+                return SessionsPanelViewModel.NoSessionsText
+            case ConnectionState.Reconnecting:
+                return SessionsPanelViewModel.ReconnectingText
+            default:
+                return SessionsPanelViewModel.DisconnectedText
+        }
+    }
+
+    public get ShowsEmptyText(): boolean
+    {
+        return this.connection !== ConnectionState.Connected || this.IsEmpty
     }
 
     public get StatusText(): string
@@ -125,7 +199,7 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
         {
             if (token === this.refreshToken)
             {
-                this.SetStatus(SessionsPanelViewModel.RefreshFailedFormat.replace(SessionsPanelViewModel.FormatToken, (e as Error).message))
+                this.SetStatus(TextFormat.Format(SessionsPanelViewModel.RefreshFailedFormat, TextFormat.Message(e)))
             }
         }
     }
@@ -137,8 +211,9 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
         if (row === undefined)
         {
             row = new SessionRowViewModel(this, summary)
+            const wasEmpty = this.IsEmpty
             this.Sessions.Insert(0, row)
-            this.RaiseIsEmpty(true)
+            this.RaiseIsEmpty(wasEmpty)
         }
         else
         {
@@ -169,7 +244,10 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
         this.OnDeleteRequested.Raise(row)
     }
 
-    /** Makes the rows match the server list (its order), reusing row objects by id. */
+    /**
+     * Makes the rows match the server list (its order) in place: existing rows are updated and moved, new ones
+     * inserted, gone ones removed. No reset is raised, so the list keeps its containers and its selection.
+     */
     private Reconcile(sessions: readonly SessionSummary[]): void
     {
         const wasEmpty = this.IsEmpty
@@ -184,17 +262,22 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
             row.Update(summary)
             return row
         })
-        const same = rows.length === this.Sessions.Count && rows.every((r, i) => this.Sessions.Get(i) === r)
-        if (!same)
+        rows.forEach((row, index) =>
         {
-            this.Sessions.Batch(() =>
+            const at = this.Sessions.IndexOf(row)
+            if (at < 0)
             {
-                this.Sessions.Clear()
-                for (const row of rows)
-                {
-                    this.Sessions.Add(row)
-                }
-            })
+                this.Sessions.Insert(index, row)
+            }
+            else if (at !== index)
+            {
+                this.Sessions.Move(at, index)
+            }
+        })
+        // Every kept row now sits in front, so what remains at the tail is gone from the server.
+        while (this.Sessions.Count > rows.length)
+        {
+            this.Sessions.RemoveAt(this.Sessions.Count - 1)
         }
         this.RaiseIsEmpty(wasEmpty)
         const selected = this._selected
@@ -225,6 +308,15 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
         this.RaisePropertyChanged(SessionsPanelViewModel.PropSelectedSession, old, row)
     }
 
+    /** Re-raises the selection after the current binding write, so a two-way list shows the kept row again. */
+    private ReannounceSelection(): void
+    {
+        void Promise.resolve().then(() =>
+        {
+            this.RaisePropertyChanged(SessionsPanelViewModel.PropSelectedSession, undefined, this._selected)
+        })
+    }
+
     private SetStatus(text: string): void
     {
         const old = this._statusText
@@ -240,6 +332,7 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
         if (wasEmpty !== this.IsEmpty)
         {
             this.RaisePropertyChanged(SessionsPanelViewModel.PropIsEmpty, wasEmpty, this.IsEmpty)
+            this.RaisePropertyChanged(SessionsPanelViewModel.PropShowsEmptyText, undefined, this.ShowsEmptyText)
         }
     }
 }

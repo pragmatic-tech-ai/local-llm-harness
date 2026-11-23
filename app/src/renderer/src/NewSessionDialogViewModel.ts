@@ -3,6 +3,7 @@ import { TypedSignal } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
 import type { AgentTemplate, SessionSummary } from './agents'
 import { TemplateTreeNodeViewModel } from './TemplateTreeNodeViewModel'
+import { TextFormat } from './TextFormat'
 
 /**
  * Body of the New session dialog: the template tree and a short summary of the selected template (model, tools,
@@ -22,7 +23,6 @@ export class NewSessionDialogViewModel extends Observable
     private static readonly ListFailedFormat = 'templates unavailable: {0}'
     private static readonly ReadFailedFormat = 'template unavailable: {0}'
     private static readonly CreateFailedFormat = 'could not create the session: {0}'
-    private static readonly FormatToken = /\{(\d+)\}/g
 
     public readonly Roots = new ObservableCollection<TemplateTreeNodeViewModel>()
     public readonly OnCreated = new TypedSignal<SessionSummary>()
@@ -100,7 +100,7 @@ export class NewSessionDialogViewModel extends Observable
         }
         catch (e)
         {
-            this.SetStatus(NewSessionDialogViewModel.Format(NewSessionDialogViewModel.ListFailedFormat, NewSessionDialogViewModel.Message(e)))
+            this.SetStatus(TextFormat.Format(NewSessionDialogViewModel.ListFailedFormat, TextFormat.Message(e)))
         }
     }
 
@@ -108,7 +108,7 @@ export class NewSessionDialogViewModel extends Observable
     public static Describe(template: AgentTemplate): string
     {
         const tools = template.tools.length > 0 ? template.tools.join(NewSessionDialogViewModel.ToolsSeparator) : NewSessionDialogViewModel.NoTools
-        return NewSessionDialogViewModel.Format(NewSessionDialogViewModel.SummaryFormat,
+        return TextFormat.Format(NewSessionDialogViewModel.SummaryFormat,
             template.model, template.runtime, template.n_ctx, tools, template.step_budget)
     }
 
@@ -123,7 +123,7 @@ export class NewSessionDialogViewModel extends Observable
         }
         if (node.Error !== null)
         {
-            this.SetSummary(NewSessionDialogViewModel.Format(NewSessionDialogViewModel.BrokenFormat, node.Error))
+            this.SetSummary(TextFormat.Format(NewSessionDialogViewModel.BrokenFormat, node.Error))
             return
         }
         this.SetSummary(NewSessionDialogViewModel.LoadingText)
@@ -139,7 +139,7 @@ export class NewSessionDialogViewModel extends Observable
         {
             if (token === this.readToken)
             {
-                this.SetSummary(NewSessionDialogViewModel.Format(NewSessionDialogViewModel.ReadFailedFormat, NewSessionDialogViewModel.Message(e)))
+                this.SetSummary(TextFormat.Format(NewSessionDialogViewModel.ReadFailedFormat, TextFormat.Message(e)))
             }
         }
     }
@@ -160,7 +160,7 @@ export class NewSessionDialogViewModel extends Observable
         }
         catch (e)
         {
-            this.SetStatus(NewSessionDialogViewModel.Format(NewSessionDialogViewModel.CreateFailedFormat, NewSessionDialogViewModel.Message(e)))
+            this.SetStatus(TextFormat.Format(NewSessionDialogViewModel.CreateFailedFormat, TextFormat.Message(e)))
         }
         finally
         {
@@ -192,15 +192,5 @@ export class NewSessionDialogViewModel extends Observable
             this._statusText = text
             this.RaisePropertyChanged(NewSessionDialogViewModel.PropStatusText, old, text)
         }
-    }
-
-    private static Message(e: unknown): string
-    {
-        return e instanceof Error ? e.message : String(e)
-    }
-
-    private static Format(template: string, ...values: unknown[]): string
-    {
-        return template.replace(NewSessionDialogViewModel.FormatToken, (_m, i: string) => String(values[Number(i)]))
     }
 }

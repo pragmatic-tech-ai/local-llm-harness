@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { RuntimeClient } from './RuntimeClient'
 import { FakeSocket } from './FakeSocket'
 import { SessionViewModel } from './SessionViewModel'
-import type { AttachedSession, Placement } from './agents'
+import { PlacementState, type AttachedSession, type Placement } from './agents'
 
 class Rig
 {
@@ -64,13 +64,13 @@ describe('SessionViewModel', () =>
     it('load_button_label_names_eviction', async () =>
     {
         const rig = new Rig()
-        await rig.Show({ state: 'needs_load', host: 'local', evicts: 'gemma-4-12B-it-QAT-Q4_0' })
+        await rig.Show({ state: PlacementState.NeedsLoad, host: 'local', evicts: 'gemma-4-12B-it-QAT-Q4_0' })
         expect(rig.view.CanLoad).toBe(true)
         expect(rig.view.LoadLabel).toBe('Load model (evicts gemma-4-12B-it-QAT-Q4_0)')
         expect(rig.view.PlacementText).toBe('model not loaded')
 
         const free = new Rig()
-        await free.Show({ state: 'needs_load', host: 'local', evicts: null })
+        await free.Show({ state: PlacementState.NeedsLoad, host: 'local', evicts: null })
         expect(free.view.LoadLabel).toBe('Load model')
     })
 
@@ -79,7 +79,7 @@ describe('SessionViewModel', () =>
         const rig = new Rig()
         expect(rig.view.HasSession).toBe(false)
         expect(rig.view.IsEmpty).toBe(true)
-        await rig.Show({ state: 'ready', host: 'local' })
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
         expect(rig.view.HasSession).toBe(true)
         expect(rig.view.HeaderText).toBe('Researcher · gemma-3-4b @ local')
         expect(rig.view.PlacementText).toBe('live on local')
@@ -92,7 +92,7 @@ describe('SessionViewModel', () =>
     it('unavailable_shows_the_reason', async () =>
     {
         const rig = new Rig()
-        await rig.Show({ state: 'unavailable', reason: 'no host serves gemma-9' })
+        await rig.Show({ state: PlacementState.Unavailable, reason: 'no host serves gemma-9' })
         expect(rig.view.PlacementText).toBe('unavailable: no host serves gemma-9')
         expect(rig.view.HeaderText).toBe('Researcher · gemma-3-4b')
         expect(rig.view.CanLoad).toBe(false)
@@ -101,13 +101,13 @@ describe('SessionViewModel', () =>
     it('load_command_loads_and_shows_ready', async () =>
     {
         const rig = new Rig()
-        await rig.Show({ state: 'needs_load', host: 'local', evicts: 'gemma-4' })
+        await rig.Show({ state: PlacementState.NeedsLoad, host: 'local', evicts: 'gemma-4' })
         rig.view.LoadCommand.Execute(undefined)
         expect(rig.Frame('load_session_model')?.params).toEqual({ id: 's1' })
         expect(rig.view.PlacementText).toBe('loading model…')
         expect(rig.view.CanLoad).toBe(false)
         const propsBefore = rig.socket.sent.filter(f => JSON.parse(f).method === 'model_props').length
-        await rig.Respond('load_session_model', { state: 'ready', host: 'local' })
+        await rig.Respond('load_session_model', { state: PlacementState.Ready, host: 'local' })
         expect(rig.view.PlacementText).toBe('live on local')
         expect(rig.socket.sent.filter(f => JSON.parse(f).method === 'model_props').length).toBe(propsBefore + 1)
     })
@@ -115,7 +115,7 @@ describe('SessionViewModel', () =>
     it('load_failure_is_shown', async () =>
     {
         const rig = new Rig()
-        await rig.Show({ state: 'needs_load', host: 'local', evicts: null })
+        await rig.Show({ state: PlacementState.NeedsLoad, host: 'local', evicts: null })
         rig.view.LoadCommand.Execute(undefined)
         rig.client.HandleFrame(JSON.stringify({ id: rig.IdOf('load_session_model'), error: { code: -32603, message: 'out of memory' } }))
         await new Promise(r => setTimeout(r, 0))
@@ -126,12 +126,12 @@ describe('SessionViewModel', () =>
     it('unload_command_and_placement_changed', async () =>
     {
         const rig = new Rig()
-        await rig.Show({ state: 'ready', host: 'local' })
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
         rig.view.UnloadCommand.Execute(undefined)
         expect(rig.Frame('unload_session_model')?.params).toEqual({ id: 's1' })
-        rig.Notify('placement_changed', { id: 's1', placement: { state: 'needs_load', host: 'local', evicts: null } })
+        rig.Notify('placement_changed', { id: 's1', placement: { state: PlacementState.NeedsLoad, host: 'local', evicts: null } })
         expect(rig.view.CanLoad).toBe(true)
-        rig.Notify('placement_changed', { id: 'other', placement: { state: 'ready', host: 'local' } })
+        rig.Notify('placement_changed', { id: 'other', placement: { state: PlacementState.Ready, host: 'local' } })
         expect(rig.view.CanLoad).toBe(true)
     })
 
@@ -139,7 +139,7 @@ describe('SessionViewModel', () =>
     {
         const rig = new Rig()
         const done = rig.view.Attach('s1')
-        const attached = Rig.Attached({ state: 'ready', host: 'local' })
+        const attached = Rig.Attached({ state: PlacementState.Ready, host: 'local' })
         await rig.Respond('attach_session', { ...attached, sampling: { ...attached.sampling, temperature: 0.3 }, enable_thinking: true })
         await done
         expect(rig.view.Panel.Temperature).toBe(0.3)
@@ -152,7 +152,7 @@ describe('SessionViewModel', () =>
         const first = rig.view.Attach('s1')
         const firstId = rig.IdOf('attach_session')
         const second = rig.view.Attach('s2')
-        const attached = Rig.Attached({ state: 'ready', host: 'local' })
+        const attached = Rig.Attached({ state: PlacementState.Ready, host: 'local' })
         rig.client.HandleFrame(JSON.stringify({ id: firstId, result: attached }))
         await first
         expect(rig.view.HasSession).toBe(false)
@@ -161,4 +161,33 @@ describe('SessionViewModel', () =>
         expect(rig.view.ShownId).toBe('s2')
         expect(rig.view.HeaderText).toBe('Second · gemma-3-4b @ local')
     })
+
+    it('first_message_load_disables_load_until_the_turn_starts', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.NeedsLoad, host: 'local', evicts: null })
+        expect(rig.view.CanLoad).toBe(true)
+        rig.Notify('session_loading', { id: 's1' })
+        expect(rig.view.CanLoad).toBe(false)
+        expect(rig.view.PlacementText).toBe('loading model…')
+        rig.Notify('turn_started', { prompt: 'p', prompt_tokens: 1, n_ctx: 8 })
+        expect(rig.view.PlacementText).toBe('model not loaded')
+        rig.Notify('session_loading', { id: 's1' })
+        rig.Notify('loop_done', { steps: 0, reason: 'no_harness' })
+        expect(rig.view.CanLoad).toBe(true)
+        rig.Notify('session_loading', { id: 'other' })
+        expect(rig.view.CanLoad).toBe(true)
+    })
+
+    it('stale_marks_placement_and_disables_load', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.NeedsLoad, host: 'local', evicts: null })
+        rig.view.SetStale(true)
+        expect(rig.view.PlacementText).toBe('model not loaded (stale: not connected)')
+        expect(rig.view.CanLoad).toBe(false)
+        rig.view.SetStale(false)
+        expect(rig.view.CanLoad).toBe(true)
+    })
 })
+

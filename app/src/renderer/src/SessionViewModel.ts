@@ -1,9 +1,11 @@
 import { Observable, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import type { IDisposable } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
-import type { AgentTemplate, AttachedSession, Placement } from './agents'
+import { PlacementState, type AgentTemplate, type AttachedSession, type Placement } from './agents'
+import { PlacementText } from './PlacementText'
 import { ChatViewModel } from './ChatViewModel'
 import type { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
+import { TextFormat } from './TextFormat'
 
 /**
  * The host-area view of the shown session: a header (template · model @ host, placement, Load / Unload, tools) over
@@ -12,14 +14,11 @@ import type { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
  */
 export class SessionViewModel extends Observable
 {
-    private static readonly PlacementReady = 'ready'
-    private static readonly PlacementNeedsLoad = 'needs_load'
     private static readonly HeaderFormat = '{0} · {1} @ {2}'
     private static readonly HeaderNoHostFormat = '{0} · {1}'
     private static readonly LiveFormat = 'live on {0}'
     private static readonly NeedsLoadText = 'model not loaded'
-    private static readonly UnavailableFormat = 'unavailable: {0}'
-    private static readonly UnavailableText = 'unavailable'
+    private static readonly StaleFormat = '{0} (stale: not connected)'
     private static readonly LoadingText = 'loading model…'
     private static readonly AttachingText = 'opening session…'
     private static readonly AttachFailedFormat = 'could not open session: {0}'
@@ -31,8 +30,7 @@ export class SessionViewModel extends Observable
     private static readonly ToolsPrefix = 'tools: '
     private static readonly ToolsSeparator = ', '
     private static readonly EmptyText = 'Select a session, or start a new one.'
-    private static readonly FormatToken = /\{(\d+)\}/g
-    private static readonly Props = ['HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText']
+    private static readonly Props = ['HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
 
     public readonly Chat = new ChatViewModel()
 
@@ -45,7 +43,12 @@ export class SessionViewModel extends Observable
     private placement: Placement | null = null
     /** A transient line (attaching, loading, an error) shown in place of the placement text. */
     private status = ''
+    /** A Load command is in flight. */
     private loading = false
+    /** The runtime is loading the model for a first message (session_loading until turn_started / loop_done). */
+    private turnLoading = false
+    /** The connection is down: the placement shown is the last one known. */
+    private stale = false
     /** Orders attaches: a late reply for an earlier selection is dropped. */
     private attachToken = 0
 
@@ -63,6 +66,15 @@ export class SessionViewModel extends Observable
                     this.ApplyPlacement(p.placement)
                 }
             }),
+            client.OnSessionLoading.Subscribe(p =>
+            {
+                if (p.id === this.shownId)
+                {
+                    this.Update(() => { this.turnLoading = true })
+                }
+            }),
+            client.OnTurnStarted.Subscribe(() => this.EndTurnLoading()),
+            client.OnLoopDone.Subscribe(() => this.EndTurnLoading()),
         ]
     }
 
@@ -102,8 +114,8 @@ export class SessionViewModel extends Observable
         }
         const host = this.placement?.host ?? snapshot.host
         return host
-            ? SessionViewModel.Format(SessionViewModel.HeaderFormat, snapshot.name, snapshot.model, host)
-            : SessionViewModel.Format(SessionViewModel.HeaderNoHostFormat, snapshot.name, snapshot.model)
+            ? TextFormat.Format(SessionViewModel.HeaderFormat, snapshot.name, snapshot.model, host)
+            : TextFormat.Format(SessionViewModel.HeaderNoHostFormat, snapshot.name, snapshot.model)
     }
 
     public get PlacementText(): string
@@ -112,36 +124,48 @@ export class SessionViewModel extends Observable
         {
             return this.status
         }
+        if (this.turnLoading)
+        {
+            return SessionViewModel.LoadingText
+        }
         const placement = this.placement
         if (placement === null)
         {
             return ''
         }
-        switch (placement.state)
-        {
-            case SessionViewModel.PlacementReady:
-                return SessionViewModel.Format(SessionViewModel.LiveFormat, placement.host ?? '')
-            case SessionViewModel.PlacementNeedsLoad:
-                return SessionViewModel.NeedsLoadText
-            default:
-                return placement.reason ? SessionViewModel.Format(SessionViewModel.UnavailableFormat, placement.reason) : SessionViewModel.UnavailableText
-        }
+        const text = SessionViewModel.Describe(placement)
+        return this.stale ? TextFormat.Format(SessionViewModel.StaleFormat, text) : text
     }
 
     public get CanLoad(): boolean
     {
-        return !this.loading && this.placement?.state === SessionViewModel.PlacementNeedsLoad
+        return !this.loading && !this.turnLoading && !this.stale && PlacementText.NeedsLoad(this.placement)
     }
 
     public get CanUnload(): boolean
     {
-        return !this.loading && this.placement?.state === SessionViewModel.PlacementReady
+        return !this.loading && !this.turnLoading && !this.stale && PlacementText.IsReady(this.placement)
+    }
+
+    /** True while the shown placement is the last one known from a dropped connection. */
+    public get IsStale(): boolean
+    {
+        return this.stale
+    }
+
+    /** The service reports the connection: while it is down the placement is marked stale and Load / Unload are off. */
+    public SetStale(stale: boolean): void
+    {
+        if (this.stale !== stale)
+        {
+            this.Update(() => { this.stale = stale })
+        }
     }
 
     public get LoadLabel(): string
     {
         const evicts = this.placement?.evicts
-        return evicts ? SessionViewModel.Format(SessionViewModel.LoadEvictsFormat, evicts) : SessionViewModel.LoadLabelText
+        return evicts ? TextFormat.Format(SessionViewModel.LoadEvictsFormat, evicts) : SessionViewModel.LoadLabelText
     }
 
     /** The tools indicator: the session's own tool subset (from its snapshot), or 'tools: off'. */
@@ -181,7 +205,7 @@ export class SessionViewModel extends Observable
         {
             if (token === this.attachToken)
             {
-                this.Update(() => { this.status = SessionViewModel.Format(SessionViewModel.AttachFailedFormat, SessionViewModel.Message(e)) })
+                this.Update(() => { this.status = TextFormat.Format(SessionViewModel.AttachFailedFormat, TextFormat.Message(e)) })
             }
             return
         }
@@ -233,6 +257,7 @@ export class SessionViewModel extends Observable
             this.placement = null
             this.status = ''
             this.loading = false
+            this.turnLoading = false
         })
     }
 
@@ -268,7 +293,7 @@ export class SessionViewModel extends Observable
                 this.Update(() =>
                 {
                     this.loading = false
-                    this.status = SessionViewModel.Format(SessionViewModel.LoadFailedFormat, SessionViewModel.Message(e))
+                    this.status = TextFormat.Format(SessionViewModel.LoadFailedFormat, TextFormat.Message(e))
                 })
             }
         }
@@ -290,19 +315,40 @@ export class SessionViewModel extends Observable
         {
             if (id === this.shownId)
             {
-                this.Update(() => { this.status = SessionViewModel.Format(SessionViewModel.UnloadFailedFormat, SessionViewModel.Message(e)) })
+                this.Update(() => { this.status = TextFormat.Format(SessionViewModel.UnloadFailedFormat, TextFormat.Message(e)) })
             }
         }
     }
 
     private ApplyPlacement(placement: Placement): void
     {
-        const wasReady = this.placement?.state === SessionViewModel.PlacementReady
+        const wasReady = PlacementText.IsReady(this.placement)
         this.Update(() => { this.placement = placement })
-        if (!wasReady && placement.state === SessionViewModel.PlacementReady && this.snapshot !== null)
+        if (!wasReady && PlacementText.IsReady(placement) && this.snapshot !== null)
         {
             // The model is up now: show its name and window size.
             this.Panel.RefreshModelProps()
+        }
+    }
+
+    private EndTurnLoading(): void
+    {
+        if (this.turnLoading)
+        {
+            this.Update(() => { this.turnLoading = false })
+        }
+    }
+
+    private static Describe(placement: Placement): string
+    {
+        switch (placement.state)
+        {
+            case PlacementState.Ready:
+                return TextFormat.Format(SessionViewModel.LiveFormat, placement.host ?? '')
+            case PlacementState.NeedsLoad:
+                return SessionViewModel.NeedsLoadText
+            default:
+                return PlacementText.Unavailable(placement)
         }
     }
 
@@ -316,15 +362,5 @@ export class SessionViewModel extends Observable
         }
         this.loadCommand.RaiseCanExecuteChanged()
         this.unloadCommand.RaiseCanExecuteChanged()
-    }
-
-    private static Message(e: unknown): string
-    {
-        return e instanceof Error ? e.message : String(e)
-    }
-
-    private static Format(template: string, ...values: unknown[]): string
-    {
-        return template.replace(SessionViewModel.FormatToken, (_m, i: string) => String(values[Number(i)]))
     }
 }

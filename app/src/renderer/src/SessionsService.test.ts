@@ -8,7 +8,8 @@ import { RuntimeClient } from './RuntimeClient'
 import { SupervisorClient } from './SupervisorClient'
 import { FakeSocket } from './FakeSocket'
 import { NewSessionDialogViewModel } from './NewSessionDialogViewModel'
-import type { AttachedSession, Placement, SessionSummary } from './agents'
+import { PlacementState, type AttachedSession, type Placement, type SessionSummary } from './agents'
+import { ConnectionState } from './ConnectionState'
 import type { AssistantMessage, ToolCallMessage, UserMessage } from './messages'
 
 class FakeSettings
@@ -112,6 +113,26 @@ class StubProvider
     }
 }
 
+/** A supervisor socket that is open at once and answers every request (list_harnesses) with no harnesses, unless silent. */
+class SupervisorSocket extends FakeSocket
+{
+    constructor(private readonly silent: boolean)
+    {
+        super()
+        this.readyState = 1
+    }
+
+    public override send(data: string): void
+    {
+        super.send(data)
+        if (!this.silent)
+        {
+            const request = JSON.parse(data) as { id: number }
+            this.onmessage?.({ data: JSON.stringify({ id: request.id, result: [] }) })
+        }
+    }
+}
+
 class Rig
 {
     public readonly host = new FakeContentHost()
@@ -121,6 +142,8 @@ class Rig
     public readonly urls: string[] = []
     public readonly supervisorSockets: FakeSocket[] = []
     public readonly service: SessionsService
+    /** When set, the supervisor never answers (discovery must time out). */
+    public SupervisorSilent = false
 
     constructor(url: string = 'ws://hive:8778')
     {
@@ -136,7 +159,7 @@ class Rig
             }),
             () => new SupervisorClient(() =>
             {
-                const socket = new FakeSocket()
+                const socket = new SupervisorSocket(this.SupervisorSilent)
                 this.supervisorSockets.push(socket)
                 return socket
             }))
@@ -147,7 +170,10 @@ class Rig
         return this.sockets[this.sockets.length - 1]
     }
 
-    public static Summary(id: string, placement: Placement = { state: 'ready', host: 'local' }): SessionSummary
+    public static readonly Ready: Placement = { state: PlacementState.Ready, host: 'local' }
+    public static readonly NeedsLoad: Placement = { state: PlacementState.NeedsLoad, host: 'local', evicts: null }
+
+    public static Summary(id: string, placement: Placement = Rig.Ready): SessionSummary
     {
         return { id, title: `Default #${id}`, template_id: 'tpl', template_name: 'Default', runtime: 'llamacpp', model: 'gemma', updated: 1, placement, busy: false }
     }
@@ -173,22 +199,11 @@ class Rig
         }
     }
 
-    /** Lets the supervisor answer list_harnesses (no chat_url), then opens the runtime socket. */
+    /** Lets discovery (the answering supervisor) finish, then opens the runtime socket. */
     public async Connect(): Promise<void>
     {
-        const supervisor = this.supervisorSockets[this.supervisorSockets.length - 1]
-        supervisor.Open()
-        const request = JSON.parse(supervisor.sent[0]) as { id: number }
-        this.Supervisor().HandleFrame(JSON.stringify({ id: request.id, result: [] }))
         await Rig.Flush()
         this.Socket.Open()
-    }
-
-    public Supervisor(): SupervisorClient
-    {
-        // The service disconnects the supervisor after discovery; answer through the socket handler it installed.
-        const socket = this.supervisorSockets[this.supervisorSockets.length - 1]
-        return { HandleFrame: (raw: string) => socket.onmessage?.({ data: raw }) } as unknown as SupervisorClient
     }
 
     public Frames(socket: FakeSocket = this.Socket): { id: number, method: string, params: unknown }[]
@@ -298,7 +313,7 @@ describe('SessionsService', () =>
         expect(body.CreateCommand.CanExecute(undefined)).toBe(true)
         body.CreateCommand.Execute(undefined)
         expect(rig.Frames().find(f => f.method === 'create_session')?.params).toEqual({ template_id: 't1' })
-        await rig.Respond('create_session', Rig.Summary('new', { state: 'needs_load', host: 'local', evicts: null }))
+        await rig.Respond('create_session', Rig.Summary('new', Rig.NeedsLoad))
         expect(rig.dialogs.closed).toHaveLength(1)
         expect(rig.Frames().filter(f => f.method === 'attach_session').pop()?.params).toEqual({ id: 'new' })
         expect(rig.service.Panel.SelectedSession?.Id).toBe('new')
@@ -394,4 +409,102 @@ describe('SessionsService', () =>
         await rig.Connect()
         expect(rig.urls).toEqual(['ws://hive:8779', 'ws://other:8779'])
     })
+
+    it('reorder_after_sessions_changed_keeps_selection_without_reattach', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s2', [Rig.Summary('s1'), Rig.Summary('s2'), Rig.Summary('s3')])
+        const selected = rig.service.Panel.SelectedSession
+        const kinds: string[] = []
+        rig.service.Panel.Sessions.Subscribe(change => kinds.push(change.kind))
+        // A committed turn in s2 moves it to the top (newest first).
+        rig.Notify('sessions_changed', {})
+        await rig.Respond('list_sessions', [Rig.Summary('s2'), Rig.Summary('s1'), Rig.Summary('s3')])
+        expect(rig.service.Panel.Sessions.ToArray().map(r => r.Id)).toEqual(['s2', 's1', 's3'])
+        expect(kinds).toEqual(['moved'])
+        expect(rig.service.Panel.SelectedSession).toBe(selected)
+        expect(rig.Methods().filter(m => m === 'attach_session')).toHaveLength(1)
+    })
+
+    it('switch_is_refused_while_the_shown_session_runs_a_turn', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1'), Rig.Summary('s2')])
+        const panel = rig.service.Panel
+        const shown = panel.SelectedSession
+        rig.service.View.Chat.Draft = 'long job'
+        rig.service.View.Chat.SendCommand.Execute(undefined)
+        expect(rig.service.View.Chat.IsBusy).toBe(true)
+        panel.SelectedSession = panel.Find('s2')!
+        await Rig.Flush()
+        expect(panel.SelectedSession).toBe(shown)
+        expect(panel.StatusText).toBe('Finish the running turn before switching sessions.')
+        expect(rig.Methods().filter(m => m === 'attach_session')).toHaveLength(1)
+        // The turn settles: the notice goes and switching works again.
+        rig.Notify('loop_done', { steps: 1, reason: 'answered' })
+        await rig.Respond('send_turn', null)
+        expect(panel.StatusText).toBe('')
+        panel.SelectedSession = panel.Find('s2')!
+        expect(rig.Frames().filter(f => f.method === 'attach_session').pop()?.params).toEqual({ id: 's2' })
+    })
+
+    it('rename_and_delete_failures_show_on_the_panel', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1')])
+        rig.service.Panel.RenameCommand.Execute(undefined)
+        await Rig.Flush()
+        rig.dialogs.Close('New title')
+        await Rig.Flush()
+        const rename = rig.Frames().find(f => f.method === 'rename_session')!
+        rig.service.Client.HandleFrame(JSON.stringify({ id: rename.id, error: { code: -32603, message: 'unknown session: s1' } }))
+        await Rig.Flush()
+        expect(rig.service.Panel.StatusText).toBe('rename failed: unknown session: s1')
+        rig.service.Panel.DeleteCommand.Execute(undefined)
+        await Rig.Flush()
+        rig.Socket.Close()
+        await Rig.Flush()
+        expect(rig.service.Panel.StatusText).toBe('delete failed: Harness not connected')
+    })
+
+    it('connection_state_shows_on_panel_and_marks_placement_stale', async () =>
+    {
+        vi.useFakeTimers()
+        const rig = new Rig()
+        expect(rig.service.Connection).toBe(ConnectionState.Reconnecting)
+        expect(rig.service.Panel.EmptyText).toBe('Connecting to the runtime…')
+        await rig.ShowSession('s1', [Rig.Summary('s1')])
+        expect(rig.service.Connection).toBe(ConnectionState.Connected)
+        expect(rig.service.Panel.ShowsEmptyText).toBe(false)
+        expect(rig.service.View.PlacementText).toBe('live on local')
+        expect(rig.service.View.CanUnload).toBe(true)
+        rig.Socket.Close()
+        expect(rig.service.Connection).toBe(ConnectionState.Reconnecting)
+        expect(rig.service.Panel.ShowsEmptyText).toBe(true)
+        expect(rig.service.View.PlacementText).toBe('live on local (stale: not connected)')
+        expect(rig.service.View.CanUnload).toBe(false)
+        rig.settings.Change('')
+        expect(rig.service.Connection).toBe(ConnectionState.Disconnected)
+        expect(rig.service.Panel.EmptyText).toBe('Not connected: set the supervisor URL in Settings.')
+    })
+
+    it('silent_supervisor_times_out_to_the_default_port_and_retries_discover_again', async () =>
+    {
+        vi.useFakeTimers()
+        const rig = new Rig('')
+        rig.SupervisorSilent = true
+        rig.settings.Change('ws://hive:8778')
+        await vi.advanceTimersByTimeAsync(2999)
+        expect(rig.urls).toEqual([])
+        await vi.advanceTimersByTimeAsync(1)
+        expect(rig.urls).toEqual(['ws://hive:8779'])
+        expect(rig.supervisorSockets[0].closeCalls).toBe(1)
+        // The runtime is down too: the retry after 1 s asks the supervisor again.
+        rig.Socket.Close()
+        await vi.advanceTimersByTimeAsync(1000)
+        expect(rig.supervisorSockets).toHaveLength(2)
+        await vi.advanceTimersByTimeAsync(3000)
+        expect(rig.urls).toEqual(['ws://hive:8779', 'ws://hive:8779'])
+    })
 })
+

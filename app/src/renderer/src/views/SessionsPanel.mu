@@ -35,8 +35,8 @@ resources SessionsPanelResources {
                 TextBlock [ Text = "New session", HorizontalAlignment = Center ]
             }
             TextBlock [ DockPanel.Dock = Top, Text = $StatusText, Style = @BodySm, Foreground = @Fg2, TextWrapping = Wrap ]
-            TextBlock [ DockPanel.Dock = Top, Text = "No sessions yet.", Style = @BodySm, Foreground = @Fg2,
-                        Visibility = $IsEmpty << ToVisibility ]
+            TextBlock [ DockPanel.Dock = Top, Text = $EmptyText, Style = @BodySm, Foreground = @Fg2, TextWrapping = Wrap,
+                        Visibility = $ShowsEmptyText << ToVisibility ]
             ListBox [ ItemsSource = $Sessions, ItemTemplate = @SessionRow, SelectedItem = $SelectedSession ]
         }
     }

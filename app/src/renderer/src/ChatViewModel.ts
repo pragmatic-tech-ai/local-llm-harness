@@ -3,6 +3,8 @@ import { RuntimeClient, type IDisposable, type ToolCallNote } from './RuntimeCli
 import type { ChatMessage } from './agents'
 import { AssistantMessage, ToolCallMessage, ToolResultMessage, UserMessage } from './messages'
 import { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
+import { TypedSignal } from './JsonRpcConnection'
+import { TextFormat } from './TextFormat'
 
 export type TranscriptItem = UserMessage | AssistantMessage | ToolCallMessage | ToolResultMessage
 
@@ -29,6 +31,8 @@ export class ChatViewModel extends Observable
 
     public readonly Transcript = new ObservableCollection<TranscriptItem>()
     public readonly Panel: InstrumentPanelViewModel
+    /** Raised when a turn starts (true) or settles / is abandoned (false). */
+    public readonly OnBusyChanged = new TypedSignal<boolean>()
 
     private _draft = ''
     /** The live assistant message; null between model passes of one tool loop. */
@@ -87,8 +91,8 @@ export class ChatViewModel extends Observable
                 client.OnTurnStarted.Subscribe(() => this.OnPassStarted()),
                 client.OnTurnChunk.Subscribe(p => this.OnChunk(p.text)),
                 client.OnTurnDone.Subscribe(() => { this.segment = null }),
-                client.OnTurnError.Subscribe(p => this.ReportFailure(ChatViewModel.Format(ChatViewModel.ErrorFormat, p.message))),
-                client.OnTurnRejected.Subscribe(p => this.ReportFailure(ChatViewModel.Format(ChatViewModel.RejectedFormat, p.needed, p.total))),
+                client.OnTurnError.Subscribe(p => this.ReportFailure(TextFormat.Format(ChatViewModel.ErrorFormat, p.message))),
+                client.OnTurnRejected.Subscribe(p => this.ReportFailure(TextFormat.Format(ChatViewModel.RejectedFormat, p.needed, p.total))),
                 client.OnToolCall.Subscribe(p => this.OnToolCall(p)),
                 client.OnToolResult.Subscribe(p => this.Transcript.Add(new ToolResultMessage(p.name, p.ok, ChatViewModel.Stringify(p.content)))),
                 client.OnLoopDone.Subscribe(p => this.OnLoopDone(p.reason)),
@@ -165,7 +169,7 @@ export class ChatViewModel extends Observable
         const reply = new AssistantMessage('')
         this.Transcript.Add(reply)
         this.segment = reply
-        this.busy = true
+        this.SetBusy(true)
         this.reported = false
         const token = ++this.turnToken
         this.Panel.ClearWarning()
@@ -174,21 +178,21 @@ export class ChatViewModel extends Observable
         const sampling = this.Panel.TakeSamplingChange()
         if (sampling !== null)
         {
-            client.SetSampling(sampling).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
+            client.SetSampling(sampling).catch((e: unknown) => this.Panel.ReportSamplingError(TextFormat.Message(e)))
         }
         const thinking = this.Panel.TakeThinkingChange()
         if (thinking !== null)
         {
-            client.SetThinking(thinking).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
+            client.SetThinking(thinking).catch((e: unknown) => this.Panel.ReportSamplingError(TextFormat.Message(e)))
         }
         client.SendTurn(draft).then(
             () => this.Settle(token),
-            (e: Error) =>
+            (e: unknown) =>
             {
                 // A turn_error/turn_rejected already reported; a stale turn (rebound) reports nothing.
                 if (token === this.turnToken && !this.reported)
                 {
-                    this.AppendNote(ChatViewModel.Format(ChatViewModel.SendFailedFormat, e.message))
+                    this.AppendNote(TextFormat.Format(ChatViewModel.SendFailedFormat, TextFormat.Message(e)))
                 }
                 this.Settle(token)
             })
@@ -198,8 +202,23 @@ export class ChatViewModel extends Observable
     {
         if (token === this.turnToken)
         {
-            this.busy = false
+            this.SetBusy(false)
             this.segment = null
+        }
+    }
+
+    /** True from Send until the turn's send_turn settles (or the turn is abandoned). */
+    public get IsBusy(): boolean
+    {
+        return this.busy
+    }
+
+    private SetBusy(value: boolean): void
+    {
+        if (this.busy !== value)
+        {
+            this.busy = value
+            this.OnBusyChanged.Raise(value)
         }
     }
 
@@ -277,7 +296,7 @@ export class ChatViewModel extends Observable
         this.segment = null
         if (reason !== ChatViewModel.AnsweredReason)
         {
-            this.Transcript.Add(new AssistantMessage(ChatViewModel.Format(ChatViewModel.NotKeptFormat, reason)))
+            this.Transcript.Add(new AssistantMessage(TextFormat.Format(ChatViewModel.NotKeptFormat, reason)))
         }
     }
 
@@ -289,7 +308,7 @@ export class ChatViewModel extends Observable
             this.AppendNote(note)
         }
         this.segment = null
-        this.busy = false
+        this.SetBusy(false)
         this.turnToken++
     }
 
@@ -342,7 +361,7 @@ export class ChatViewModel extends Observable
     /** A call whose arguments did not parse shows the raw text plus the parse error. */
     private static CallMessage(p: ToolCallNote): ToolCallMessage
     {
-        const text = p.parse_error ? ChatViewModel.Format(ChatViewModel.ParseErrorFormat, p.raw, p.parse_error) : ChatViewModel.Stringify(p.arguments)
+        const text = p.parse_error ? TextFormat.Format(ChatViewModel.ParseErrorFormat, p.raw, p.parse_error) : ChatViewModel.Stringify(p.arguments)
         return new ToolCallMessage(p.name, text)
     }
 
@@ -356,8 +375,4 @@ export class ChatViewModel extends Observable
         return typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value))
     }
 
-    private static Format(template: string, ...values: unknown[]): string
-    {
-        return template.replace(/\{(\d+)\}/g, (_m, i: string) => String(values[Number(i)]))
-    }
 }

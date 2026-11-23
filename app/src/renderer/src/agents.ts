@@ -52,9 +52,17 @@ export interface TemplateRecord
     template: AgentTemplate
 }
 
+/** Where a session's model stands on its host (the wire `placement.state`). */
+export enum PlacementState
+{
+    Ready = 'ready',
+    NeedsLoad = 'needs_load',
+    Unavailable = 'unavailable',
+}
+
 export interface Placement
 {
-    state: 'ready' | 'needs_load' | 'unavailable'
+    state: PlacementState
     host?: string
     evicts?: string | null
     reason?: string

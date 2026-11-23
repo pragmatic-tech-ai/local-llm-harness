@@ -2,22 +2,26 @@ import { RelayCommand, ServiceBase, ServiceKey } from '@pragmatic-tech-ai/mural/
 import type { IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/services/content-host-service.js'
 import { ApplicationSettings, ButtonVariant, DialogAction, DialogService } from '@pragmatic-tech-ai/mural/framework'
-import type { IDisposable } from './JsonRpcConnection'
+import { TypedSignal, type IDisposable } from './JsonRpcConnection'
 import { RuntimeClient } from './RuntimeClient'
 import { SupervisorClient, type HarnessInfo } from './SupervisorClient'
 import { SupervisorUrlSettingKey } from './SettingsKeys'
 import type { SessionSummary } from './agents'
+import { ConnectionState } from './ConnectionState'
 import { SessionsPanelViewModel } from './SessionsPanelViewModel'
 import type { SessionRowViewModel } from './SessionRowViewModel'
 import { SessionViewModel } from './SessionViewModel'
 import { NewSessionDialogViewModel } from './NewSessionDialogViewModel'
 import { TextPromptViewModel } from './TextPromptViewModel'
+import { TextFormat } from './TextFormat'
 
 /**
  * The Sessions capability. Owns the app's single runtime connection (`Client`, shared with the Agents capability),
  * the side-pane list (`Panel`) and the host-area session view (`View`, shown in the content host from the start).
- * The runtime url comes from the `supervisor.url` setting through the supervisor's `chat_url`; a dropped connection
- * reconnects with backoff (1 s, 2 s, 4 s, ... capped at 10 s) and re-attaches the session that was shown.
+ * Each connection attempt asks the supervisor (named by the `supervisor.url` setting, bounded by a timeout) for the
+ * runtime's `chat_url`, falling back to the supervisor host on :8779. A failed or dropped connection retries with
+ * backoff (1 s, 2 s, 4 s, ... capped at 10 s) and re-attaches the session that was shown. `Connection` reports the
+ * state; the panel and the session header show it.
  */
 export class SessionsService extends ServiceBase
 {
@@ -25,6 +29,8 @@ export class SessionsService extends ServiceBase
 
     private static readonly BackoffStartMs = 1000
     private static readonly BackoffCapMs = 10000
+    private static readonly DiscoveryTimeoutMs = 3000
+    private static readonly DiscoveryTimedOut = 'supervisor did not answer'
     private static readonly NewSessionTitle = 'New session'
     private static readonly NewSessionWidth = 520
     private static readonly CancelLabel = 'Cancel'
@@ -32,19 +38,23 @@ export class SessionsService extends ServiceBase
     private static readonly RenameTitle = 'Rename session'
     private static readonly RenameLabel = 'Title'
     private static readonly RenameConfirm = 'Rename'
+    private static readonly RenameFailedFormat = 'rename failed: {0}'
     private static readonly DeleteTitle = 'Delete session'
     private static readonly DeleteFormat = 'Delete "{0}" and its transcript?'
     private static readonly DeleteConfirm = 'Delete'
-    private static readonly FormatToken = '{0}'
-    private static readonly ActionFailed = 'Session action failed'
+    private static readonly DeleteFailedFormat = 'delete failed: {0}'
+    private static readonly DialogFailedFormat = 'could not open the dialog: {0}'
 
     public readonly Client: RuntimeClient
     public readonly Panel = new SessionsPanelViewModel()
     public readonly View: SessionViewModel
+    /** Raised whenever `Connection` changes. */
+    public readonly OnConnectionChanged = new TypedSignal<ConnectionState>()
 
     private readonly subscriptions: IDisposable[] = []
-    private runtimeUrl: string | null = null
-    /** Bumped on every settings change so a stale endpoint discovery is dropped. */
+    private connection = ConnectionState.Disconnected
+    private supervisorUrl = ''
+    /** Bumped on every settings change so a stale discovery or retry is dropped. */
     private generation = 0
     private attempt = 0
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -60,17 +70,24 @@ export class SessionsService extends ServiceBase
         this.subscriptions.push(
             this.Client.OnOpened.Subscribe(() => this.OnConnected()),
             this.Client.OnClosed.Subscribe(() => this.OnDisconnected()),
+            this.View.Chat.OnBusyChanged.Subscribe(busy => this.Panel.SetSwitchLocked(busy)),
             this.Panel.OnOpen.Subscribe(id => void this.View.Attach(id)),
             this.Panel.OnSelectionLost.Subscribe(id => this.OnSessionGone(id)),
             this.Panel.OnNewSessionRequested.Subscribe(() => void this.OpenNewSessionDialog()),
             this.Panel.OnRenameRequested.Subscribe(row => void this.Rename(row)),
             this.Panel.OnDeleteRequested.Subscribe(row => void this.Delete(row)))
+        this.SetConnection(ConnectionState.Disconnected)
         provider.getRequired(ContentHostService.Key).View(this.View)
         const settings = provider.getRequired(ApplicationSettings.Key)
-        void this.ApplyConnection(SessionsService.ReadUrl(settings))
+        this.ApplyConnection(SessionsService.ReadUrl(settings))
         const changed = settings.Changed(SupervisorUrlSettingKey)
-            .subscribe(() => void this.ApplyConnection(SessionsService.ReadUrl(settings)))
+            .subscribe(() => this.ApplyConnection(SessionsService.ReadUrl(settings)))
         this.subscriptions.push({ Dispose: () => changed.dispose() })
+    }
+
+    public get Connection(): ConnectionState
+    {
+        return this.connection
     }
 
     /** Opens the New session dialog; Create makes the session, closes the dialog and opens the session. */
@@ -100,6 +117,10 @@ export class SessionsService extends ServiceBase
                 ],
             })
         }
+        catch (e)
+        {
+            this.Panel.ReportError(TextFormat.Format(SessionsService.DialogFailedFormat, TextFormat.Message(e)))
+        }
         finally
         {
             created.Dispose()
@@ -120,16 +141,23 @@ export class SessionsService extends ServiceBase
         {
             return
         }
-        const title = await TextPromptViewModel.Ask(dialogs, {
-            Title: SessionsService.RenameTitle,
-            Label: SessionsService.RenameLabel,
-            Text: row.Title,
-            ConfirmLabel: SessionsService.RenameConfirm,
-        })
-        if (title !== undefined && title !== row.Title)
+        try
         {
-            // The list follows through sessions_changed.
-            await this.Client.RenameSession(row.Id, title).catch(e => console.error(SessionsService.ActionFailed, e))
+            const title = await TextPromptViewModel.Ask(dialogs, {
+                Title: SessionsService.RenameTitle,
+                Label: SessionsService.RenameLabel,
+                Text: row.Title,
+                ConfirmLabel: SessionsService.RenameConfirm,
+            })
+            if (title !== undefined && title !== row.Title)
+            {
+                // The list follows through sessions_changed.
+                await this.Client.RenameSession(row.Id, title)
+            }
+        }
+        catch (e)
+        {
+            this.Panel.ReportError(TextFormat.Format(SessionsService.RenameFailedFormat, TextFormat.Message(e)))
         }
     }
 
@@ -140,15 +168,22 @@ export class SessionsService extends ServiceBase
         {
             return
         }
-        const confirmed = await dialogs.Confirm({
-            Title: SessionsService.DeleteTitle,
-            Message: SessionsService.DeleteFormat.replace(SessionsService.FormatToken, row.Title),
-            ConfirmLabel: SessionsService.DeleteConfirm,
-        })
-        if (confirmed)
+        try
         {
-            // sessions_changed then drops the row, and the view if it was shown.
-            await this.Client.DeleteSession(row.Id).catch(e => console.error(SessionsService.ActionFailed, e))
+            const confirmed = await dialogs.Confirm({
+                Title: SessionsService.DeleteTitle,
+                Message: TextFormat.Format(SessionsService.DeleteFormat, row.Title),
+                ConfirmLabel: SessionsService.DeleteConfirm,
+            })
+            if (confirmed)
+            {
+                // sessions_changed then drops the row, and the view if it was shown.
+                await this.Client.DeleteSession(row.Id)
+            }
+        }
+        catch (e)
+        {
+            this.Panel.ReportError(TextFormat.Format(SessionsService.DeleteFailedFormat, TextFormat.Message(e)))
         }
     }
 
@@ -159,37 +194,65 @@ export class SessionsService extends ServiceBase
     }
 
     /** Points the runtime connection at the supervisor named by the setting (or goes inert when empty). */
-    private async ApplyConnection(supervisorUrl: string): Promise<void>
+    private ApplyConnection(supervisorUrl: string): void
     {
-        const generation = ++this.generation
+        this.generation++
         this.CancelReconnect()
         this.attempt = 0
-        this.runtimeUrl = null
+        this.supervisorUrl = supervisorUrl
         this.Client.Disconnect()
         this.Panel.Bind(null)
         this.View.Clear()
         if (supervisorUrl.length === 0)
         {
+            this.SetConnection(ConnectionState.Disconnected)
             return
         }
-        const runtimeUrl = await this.DiscoverRuntimeUrl(supervisorUrl)
-        if (generation !== this.generation || runtimeUrl === null)
+        void this.Connect()
+    }
+
+    /** One connection attempt: discover the runtime url, then open the runtime socket (or schedule the next try). */
+    private async Connect(): Promise<void>
+    {
+        const generation = this.generation
+        this.SetConnection(ConnectionState.Reconnecting)
+        const runtimeUrl = await this.DiscoverRuntimeUrl(this.supervisorUrl)
+        if (generation !== this.generation)
         {
             return
         }
-        this.runtimeUrl = runtimeUrl
-        this.Connect()
+        if (runtimeUrl === null)
+        {
+            this.ScheduleReconnect()
+            return
+        }
+        try
+        {
+            this.Client.Connect(runtimeUrl)
+        }
+        catch
+        {
+            this.ScheduleReconnect()
+        }
     }
 
-    /** Asks the supervisor for its harnesses' `chat_url`; an unreachable supervisor still yields the default runtime port. */
+    /**
+     * Asks the supervisor for its harnesses' `chat_url`. An unreachable or silent supervisor (no answer within the
+     * timeout) still yields the default runtime port; a malformed url yields null.
+     */
     private async DiscoverRuntimeUrl(supervisorUrl: string): Promise<string | null>
     {
         let harnesses: HarnessInfo[] = []
         const supervisor = this.supervisorFactory()
+        let timer: ReturnType<typeof setTimeout> | null = null
         try
         {
             supervisor.Connect(supervisorUrl)
-            harnesses = await supervisor.ListHarnesses()
+            const timeout = new Promise<never>((_resolve, reject) =>
+            {
+                timer = setTimeout(() => reject(new Error(SessionsService.DiscoveryTimedOut)), SessionsService.DiscoveryTimeoutMs)
+            })
+            harnesses = await Promise.race([supervisor.ListHarnesses(), timeout])
         }
         catch
         {
@@ -197,6 +260,10 @@ export class SessionsService extends ServiceBase
         }
         finally
         {
+            if (timer !== null)
+            {
+                clearTimeout(timer)
+            }
             supervisor.Disconnect()
         }
         try
@@ -205,25 +272,7 @@ export class SessionsService extends ServiceBase
         }
         catch
         {
-            // Not a url: stay inert until the setting is fixed.
             return null
-        }
-    }
-
-    private Connect(): void
-    {
-        const url = this.runtimeUrl
-        if (url === null)
-        {
-            return
-        }
-        try
-        {
-            this.Client.Connect(url)
-        }
-        catch
-        {
-            this.ScheduleReconnect()
         }
     }
 
@@ -231,6 +280,7 @@ export class SessionsService extends ServiceBase
     private OnConnected(): void
     {
         this.attempt = 0
+        this.SetConnection(ConnectionState.Connected)
         this.Panel.Bind(this.Client)
         void this.Panel.Refresh()
         const shown = this.View.ShownId
@@ -249,16 +299,17 @@ export class SessionsService extends ServiceBase
 
     private ScheduleReconnect(): void
     {
-        if (this.runtimeUrl === null || this.reconnectTimer !== null)
+        if (this.supervisorUrl.length === 0 || this.reconnectTimer !== null)
         {
             return
         }
+        this.SetConnection(ConnectionState.Reconnecting)
         const delay = Math.min(SessionsService.BackoffStartMs * 2 ** this.attempt, SessionsService.BackoffCapMs)
         this.attempt++
         this.reconnectTimer = setTimeout(() =>
         {
             this.reconnectTimer = null
-            this.Connect()
+            void this.Connect()
         }, delay)
     }
 
@@ -268,6 +319,17 @@ export class SessionsService extends ServiceBase
         {
             clearTimeout(this.reconnectTimer)
             this.reconnectTimer = null
+        }
+    }
+
+    private SetConnection(state: ConnectionState): void
+    {
+        this.Panel.SetConnection(state)
+        this.View.SetStale(state !== ConnectionState.Connected)
+        if (this.connection !== state)
+        {
+            this.connection = state
+            this.OnConnectionChanged.Raise(state)
         }
     }
 
@@ -287,7 +349,7 @@ export class SessionsService extends ServiceBase
         }
         this.generation++
         this.CancelReconnect()
-        this.runtimeUrl = null
+        this.supervisorUrl = ''
         this.Client.Disconnect()
         this.View.dispose()
         super.dispose()

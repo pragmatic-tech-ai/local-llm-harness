@@ -1,5 +1,6 @@
 import { Observable, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import type { Placement, SessionSummary } from './agents'
+import { PlacementState, type Placement, type SessionSummary } from './agents'
+import { PlacementText } from './PlacementText'
 
 /** A session's live state as the list shows it: the placement, or busy while a turn runs. */
 export enum SessionStateKind
@@ -20,14 +21,9 @@ export interface ISessionRowOwner
 /** One row of the Sessions panel: title, template name and the state dot. Updated in place so selection survives a refresh. */
 export class SessionRowViewModel extends Observable
 {
-    private static readonly PlacementReady = 'ready'
-    private static readonly PlacementNeedsLoad = 'needs_load'
     private static readonly LiveText = 'live'
     private static readonly IdleText = 'idle'
     private static readonly BusyText = 'busy'
-    private static readonly UnavailableText = 'unavailable'
-    private static readonly UnavailableFormat = 'unavailable: {0}'
-    private static readonly FormatToken = '{0}'
     private static readonly PropTitle = 'Title'
     private static readonly PropTemplateName = 'TemplateName'
     private static readonly PropStateText = 'StateText'
@@ -88,9 +84,9 @@ export class SessionRowViewModel extends Observable
         }
         switch (this.summary.placement.state)
         {
-            case SessionRowViewModel.PlacementReady:
+            case PlacementState.Ready:
                 return SessionStateKind.Live
-            case SessionRowViewModel.PlacementNeedsLoad:
+            case PlacementState.NeedsLoad:
                 return SessionStateKind.Idle
             default:
                 return SessionStateKind.Unavailable
@@ -108,10 +104,7 @@ export class SessionRowViewModel extends Observable
             case SessionStateKind.Idle:
                 return SessionRowViewModel.IdleText
             default:
-            {
-                const reason = this.summary.placement.reason
-                return reason ? SessionRowViewModel.UnavailableFormat.replace(SessionRowViewModel.FormatToken, reason) : SessionRowViewModel.UnavailableText
-            }
+                return PlacementText.Unavailable(this.summary.placement)
         }
     }
 
