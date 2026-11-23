@@ -681,6 +681,29 @@ mod tests {
         assert_eq!(result, Err("path escapes the sandbox".to_string()));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn resolve_rejects_sibling_prefix_junction_escape() {
+        let outer = TestDir::new();
+        let boxed = outer.path.join("box");
+        let sibling = outer.path.join("box2");
+        fs::create_dir(&boxed).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join("f"), "f").unwrap();
+        let link = boxed.join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&sibling)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink failed");
+        let result = Sandbox::new(&boxed).unwrap().resolve("link/f");
+        // Remove the junction itself so cleanup never follows it.
+        let _ = fs::remove_dir(&link);
+        assert_eq!(result, Err("path escapes the sandbox".to_string()));
+    }
+
     #[test]
     fn source_without_sandbox_has_only_get_time() {
         let names: Vec<String> = BuiltinSource::new(None)
