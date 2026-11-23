@@ -2,10 +2,13 @@
 import ChatViewModel from "../ChatViewModel.js"
 import UserMessage from "../messages.js"
 import AssistantMessage from "../messages.js"
+import ToolCallMessage from "../messages.js"
+import ToolResultMessage from "../messages.js"
 
 resources ChatResources {
     DataTemplate [ DataType = ChatViewModel ] {
         DockPanel [ LastChildFill = true, Margin = (12,12,12,12) ] {
+            TextBlock [ DockPanel.Dock = Top, Text = $ToolsText, Style = @BodySm, Foreground = @Fg2, Margin = (0,0,0,6) ]
             // Instrument panel to the right of the transcript (Content region split, not the shell dock).
             ContentControl [ DockPanel.Dock = Right, Width = 360, Content = $Panel, Margin = (12,0,0,0) ]
             DockPanel [ DockPanel.Dock = Bottom, Style = @ComposerSubmitStyle, LastChildFill = true, Margin = (0,8,0,0) ] {
@@ -38,6 +41,29 @@ resources ChatResources {
     DataTemplate [ DataType = AssistantMessage ] {
         Border [ Padding = (10,6,10,6), Margin = (0,3,40,3) ] {
             TextBlock [ Text = $Text, TextWrapping = Wrap ]
+        }
+    }
+
+    // Tool call: "→ name arguments", mono, in the assistant bubble style.
+    DataTemplate [ DataType = ToolCallMessage ] {
+        Border [ Padding = (10,6,10,6), Margin = (0,3,40,3) ] {
+            DockPanel [ LastChildFill = true ] {
+                TextBlock [ DockPanel.Dock = Left, Text = "→", FontFamily = "Consolas", Margin = (0,0,6,0) ]
+                TextBlock [ DockPanel.Dock = Left, Text = $Name, FontFamily = "Consolas", Margin = (0,0,6,0) ]
+                TextBlock [ Text = $Arguments, FontFamily = "Consolas", TextWrapping = Wrap ]
+            }
+        }
+    }
+
+    // Tool result: "← name status: content", dimmed.
+    DataTemplate [ DataType = ToolResultMessage ] {
+        Border [ Padding = (10,6,10,6), Margin = (0,3,40,3) ] {
+            DockPanel [ LastChildFill = true ] {
+                TextBlock [ DockPanel.Dock = Left, Text = "←", Foreground = @Fg2, FontFamily = "Consolas", Margin = (0,0,6,0) ]
+                TextBlock [ DockPanel.Dock = Left, Text = $Name, Foreground = @Fg2, FontFamily = "Consolas", Margin = (0,0,6,0) ]
+                TextBlock [ DockPanel.Dock = Left, Text = $StatusText, Foreground = @Fg2, FontFamily = "Consolas", Margin = (0,0,6,0) ]
+                TextBlock [ Text = $Content, Foreground = @Fg2, FontFamily = "Consolas", TextWrapping = Wrap ]
+            }
         }
     }
 }

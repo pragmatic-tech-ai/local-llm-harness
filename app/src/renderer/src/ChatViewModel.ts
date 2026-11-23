@@ -1,6 +1,6 @@
 import { Key, Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import { HarnessClient, type IDisposable } from './HarnessClient'
-import { AssistantMessage, UserMessage } from './messages'
+import { AssistantMessage, ToolCallMessage, ToolResultMessage, UserMessage } from './messages'
 import { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
 
 /** Owns the transcript, the composer draft, and the send flow. */
@@ -15,12 +15,26 @@ export class ChatViewModel extends Observable
     private static readonly RejectedFormat = '\n[context window full: needed {0} of {1} tokens]'
     private static readonly DisconnectedNote = '\n[disconnected]'
     private static readonly SendFailedFormat = '\n[send failed: {0}]'
+    private static readonly ToolsProperty = 'ToolsText'
+    private static readonly ToolsOff = 'tools: off'
+    private static readonly ToolsPrefix = 'tools: '
+    private static readonly ToolsSeparator = ', '
+    private static readonly NotKeptFormat = '[not kept: {0}]'
+    private static readonly AnsweredReason = 'answered'
 
-    public readonly Transcript = new ObservableCollection<UserMessage | AssistantMessage>()
+    public readonly Transcript = new ObservableCollection<UserMessage | AssistantMessage | ToolCallMessage | ToolResultMessage>()
     public readonly Panel: InstrumentPanelViewModel
 
     private _draft = ''
-    private current: AssistantMessage | null = null
+    /** The live assistant message; null between model passes of one tool loop. */
+    private segment: AssistantMessage | null = null
+    /** A turn (the whole tool loop) is in flight from Send until its send_turn promise settles. */
+    private busy = false
+    /** Identifies the turn a settling promise belongs to, so a stale settle cannot clear a newer turn. */
+    private turnToken = 0
+    /** Set once turn_error/turn_rejected has reported, so a following send_turn failure adds no duplicate note. */
+    private reported = false
+    private _toolsText = ChatViewModel.ToolsOff
     private readonly _sendCommand: RelayCommand
     private readonly _submitCommand: RelayCommand
     private client: HarnessClient | null = null
@@ -60,18 +74,23 @@ export class ChatViewModel extends Observable
         }
         this.subscriptions = []
         // A rebind means a new/removed harness: drop any turn waiting on the old one.
-        this.EndTurn(ChatViewModel.DisconnectedNote)
+        this.AbandonTurn(ChatViewModel.DisconnectedNote)
         const old = this.CanChat
         this.client = client
         if (client)
         {
             this.subscriptions.push(
-                client.OnTurnChunk.Subscribe(p => this.current?.Append(p.text)),
-                client.OnTurnDone.Subscribe(() => this.EndTurn(null)),
-                client.OnTurnError.Subscribe(p => this.EndTurn(ChatViewModel.Format(ChatViewModel.ErrorFormat, p.message))),
-                client.OnTurnRejected.Subscribe(p => this.EndTurn(ChatViewModel.Format(ChatViewModel.RejectedFormat, p.needed, p.total))))
+                client.OnTurnStarted.Subscribe(() => this.OnPassStarted()),
+                client.OnTurnChunk.Subscribe(p => this.segment?.Append(p.text)),
+                client.OnTurnDone.Subscribe(() => { this.segment = null }),
+                client.OnTurnError.Subscribe(p => this.ReportFailure(ChatViewModel.Format(ChatViewModel.ErrorFormat, p.message))),
+                client.OnTurnRejected.Subscribe(p => this.ReportFailure(ChatViewModel.Format(ChatViewModel.RejectedFormat, p.needed, p.total))),
+                client.OnToolCall.Subscribe(p => this.Transcript.Add(new ToolCallMessage(p.name, ChatViewModel.Stringify(p.arguments)))),
+                client.OnToolResult.Subscribe(p => this.Transcript.Add(new ToolResultMessage(p.name, p.ok, ChatViewModel.Stringify(p.content)))),
+                client.OnLoopDone.Subscribe(p => this.OnLoopDone(p.reason)))
         }
         this.Panel.Bind(client)
+        this.RefreshTools(client)
         this._sendCommand.RaiseCanExecuteChanged()
         this._submitCommand.RaiseCanExecuteChanged()
         this.RaisePropertyChanged(ChatViewModel.CanChatProperty, old, this.CanChat)
@@ -82,6 +101,12 @@ export class ChatViewModel extends Observable
     public get ComposerPlaceholder(): string
     {
         return this.CanChat ? ChatViewModel.ComposerHint : ChatViewModel.NoHarnessHint
+    }
+
+    /** Header indicator: the tools the runtime exposes, or 'tools: off'. */
+    public get ToolsText(): string
+    {
+        return this._toolsText
     }
 
     public get Draft(): string
@@ -106,12 +131,12 @@ export class ChatViewModel extends Observable
         return this._submitCommand
     }
 
-    /** A turn is in flight while `current` is set; sends are blocked until a terminal notification clears it. */
+    /** A turn is in flight from Send until its send_turn promise settles (after loop_done); sends are blocked meanwhile. */
     private Send(): void
     {
         const client = this.client
         const draft = this._draft.trim()
-        if (client === null || draft.length === 0 || this.current !== null)
+        if (client === null || draft.length === 0 || this.busy)
         {
             return
         }
@@ -119,39 +144,117 @@ export class ChatViewModel extends Observable
         this.Draft = ''
         const reply = new AssistantMessage('')
         this.Transcript.Add(reply)
-        this.current = reply
+        this.segment = reply
+        this.busy = true
+        this.reported = false
+        const token = ++this.turnToken
         this.Panel.ClearWarning()
         // Apply the knobs to THIS turn (set_sampling lands before send_turn on the single ws stream).
         client.SetSampling(this.Panel.Config).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
         client.SendTurn(draft, this.Panel.EnableThinking).then(
-            () => this.ClearIfCurrent(reply),
+            () => this.Settle(token),
             (e: Error) =>
             {
-                // Only a still-active turn reports: after a terminal notification
-                // current !== reply, so no duplicate note follows [error: ...].
-                if (this.current === reply)
+                // A turn_error/turn_rejected already reported; a stale turn (rebound) reports nothing.
+                if (token === this.turnToken && !this.reported)
                 {
-                    reply.Append(ChatViewModel.Format(ChatViewModel.SendFailedFormat, e.message))
-                    this.current = null
+                    this.AppendNote(ChatViewModel.Format(ChatViewModel.SendFailedFormat, e.message))
                 }
+                this.Settle(token)
             })
     }
 
-    private ClearIfCurrent(reply: AssistantMessage): void
+    private Settle(token: number): void
     {
-        if (this.current === reply)
+        if (token === this.turnToken)
         {
-            this.current = null
+            this.busy = false
+            this.segment = null
         }
     }
 
-    private EndTurn(note: string | null): void
+    /** A new model pass of the tool loop opens a fresh assistant message. */
+    private OnPassStarted(): void
     {
-        if (note !== null)
+        if (this.busy && this.segment === null)
         {
-            this.current?.Append(note)
+            this.segment = new AssistantMessage('')
+            this.Transcript.Add(this.segment)
         }
-        this.current = null
+    }
+
+    private ReportFailure(note: string): void
+    {
+        this.reported = true
+        this.AppendNote(note)
+        this.segment = null
+    }
+
+    /** Appends to the live segment, or opens one when the failure lands between passes. */
+    private AppendNote(note: string): void
+    {
+        if (this.segment === null)
+        {
+            this.segment = new AssistantMessage('')
+            this.Transcript.Add(this.segment)
+        }
+        this.segment.Append(note)
+    }
+
+    private OnLoopDone(reason: string): void
+    {
+        this.segment = null
+        if (reason !== ChatViewModel.AnsweredReason)
+        {
+            this.Transcript.Add(new AssistantMessage(ChatViewModel.Format(ChatViewModel.NotKeptFormat, reason)))
+        }
+    }
+
+    /** Drops any turn waiting on a previous client, noting the abandoned reply. */
+    private AbandonTurn(note: string): void
+    {
+        if (this.busy)
+        {
+            this.segment?.Append(note)
+        }
+        this.segment = null
+        this.busy = false
+        this.turnToken++
+    }
+
+    private RefreshTools(client: HarnessClient | null): void
+    {
+        this.SetToolsText(ChatViewModel.ToolsOff)
+        if (client === null)
+        {
+            return
+        }
+        client.ModelProps()
+            .then(props => props.supports_tools === true ? client.ListTools() : [])
+            .then(
+                tools =>
+                {
+                    if (this.client === client && tools.length > 0)
+                    {
+                        this.SetToolsText(ChatViewModel.ToolsPrefix + tools.map(t => t.name).join(ChatViewModel.ToolsSeparator))
+                    }
+                },
+                () => undefined)
+    }
+
+    private SetToolsText(value: string): void
+    {
+        const old = this._toolsText
+        this._toolsText = value
+        if (old !== value)
+        {
+            this.RaisePropertyChanged(ChatViewModel.ToolsProperty, old, value)
+        }
+    }
+
+    private static Stringify(value: unknown): string
+    {
+        return typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value))
     }
 
     private static Format(template: string, ...values: unknown[]): string

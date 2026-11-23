@@ -306,7 +306,7 @@ export class HarnessPickerViewModel extends Observable
         }
         if (info.state === HarnessPickerViewModel.StateReady && info.url)
         {
-            this.OnReady.Raise(info.url)
+            this.OnReady.Raise(info.chat_url ?? info.url)
         }
         else if (info.state === HarnessPickerViewModel.StateFailed || info.state === HarnessPickerViewModel.StateStopped)
         {

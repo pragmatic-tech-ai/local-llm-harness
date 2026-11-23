@@ -281,4 +281,24 @@ describe('HarnessPickerViewModel', () =>
         expect(rig.picker.StatusText).toContain('incompatible')
         expect(rig.ready).toEqual([])
     })
+
+    it('ready_raises_chat_url_when_present', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.StartCommand.Execute()
+        const info: HarnessInfo = { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://w', chat_url: 'ws://r' }
+        rig.client.HandleFrame(JSON.stringify({ method: 'harness_changed', params: info }))
+        expect(rig.ready).toEqual(['ws://r'])
+    })
+
+    it('ready_falls_back_to_url', async () =>
+    {
+        const rig = new Rig()
+        await rig.Populate()
+        rig.picker.StartCommand.Execute()
+        const info: HarnessInfo = { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://w' }
+        rig.client.HandleFrame(JSON.stringify({ method: 'harness_changed', params: info }))
+        expect(rig.ready).toEqual(['ws://w'])
+    })
 })

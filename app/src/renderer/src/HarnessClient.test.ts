@@ -191,4 +191,32 @@ describe('HarnessClient', () =>
         sockets[1].Open()
         expect(sockets[1].sent).toEqual([])
     })
+
+    it('tool_notifications_raise_signals', () =>
+    {
+        const client = new HarnessClient()
+        const seen: unknown[] = []
+        client.OnToolCall.Subscribe(p => seen.push(p))
+        client.OnToolResult.Subscribe(p => seen.push(p))
+        client.OnLoopDone.Subscribe(p => seen.push(p))
+        const call = { id: 'c1', name: 'get_time', arguments: {}, raw: '{}' }
+        const result = { id: 'c1', name: 'get_time', ok: true, content: '14:05' }
+        const done = { steps: 2, reason: 'answered' }
+        client.HandleFrame(JSON.stringify({ method: 'tool_call', params: call }))
+        client.HandleFrame(JSON.stringify({ method: 'tool_result', params: result }))
+        client.HandleFrame(JSON.stringify({ method: 'loop_done', params: done }))
+        expect(seen).toEqual([call, result, done])
+    })
+
+    it('list_tools_sends_method', async () =>
+    {
+        const socket = new FakeSocket()
+        const client = new HarnessClient(() => socket)
+        client.Connect('ws://x')
+        socket.Open()
+        const pending = client.ListTools()
+        expect(JSON.parse(socket.sent[0]).method).toBe('list_tools')
+        client.HandleFrame(JSON.stringify({ id: 1, result: [{ name: 'get_time', description: 'd', side_effects: false }] }))
+        await expect(pending).resolves.toEqual([{ name: 'get_time', description: 'd', side_effects: false }])
+    })
 })

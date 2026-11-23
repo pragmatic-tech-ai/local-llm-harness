@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { ChatViewModel } from './ChatViewModel'
 import { HarnessClient } from './HarnessClient'
 import { FakeSocket } from './FakeSocket'
-import type { AssistantMessage } from './messages'
+import type { AssistantMessage, ToolCallMessage, ToolResultMessage } from './messages'
 
 class Rig
 {
@@ -28,6 +28,12 @@ class Rig
     public Notify(method: string, params: unknown): void
     {
         this.client.HandleFrame(JSON.stringify({ method, params }))
+    }
+
+    /** Answers the pending request with this JSON-RPC id. */
+    public Respond(id: number, result: unknown = null): void
+    {
+        this.client.HandleFrame(JSON.stringify({ id, result }))
     }
 
     public Count(): number
@@ -62,7 +68,7 @@ describe('ChatViewModel', () =>
         expect(rig.Reply(1).Text).toBe('ab')
     })
 
-    it('BlocksSecondSendWhileTurnActiveThenAllowsAfterDone', () =>
+    it('BlocksSecondSendWhileTurnActiveThenAllowsAfterDone', async () =>
     {
         const rig = new Rig(true)
         rig.Send('one')
@@ -71,6 +77,8 @@ describe('ChatViewModel', () =>
         expect(rig.vm.Draft).toBe('two')
         rig.Notify('turn_chunk', { text: 'x', tokens: [], stop: false })
         rig.Notify('turn_done', {})
+        rig.Respond(2)
+        await new Promise(r => setTimeout(r, 0))
         rig.Send('two')
         expect(rig.Count()).toBe(4)
         rig.Notify('turn_chunk', { text: 'y', tokens: [], stop: false })
@@ -83,10 +91,11 @@ describe('ChatViewModel', () =>
         const rig = new Rig(true)
         rig.Send('one')
         rig.Notify('turn_done', {})
+        // Rebinding drops the in-flight turn; the old turn's send_turn then fails late (id 2; set_sampling takes id 1).
+        rig.vm.Bind(rig.client)
         rig.Send('two')
-        // The old turn's send_turn response (id 2; set_sampling takes id 1) arrives late, as an error.
         rig.client.HandleFrame(JSON.stringify({ id: 2, error: { code: 1, message: 'late' } }))
-        await Promise.resolve()
+        await new Promise(r => setTimeout(r, 0))
         rig.Notify('turn_chunk', { text: 'z', tokens: [], stop: false })
         expect(rig.Reply(1).Text).toBe('')
         expect(rig.Reply(3).Text).toBe('z')
@@ -98,18 +107,21 @@ describe('ChatViewModel', () =>
         rig.Send('one')
         rig.Notify('turn_error', { message: 'boom' })
         rig.client.HandleFrame(JSON.stringify({ id: 2, error: { code: 1, message: 'boom' } }))
-        await Promise.resolve()
+        await new Promise(r => setTimeout(r, 0))
         expect(rig.Reply(1).Text).toBe('\n[error: boom]')
     })
 
-    it('RejectedTurnAppendsWindowNoteAndAllowsNextSend', () =>
+    it('RejectedTurnAppendsWindowNoteAndAllowsNextSend', async () =>
     {
         const rig = new Rig(true)
         rig.Send('one')
         rig.Notify('turn_rejected', { needed: 9, total: 4 })
         expect(rig.Reply(1).Text).toBe('\n[context window full: needed 9 of 4 tokens]')
+        rig.Notify('loop_done', { steps: 0, reason: 'error' })
+        rig.Respond(2)
+        await new Promise(r => setTimeout(r, 0))
         rig.Send('two')
-        expect(rig.Count()).toBe(4)
+        expect(rig.Count()).toBe(5)
     })
 
     it('SendWithNoConnectionSettlesWithNote', async () =>
@@ -208,5 +220,83 @@ describe('ChatViewModel', () =>
         expect(rig.vm.CanChat).toBe(false)
         rig.Send('hi')
         expect(rig.Count()).toBe(0)
+    })
+
+    it('multi_step_turn_renders_call_result_and_answer', async () =>
+    {
+        const rig = new Rig(true)
+        rig.Send('time?')
+        rig.Notify('turn_started', { prompt: 'p', prompt_tokens: 1, n_ctx: 8 })
+        rig.Notify('turn_chunk', { text: '', tokens: [], stop: true })
+        rig.Notify('tool_call', { id: 'c1', name: 'get_time', arguments: { tz: 'utc' }, raw: '{}' })
+        rig.Notify('turn_done', {})
+        rig.Notify('tool_result', { id: 'c1', name: 'get_time', ok: true, content: '14:05' })
+        rig.Notify('turn_started', { prompt: 'p2', prompt_tokens: 2, n_ctx: 8 })
+        rig.Notify('turn_chunk', { text: "It's 14:05.", tokens: [], stop: true })
+        rig.Notify('turn_done', {})
+        rig.Notify('loop_done', { steps: 2, reason: 'answered' })
+        rig.Respond(2)
+        await new Promise(r => setTimeout(r, 0))
+        const items = rig.vm.Transcript.ToArray()
+        expect(items.map(i => i.constructor.name)).toEqual(['UserMessage', 'AssistantMessage', 'ToolCallMessage', 'ToolResultMessage', 'AssistantMessage'])
+        const call = items[2] as ToolCallMessage
+        expect(call.Name).toBe('get_time')
+        expect(call.Arguments).toBe('{"tz":"utc"}')
+        const result = items[3] as ToolResultMessage
+        expect(result.StatusText).toBe('ok')
+        expect(result.Content).toBe('14:05')
+        expect((items[4] as AssistantMessage).Text).toBe("It's 14:05.")
+    })
+
+    it('send_resolves_after_loop_done_not_turn_done', async () =>
+    {
+        const rig = new Rig(true)
+        rig.Send('one')
+        rig.Notify('turn_chunk', { text: 'a', tokens: [], stop: true })
+        rig.Notify('turn_done', {})
+        rig.Send('two')
+        expect(rig.Count()).toBe(2)
+        rig.Notify('loop_done', { steps: 1, reason: 'answered' })
+        rig.Respond(2)
+        await new Promise(r => setTimeout(r, 0))
+        rig.Send('two')
+        expect(rig.Count()).toBe(4)
+    })
+
+    it('not_kept_loop_adds_note', () =>
+    {
+        const rig = new Rig(true)
+        rig.Send('one')
+        rig.Notify('turn_done', {})
+        rig.Notify('loop_done', { steps: 8, reason: 'step_limit' })
+        const items = rig.vm.Transcript.ToArray()
+        expect((items[items.length - 1] as AssistantMessage).Text).toBe('[not kept: step_limit]')
+    })
+
+    it('tools_text_reflects_runtime', async () =>
+    {
+        const rig = new Rig(false)
+        expect(rig.vm.ToolsText).toBe('tools: off')
+        rig.client.Connect('ws://x')
+        rig.socket.Open()
+        rig.vm.Bind(rig.client)
+        // Bind sends the panel's model_props (1), then ours (2).
+        rig.Respond(1, { n_ctx: 8, model_name: 'm' })
+        rig.Respond(2, { n_ctx: 8, model_name: 'm', supports_tools: true })
+        await new Promise(r => setTimeout(r, 0))
+        expect(JSON.parse(rig.socket.sent[2]).method).toBe('list_tools')
+        rig.Respond(3, [{ name: 'get_time', description: '', side_effects: false }])
+        await new Promise(r => setTimeout(r, 0))
+        expect(rig.vm.ToolsText).toBe('tools: get_time')
+
+        const off = new Rig(false)
+        off.client.Connect('ws://x')
+        off.socket.Open()
+        off.vm.Bind(off.client)
+        off.Respond(1, { n_ctx: 8, model_name: 'm' })
+        off.Respond(2, { n_ctx: 8, model_name: 'm', supports_tools: false })
+        await new Promise(r => setTimeout(r, 0))
+        expect(off.vm.ToolsText).toBe('tools: off')
+        expect(off.socket.sent.length).toBe(2)
     })
 })

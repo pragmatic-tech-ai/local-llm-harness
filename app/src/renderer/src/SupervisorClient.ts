@@ -21,6 +21,7 @@ export interface HarnessInfo
     model: string
     state: string
     url?: string
+    chat_url?: string
 }
 
 /** JSON-RPC client for the supervisor control server: list/start/stop harnesses. */

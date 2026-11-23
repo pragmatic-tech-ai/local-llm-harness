@@ -28,6 +28,15 @@ class Rig
         this.client.HandleFrame(JSON.stringify({ method, params }))
     }
 
+    /** Ends the turn the way the runtime does: answers the latest send_turn (after its terminal notifications). */
+    public async FinishTurn(): Promise<void>
+    {
+        const frames = this.socket.sent.map(f => JSON.parse(f) as { id: number, method: string })
+        const last = frames.filter(f => f.method === 'send_turn').pop()
+        this.client.HandleFrame(JSON.stringify({ id: last?.id, result: null }))
+        await new Promise(r => setTimeout(r, 0))
+    }
+
     /** Sampling configs sent so far, in order. */
     public SamplingSent(): { temperature: number }[]
     {
@@ -45,12 +54,13 @@ class Rig
 
 describe('InstrumentPanelViewModel', () =>
 {
-    it('KnobEditsApplyToNextTurnNotCurrent', () =>
+    it('KnobEditsApplyToNextTurnNotCurrent', async () =>
     {
         const rig = new Rig()
         rig.Send('one')
         rig.vm.Panel.Temperature = 1.5
         rig.Notify('turn_done', {})
+        await rig.FinishTurn()
         rig.Send('two')
 
         const sent = rig.SamplingSent()
@@ -95,7 +105,7 @@ describe('InstrumentPanelViewModel', () =>
         expect(rig.vm.Panel.ContextTotal).toBe(10)
     })
 
-    it('WindowFullSurfacesWarning', () =>
+    it('WindowFullSurfacesWarning', async () =>
     {
         const rig = new Rig()
         rig.Send('one')
@@ -106,11 +116,12 @@ describe('InstrumentPanelViewModel', () =>
         expect(rig.vm.Panel.HasWarning).toBe(true)
         expect(rig.vm.Transcript.ToArray().length).toBe(2)
         rig.Notify('turn_done', {})
+        await rig.FinishTurn()
         rig.Send('two')
         expect(rig.vm.Panel.Warning).toBe('')
     })
 
-    it('TracksPromptContextAndLogprobsPerTurn', () =>
+    it('TracksPromptContextAndLogprobsPerTurn', async () =>
     {
         const rig = new Rig()
         rig.Send('one')
@@ -121,6 +132,7 @@ describe('InstrumentPanelViewModel', () =>
         expect(rig.vm.Panel.ContextLabel).toBe('1024 / 4096 (25%)')
         expect(rig.vm.Panel.Logprobs.ToArray().length).toBe(1)
         rig.Notify('turn_done', {})
+        await rig.FinishTurn()
         rig.Send('two')
         rig.Notify('turn_started', { prompt: 'RAW2', prompt_tokens: 1, n_ctx: 4096 })
         expect(rig.vm.Panel.Logprobs.ToArray().length).toBe(0)
@@ -139,7 +151,7 @@ describe('InstrumentPanelViewModel', () =>
     {
         const rig = new Rig()
         rig.Send('one')
-        rig.client.HandleFrame(JSON.stringify({ id: 2, error: { code: 1, message: 'bad config' } }))
+        rig.client.HandleFrame(JSON.stringify({ id: 3, error: { code: 1, message: 'bad config' } }))
         await new Promise(r => setTimeout(r, 0))
         expect(rig.vm.Panel.Warning).toContain('bad config')
     })
