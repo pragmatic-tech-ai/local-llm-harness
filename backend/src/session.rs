@@ -289,6 +289,43 @@ mod tests {
     }
 
     #[test]
+    fn context_fill_check_accepts_exactly_full_window() {
+        let fill = ContextFill::check(90, 100, 10).expect("needed == total fits");
+        assert_eq!(
+            fill,
+            ContextFill {
+                used: 90,
+                total: 100
+            }
+        );
+    }
+
+    #[test]
+    fn context_fill_check_rejects_one_over() {
+        let (fill, reason) = ContextFill::check(91, 100, 10).unwrap_err();
+        assert_eq!(
+            fill,
+            ContextFill {
+                used: 91,
+                total: 100
+            }
+        );
+        assert!(matches!(
+            reason,
+            TurnRejected::WindowFull {
+                needed: 101,
+                total: 100
+            }
+        ));
+    }
+
+    #[test]
+    fn context_fill_check_treats_unlimited_max_tokens_as_zero() {
+        assert!(ContextFill::check(100, 100, -1).is_ok());
+        assert!(ContextFill::check(101, 100, -1).is_err());
+    }
+
+    #[test]
     fn engine_trait_default_does_not_support_tools() {
         assert!(!FakeEngine::new(1).supports_tools());
     }

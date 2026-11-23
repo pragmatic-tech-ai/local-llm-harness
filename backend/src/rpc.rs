@@ -141,6 +141,8 @@ struct Connection {
 }
 
 impl Connection {
+    const TOOLS_UNSUPPORTED: &'static str = "tools are not supported by this engine";
+
     async fn run(mut self, stream: TcpStream) -> Result<(), BoxError> {
         let mut ws = tokio_tungstenite::accept_async(stream).await?;
         while let Some(frame) = ws.next().await {
@@ -259,9 +261,22 @@ impl Connection {
 
     /// Stateless turn: renders `p.messages` (with `p.tools`), checks the window, streams the
     /// reply and parses Gemma 4 tool calls out of it. Nothing is stored on the connection.
+    ///
+    /// Wire contract:
+    /// - Non-empty `tools` on an engine whose `supports_tools()` is false yields a single
+    ///   `turn_error {message: "tools are not supported by this engine"}` before anything else
+    ///   (no `turn_started`, no render, no `complete`).
+    /// - Every engine chunk is relayed raw as `turn_chunk {text, tokens, stop}`, including the
+    ///   chunk that carries the response marker; that chunk keeps the engine's own `stop` flag
+    ///   (normally false, since the engine is cut off mid-stream). Chunks after it are never
+    ///   relayed. Clients must not treat `stop` as the end of the turn: `turn_done` (or
+    ///   `turn_rejected` / `turn_error`) is what ends it.
     async fn generate(&mut self, ws: &mut Ws, p: GenerateParams) -> Result<(), Failure> {
         let cfg = p.sampling.unwrap_or_else(|| self.sampling.clone());
         let tools = p.tools.unwrap_or_default();
+        if !tools.is_empty() && !self.engine.supports_tools() {
+            return Self::turn_error(ws, Self::TOOLS_UNSUPPORTED).await;
+        }
         let prompt = match self
             .engine
             .apply_template(&p.messages, true, p.enable_thinking, &tools)
@@ -354,6 +369,7 @@ pub(crate) mod test_support {
     use crate::engine::{CompletionChunk, TokenizeResult};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio_tungstenite::MaybeTlsStream;
 
@@ -364,6 +380,37 @@ pub(crate) mod test_support {
         token_count: usize,
         supports_tools: bool,
         recorded_tools: Mutex<Vec<Vec<Value>>>,
+        pulled: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    /// The lazily produced reply stream: counts every chunk pulled and flags its own drop.
+    struct LazyChunks {
+        chunks: Vec<String>,
+        index: usize,
+        pulled: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl LazyChunks {
+        fn next_chunk(mut self) -> Option<(crate::engine::Result<CompletionChunk>, Self)> {
+            let text = self.chunks.get(self.index)?.clone();
+            let stop = self.index + 1 == self.chunks.len();
+            self.index += 1;
+            self.pulled.fetch_add(1, Ordering::SeqCst);
+            let chunk = CompletionChunk {
+                text,
+                tokens: vec![],
+                stop,
+            };
+            Some((Ok(chunk), self))
+        }
+    }
+
+    impl Drop for LazyChunks {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
     }
 
     impl FakeEngine {
@@ -375,7 +422,19 @@ pub(crate) mod test_support {
                 token_count: 10,
                 supports_tools: false,
                 recorded_tools: Mutex::new(Vec::new()),
+                pulled: Arc::new(AtomicUsize::new(0)),
+                dropped: Arc::new(AtomicBool::new(false)),
             }
+        }
+
+        /// How many chunks the consumer has pulled from the reply stream.
+        pub(crate) fn pulled_chunks(&self) -> usize {
+            self.pulled.load(Ordering::SeqCst)
+        }
+
+        /// Whether the reply stream has been dropped.
+        pub(crate) fn stream_dropped(&self) -> bool {
+            self.dropped.load(Ordering::SeqCst)
         }
 
         pub(crate) fn with_token_count(mut self, token_count: usize) -> Self {
@@ -417,20 +476,13 @@ pub(crate) mod test_support {
             _cfg: &SamplingConfig,
         ) -> crate::engine::Result<BoxStream<'static, crate::engine::Result<CompletionChunk>>>
         {
-            let last = self.chunks.len().saturating_sub(1);
-            let chunks: Vec<_> = self
-                .chunks
-                .iter()
-                .enumerate()
-                .map(|(i, text)| {
-                    Ok(CompletionChunk {
-                        text: text.clone(),
-                        tokens: vec![],
-                        stop: i == last,
-                    })
-                })
-                .collect();
-            Ok(futures::stream::iter(chunks).boxed())
+            let state = LazyChunks {
+                chunks: self.chunks.clone(),
+                index: 0,
+                pulled: Arc::clone(&self.pulled),
+                dropped: Arc::clone(&self.dropped),
+            };
+            Ok(futures::stream::unfold(state, |s| async move { s.next_chunk() }).boxed())
         }
 
         async fn apply_template(
@@ -591,6 +643,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generate_drops_the_stream_at_response_marker() {
+        let engine = Arc::new(FakeEngine::new(&MARKER_CHUNKS));
+        let mut client = TestClient::connect(engine.clone(), 8192).await;
+        let params = json!({"messages": Harness::messages()});
+        let (notes, _) = client.request("generate", params).await;
+        assert_eq!(TestClient::params_of(&notes, "turn_chunk").len(), 4);
+        // The marker is the 4th chunk; the 5th must never have been pulled.
+        assert_eq!(engine.pulled_chunks(), 4);
+        assert!(engine.stream_dropped());
+    }
+
+    #[tokio::test]
+    async fn generate_with_tools_on_unsupporting_engine_errors_without_completing() {
+        let engine = Arc::new(FakeEngine::new(&["ok"]));
+        let mut client = TestClient::connect(engine.clone(), 8192).await;
+        let tools = json!([{"type": "function", "function": {"name": "get_time"}}]);
+        let params = json!({"messages": Harness::messages(), "tools": tools});
+        let (notes, resp) = client.request("generate", params).await;
+        assert_eq!(TestClient::methods(&notes), ["turn_error"]);
+        assert_eq!(
+            TestClient::params_of(&notes, "turn_error")[0]["message"],
+            "tools are not supported by this engine"
+        );
+        assert_eq!(resp["result"], Value::Null);
+        assert_eq!(engine.pulled_chunks(), 0);
+        assert!(engine.recorded_tools().is_empty());
+    }
+
+    #[tokio::test]
     async fn generate_reports_unterminated_call_at_end_of_stream() {
         let engine = FakeEngine::new(&["Hi ", "<|tool_call>call:get_time{"]);
         let params = json!({"messages": Harness::messages()});
@@ -623,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn generate_passes_tools_to_template() {
         let tools = json!([{"type": "function", "function": {"name": "get_time"}}]);
-        let engine = Arc::new(FakeEngine::new(&["ok"]));
+        let engine = Arc::new(FakeEngine::new(&["ok"]).with_tools_support(true));
         let mut client = TestClient::connect(engine.clone(), 8192).await;
         let params = json!({"messages": Harness::messages(), "tools": tools});
         client.request("generate", params).await;

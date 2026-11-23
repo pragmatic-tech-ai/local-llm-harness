@@ -353,10 +353,6 @@ impl Engine for CandleEngine {
             .map_err(|e| EngineError::Protocol(format!("detokenize failed: {e}")))
     }
 
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
     async fn apply_template(
         &self,
         messages: &[ChatMessage],
