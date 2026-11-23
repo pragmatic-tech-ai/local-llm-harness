@@ -11,7 +11,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use super::tool_loop::{LoopSink, SinkClosed, ToolLoop, TurnLinks};
-use super::worker::{GenerateRequest, LinkError, Note, WorkerConnector, WorkerLink};
+use super::worker::{GenerateRequest, LinkError, Note, WorkerLink};
 
 /// What one `generate` call yields: a stream of items, or an immediate failure.
 pub(crate) type Scripted = Result<Vec<Result<Note, LinkError>>, LinkError>;
@@ -164,14 +164,8 @@ impl FakeConnector {
         }
     }
 
-    /// How many times `connect` has been called.
-    pub(crate) fn connects(&self) -> usize {
-        *self.connects.lock().expect("connects")
-    }
-}
-
-impl WorkerConnector for FakeConnector {
-    fn connect(&self) -> Option<Arc<dyn WorkerLink>> {
+    /// The next scripted link (or none); counts the call.
+    pub(crate) fn connect(&self) -> Option<Arc<dyn WorkerLink>> {
         *self.connects.lock().expect("connects") += 1;
         let mut links = self.links.lock().expect("links");
         let link = if links.len() > 1 {
@@ -180,6 +174,11 @@ impl WorkerConnector for FakeConnector {
             links.front().cloned().expect("non-empty")
         };
         link.map(|l| l as Arc<dyn WorkerLink>)
+    }
+
+    /// How many times `connect` has been called.
+    pub(crate) fn connects(&self) -> usize {
+        *self.connects.lock().expect("connects")
     }
 }
 

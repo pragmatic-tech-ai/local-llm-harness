@@ -1,8 +1,7 @@
 //! The runtime's client side of the worker protocol: calls the worker's `generate`,
-//! `model_props` and `tokenize` over a websocket, and finds the ready worker via the supervisor.
+//! `model_props` and `tokenize` over a websocket.
 
 use std::fmt;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,7 +14,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::engine::{ChatMessage, SamplingConfig};
-use crate::supervisor::manager::{HarnessManager, ReadinessProbe, WorkerLauncher};
 
 type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -64,22 +62,6 @@ pub trait WorkerLink: Send + Sync {
         &self,
         req: &GenerateRequest,
     ) -> Result<BoxStream<'static, Result<Note, LinkError>>, LinkError>;
-}
-
-/// Hands out a link to the current ready worker, if there is one.
-pub trait WorkerConnector: Send + Sync {
-    fn connect(&self) -> Option<Arc<dyn WorkerLink>>;
-}
-
-/// The supervisor's answer to "where is the ready worker".
-pub trait ReadyWorkerUrl: Send + Sync {
-    fn ready_worker_url(&self) -> Option<String>;
-}
-
-impl<L: WorkerLauncher, P: ReadinessProbe> ReadyWorkerUrl for HarnessManager<L, P> {
-    fn ready_worker_url(&self) -> Option<String> {
-        HarnessManager::ready_worker_url(self)
-    }
 }
 
 /// Websocket `WorkerLink`: one connection per call, request id `1`.
@@ -259,37 +241,12 @@ impl WorkerLink for WsWorkerLink {
     }
 }
 
-/// Connects to whichever worker the supervisor reports as ready.
-pub struct SupervisorConnector {
-    source: Arc<dyn ReadyWorkerUrl>,
-}
-
-impl SupervisorConnector {
-    pub fn new(source: Arc<dyn ReadyWorkerUrl>) -> Self {
-        Self { source }
-    }
-}
-
-impl WorkerConnector for SupervisorConnector {
-    fn connect(&self) -> Option<Arc<dyn WorkerLink>> {
-        let url = self.source.ready_worker_url()?;
-        Some(Arc::new(WsWorkerLink::new(url)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::Role;
+    use std::sync::Arc;
     use crate::rpc::test_support::{FakeEngine, TestServer};
-
-    struct NoWorker;
-
-    impl ReadyWorkerUrl for NoWorker {
-        fn ready_worker_url(&self) -> Option<String> {
-            None
-        }
-    }
 
     const MS: Duration = Duration::from_millis(100);
     const GENEROUS: Duration = Duration::from_secs(5);
@@ -447,11 +404,5 @@ mod tests {
             .await
             .expect("server saw close")
             .expect("signal");
-    }
-
-    #[test]
-    fn connector_returns_none_without_ready_worker() {
-        let connector = SupervisorConnector::new(Arc::new(NoWorker));
-        assert!(connector.connect().is_none());
     }
 }

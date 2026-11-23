@@ -85,6 +85,48 @@ struct StopParams {
     id: String,
 }
 
+/// Path-free JSON views of the catalog, shared by the control server and the agent runtime.
+pub struct CatalogListing;
+
+impl CatalogListing {
+    const KIND_CANDLE: &'static str = "candle";
+    const KIND_LLAMACPP: &'static str = "llamacpp";
+    const KIND_HTTP: &'static str = "http";
+
+    pub fn kind_name(kind: RuntimeKind) -> &'static str {
+        match kind {
+            RuntimeKind::Candle => Self::KIND_CANDLE,
+            RuntimeKind::Llamacpp => Self::KIND_LLAMACPP,
+            RuntimeKind::Http => Self::KIND_HTTP,
+        }
+    }
+
+    /// `[{name, kind}]` for every runtime.
+    pub fn runtimes(catalog: &Catalog) -> Vec<Value> {
+        catalog
+            .runtimes
+            .iter()
+            .map(|r| json!({ "name": r.name, "kind": Self::kind_name(r.kind) }))
+            .collect()
+    }
+
+    /// `[{name, runtimes, size_hint}]` for every discovered model. The hand-built JSON is a
+    /// DELIBERATE field whitelist: it must never echo a path, so it is intentionally NOT a
+    /// blanket `Serialize` of `DiscoveredModel` (a future path field can't leak).
+    pub fn models(catalog: &Catalog) -> Vec<Value> {
+        discover(catalog)
+            .into_iter()
+            .map(|m| {
+                json!({
+                    "name": m.display_name,
+                    "runtimes": m.runtimes,
+                    "size_hint": m.size_hint,
+                })
+            })
+            .collect()
+    }
+}
+
 /// The control server, generic over how workers are launched and probed.
 pub struct ControlServer<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> {
     manager: Arc<HarnessManager<L, P>>,
@@ -98,9 +140,6 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
     const METHOD_START: &'static str = "start";
     const METHOD_STOP: &'static str = "stop";
     const NOTIFY_CHANGED: &'static str = "harness_changed";
-    const KIND_CANDLE: &'static str = "candle";
-    const KIND_LLAMACPP: &'static str = "llamacpp";
-    const KIND_HTTP: &'static str = "http";
 
     pub fn new(manager: Arc<HarnessManager<L, P>>, catalog: Arc<Catalog>) -> Self {
         Self { manager, catalog }
@@ -139,14 +178,6 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
         }
     }
 
-    fn kind_name(kind: RuntimeKind) -> &'static str {
-        match kind {
-            RuntimeKind::Candle => Self::KIND_CANDLE,
-            RuntimeKind::Llamacpp => Self::KIND_LLAMACPP,
-            RuntimeKind::Http => Self::KIND_HTTP,
-        }
-    }
-
     fn list_runtimes(&self) -> Value {
         let items: Vec<Value> = self
             .catalog
@@ -155,7 +186,7 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
             .map(|r| {
                 json!({
                     "name": r.name,
-                    "kind": Self::kind_name(r.kind),
+                    "kind": CatalogListing::kind_name(r.kind),
                     "available": r.exe.exists(),
                 })
             })
@@ -163,20 +194,8 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
         Value::Array(items)
     }
 
-    /// The hand-built JSON is a DELIBERATE field whitelist: it must never echo a path, so it is
-    /// intentionally NOT a blanket `Serialize` of `DiscoveredModel` (a future path field can't leak).
     fn list_models(&self) -> Value {
-        let items: Vec<Value> = discover(&self.catalog)
-            .into_iter()
-            .map(|m| {
-                json!({
-                    "name": m.display_name,
-                    "runtimes": m.runtimes,
-                    "size_hint": m.size_hint,
-                })
-            })
-            .collect();
-        Value::Array(items)
+        Value::Array(CatalogListing::models(&self.catalog))
     }
 
     fn error_frame(id: Value, err: &RpcError) -> Value {
@@ -394,7 +413,10 @@ mod tests {
     async fn start_accepts_n_ctx_override() {
         let s = server("nctx");
         let v = s
-            .dispatch("start", json!({"runtime": "candle", "model": "gem", "n_ctx": 8192}))
+            .dispatch(
+                "start",
+                json!({"runtime": "candle", "model": "gem", "n_ctx": 8192}),
+            )
             .await
             .unwrap();
         assert_eq!(v["id"], "candle:gem");
