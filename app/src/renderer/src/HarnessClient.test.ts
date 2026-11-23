@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { HarnessClient, TurnSignal, type ModelProps, type TurnChunk } from './HarnessClient'
+import { HarnessClient, TypedSignal, type ModelProps, type TurnChunk } from './HarnessClient'
 import { FakeSocket } from './FakeSocket'
 
 describe('HarnessClient', () =>
@@ -116,7 +116,7 @@ describe('HarnessClient', () =>
 
     it('ThrowingSubscriberDoesNotBlockOthers', () =>
     {
-        const signal = new TurnSignal<number>()
+        const signal = new TypedSignal<number>()
         const seen: number[] = []
         const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
         signal.Subscribe(() =>
@@ -131,7 +131,7 @@ describe('HarnessClient', () =>
 
     it('subscribe_returns_disposable_that_unsubscribes', () =>
     {
-        const signal = new TurnSignal<number>()
+        const signal = new TypedSignal<number>()
         const seen: number[] = []
         const subscription = signal.Subscribe(n => seen.push(n))
         signal.Raise(1)
@@ -169,7 +169,7 @@ describe('HarnessClient', () =>
 
     it('dispose_removes_exact_subscription_when_handler_subscribed_twice', () =>
     {
-        const signal = new TurnSignal<number>()
+        const signal = new TypedSignal<number>()
         const seen: number[] = []
         const handler = (n: number) => seen.push(n)
         signal.Subscribe(handler)

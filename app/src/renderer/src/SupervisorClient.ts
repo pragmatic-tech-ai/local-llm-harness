@@ -1,4 +1,4 @@
-import { JsonRpcConnection, TurnSignal } from './JsonRpcConnection'
+import { JsonRpcConnection, TypedSignal } from './JsonRpcConnection'
 
 export interface RuntimeInfo
 {
@@ -35,7 +35,7 @@ export class SupervisorClient extends JsonRpcConnection
     private static readonly NoteHarnessChanged = 'harness_changed'
     private static readonly ParamNCtx = 'n_ctx'
 
-    public readonly OnHarnessChanged = new TurnSignal<HarnessInfo>()
+    public readonly OnHarnessChanged = new TypedSignal<HarnessInfo>()
 
     public ListRuntimes(): Promise<RuntimeInfo[]>
     {

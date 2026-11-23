@@ -23,10 +23,10 @@ export interface IDisposable
     Dispose(): void
 }
 
-/** Typed signal: handlers subscribe, the client raises (mirrors SidecarExitSignal). */
-export class TurnSignal<T>
+/** Typed signal: handlers subscribe, the owner raises (mirrors SidecarExitSignal). Used for every app-level event, not only turn notes. */
+export class TypedSignal<T>
 {
-    private static readonly HandlerFailedMessage = 'Turn signal handler threw'
+    private static readonly HandlerFailedMessage = 'Signal handler threw'
     private readonly handlers: { handler: (payload: T) => void }[] = []
 
     public Subscribe(handler: (payload: T) => void): IDisposable
@@ -55,7 +55,7 @@ export class TurnSignal<T>
             }
             catch (e)
             {
-                console.error(TurnSignal.HandlerFailedMessage, e)
+                console.error(TypedSignal.HandlerFailedMessage, e)
             }
         }
     }

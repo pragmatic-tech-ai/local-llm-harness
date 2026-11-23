@@ -1,6 +1,6 @@
-import { JsonRpcConnection, TurnSignal } from './JsonRpcConnection'
+import { JsonRpcConnection, TypedSignal } from './JsonRpcConnection'
 
-export { TurnSignal }
+export { TypedSignal }
 export type { IHarnessSocket, HarnessSocketFactory, IDisposable } from './JsonRpcConnection'
 
 export interface SamplingConfig
@@ -105,14 +105,14 @@ export class HarnessClient extends JsonRpcConnection
     private static readonly NoteToolResult = 'tool_result'
     private static readonly NoteLoopDone = 'loop_done'
 
-    public readonly OnTurnStarted = new TurnSignal<TurnStarted>()
-    public readonly OnTurnChunk = new TurnSignal<TurnChunk>()
-    public readonly OnTurnDone = new TurnSignal<Record<string, never>>()
-    public readonly OnTurnError = new TurnSignal<TurnError>()
-    public readonly OnTurnRejected = new TurnSignal<TurnRejected>()
-    public readonly OnToolCall = new TurnSignal<ToolCallNote>()
-    public readonly OnToolResult = new TurnSignal<ToolResultNote>()
-    public readonly OnLoopDone = new TurnSignal<LoopDone>()
+    public readonly OnTurnStarted = new TypedSignal<TurnStarted>()
+    public readonly OnTurnChunk = new TypedSignal<TurnChunk>()
+    public readonly OnTurnDone = new TypedSignal<Record<string, never>>()
+    public readonly OnTurnError = new TypedSignal<TurnError>()
+    public readonly OnTurnRejected = new TypedSignal<TurnRejected>()
+    public readonly OnToolCall = new TypedSignal<ToolCallNote>()
+    public readonly OnToolResult = new TypedSignal<ToolResultNote>()
+    public readonly OnLoopDone = new TypedSignal<LoopDone>()
 
     public ModelProps(): Promise<ModelProps>
     {

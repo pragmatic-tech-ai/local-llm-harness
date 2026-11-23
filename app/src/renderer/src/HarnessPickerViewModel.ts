@@ -1,5 +1,5 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { TurnSignal, type IDisposable } from './JsonRpcConnection'
+import { TypedSignal, type IDisposable } from './JsonRpcConnection'
 import type { HarnessInfo, ModelInfo, RuntimeInfo, SupervisorClient } from './SupervisorClient'
 
 /** Runtime/model picker over the supervisor: lists choices, starts/stops a harness, tracks its lifecycle state. */
@@ -46,8 +46,8 @@ export class HarnessPickerViewModel extends Observable
 
     public readonly Runtimes = new ObservableCollection<RuntimeInfo>()
     public readonly Models = new ObservableCollection<ModelInfo>()
-    public readonly OnReady = new TurnSignal<string>()
-    public readonly OnCleared = new TurnSignal<void>()
+    public readonly OnReady = new TypedSignal<string>()
+    public readonly OnCleared = new TypedSignal<void>()
 
     private client: SupervisorClient | null = null
     private harnessSubscription: IDisposable | null = null
