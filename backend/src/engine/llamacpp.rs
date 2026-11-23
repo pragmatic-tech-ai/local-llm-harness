@@ -342,11 +342,16 @@ impl Engine for LocalLlamaEngine {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
     async fn apply_template(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
         enable_thinking: bool,
+        tools: &[serde_json::Value],
     ) -> Result<String> {
         // Primary path: read the model's raw Jinja template from metadata and render it with the
         // crate-local `ChatTemplate`. This preserves the `enable_thinking` variable, which the
@@ -357,7 +362,7 @@ impl Engine for LocalLlamaEngine {
         let template = ChatTemplate::from_jinja(&src)
             .map_err(|e| EngineError::Protocol(format!("chat template compile failed: {e}")))?;
         template
-            .render(messages, add_generation_prompt, enable_thinking)
+            .render(messages, add_generation_prompt, enable_thinking, tools)
             .map_err(|e| EngineError::Protocol(format!("chat template render failed: {e}")))
     }
 

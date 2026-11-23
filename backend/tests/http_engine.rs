@@ -124,15 +124,9 @@ async fn apply_template_maps_llama_endpoint() {
 
     let engine = HttpEngine::new(server.uri());
     let messages = vec![
-        ChatMessage {
-            role: Role::System,
-            content: "be brief".into(),
-        },
-        ChatMessage {
-            role: Role::User,
-            content: "hi".into(),
-        },
+        ChatMessage::new(Role::System, "be brief"),
+        ChatMessage::new(Role::User, "hi"),
     ];
-    let prompt = engine.apply_template(&messages, true, false).await.unwrap();
+    let prompt = engine.apply_template(&messages, true, false, &[]).await.unwrap();
     assert_eq!(prompt, "RENDERED");
 }

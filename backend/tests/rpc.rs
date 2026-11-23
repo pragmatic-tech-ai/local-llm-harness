@@ -54,6 +54,7 @@ impl Engine for FakeEngine {
         _messages: &[ChatMessage],
         _add_generation_prompt: bool,
         _enable_thinking: bool,
+        _tools: &[serde_json::Value],
     ) -> Result<String> {
         Ok("RENDERED".to_string())
     }

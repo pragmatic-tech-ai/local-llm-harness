@@ -30,12 +30,65 @@ pub enum Role {
     System,
     User,
     Assistant,
+    Tool,
+}
+
+/// A function invocation requested by the model (OpenAI-style shape).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<serde_json::Value>,
+}
+
+impl ChatMessage {
+    /// A plain text message with no tool data.
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            tool_result: None,
+        }
+    }
+
+    /// The JSON shape handed to chat templates: `{role, content, tool_calls?, tool_call_id?}`.
+    /// For `Role::Tool` messages `content` carries the structured `tool_result` (the template
+    /// formats it), falling back to the plain text when no result is set.
+    pub fn template_view(&self) -> serde_json::Value {
+        let content = match (&self.role, &self.tool_result) {
+            (Role::Tool, Some(result)) => result.clone(),
+            _ => serde_json::Value::String(self.content.clone()),
+        };
+        let mut view = serde_json::json!({ "role": self.role, "content": content });
+        if let Some(calls) = &self.tool_calls {
+            view["tool_calls"] = serde_json::json!(calls);
+        }
+        if let Some(id) = &self.tool_call_id {
+            view["tool_call_id"] = serde_json::json!(id);
+        }
+        view
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -147,6 +200,43 @@ mod tests {
                 ..SamplingConfig::default()
             }
         );
+    }
+
+    #[test]
+    fn chat_message_serde_omits_absent_tool_fields_and_round_trips() {
+        let plain = ChatMessage::new(Role::User, "hi");
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"role":"user","content":"hi"}"#
+        );
+        let back: ChatMessage = serde_json::from_str(r#"{"role":"tool","content":""}"#).unwrap();
+        assert_eq!(back.role, Role::Tool);
+
+        let mut call = ChatMessage::new(Role::Assistant, "");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "f".into(),
+                arguments: serde_json::json!({"a": 1}),
+            },
+        }]);
+        let json = serde_json::to_string(&call).unwrap();
+        assert!(json.contains(r#""type":"function""#));
+        assert_eq!(serde_json::from_str::<ChatMessage>(&json).unwrap(), call);
+    }
+
+    #[test]
+    fn template_view_uses_tool_result_as_content_for_tool_role() {
+        let mut tool = ChatMessage::new(Role::Tool, "ignored");
+        tool.tool_call_id = Some("c1".into());
+        tool.tool_result = Some(serde_json::json!({"x": 1}));
+        let v = tool.template_view();
+        assert_eq!(v["role"], "tool");
+        assert_eq!(v["content"], serde_json::json!({"x": 1}));
+        assert_eq!(v["tool_call_id"], "c1");
+        let user = ChatMessage::new(Role::User, "hi").template_view();
+        assert_eq!(user, serde_json::json!({"role":"user","content":"hi"}));
     }
 
     #[test]

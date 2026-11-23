@@ -137,7 +137,13 @@ impl Engine for HttpEngine {
         messages: &[ChatMessage],
         add_generation_prompt: bool,
         enable_thinking: bool,
+        tools: &[serde_json::Value],
     ) -> Result<String> {
+        if !tools.is_empty() {
+            return Err(EngineError::Protocol(
+                "tools are not supported by the http engine".into(),
+            ));
+        }
         let body = json!({
             "messages": messages,
             "add_generation_prompt": add_generation_prompt,

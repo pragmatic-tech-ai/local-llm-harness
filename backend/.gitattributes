@@ -3,3 +3,4 @@
 # (the repo-wide `* text=auto eol=lf`) would break the checksum and fail the build on
 # checkout — notably on the Windows hive. Keep these verbatim and out of diffs/stats.
 vendor/** -text -diff linguist-vendored linguist-generated
+tests/fixtures/*.jinja -text

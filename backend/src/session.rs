@@ -60,10 +60,7 @@ impl ChatSession {
     pub fn new(engine: Arc<dyn Engine>, props: ModelProps, system: Option<String>) -> Self {
         let messages = system
             .map(|content| {
-                vec![ChatMessage {
-                    role: Role::System,
-                    content,
-                }]
+                vec![ChatMessage::new(Role::System, content)]
             })
             .unwrap_or_default();
         Self {
@@ -120,10 +117,7 @@ impl ChatSession {
         cfg: &SamplingConfig,
         enable_thinking: bool,
     ) -> std::result::Result<Turn, TurnFailure> {
-        let user_message = ChatMessage {
-            role: Role::User,
-            content: user.to_string(),
-        };
+        let user_message = ChatMessage::new(Role::User, user);
         let mut candidate = self.messages();
         candidate.push(user_message.clone());
         let prompt = Self::render(&*self.engine, &candidate, enable_thinking)
@@ -171,10 +165,7 @@ impl ChatSession {
                         if let Some(user_message) = pending.take() {
                             let mut history = history.lock().expect("messages lock");
                             history.push(user_message);
-                            history.push(ChatMessage {
-                                role: Role::Assistant,
-                                content: std::mem::take(&mut reply),
-                            });
+                            history.push(ChatMessage::new(Role::Assistant, std::mem::take(&mut reply)));
                         }
                     }
                 }
@@ -193,7 +184,9 @@ impl ChatSession {
         messages: &[ChatMessage],
         enable_thinking: bool,
     ) -> Result<String> {
-        engine.apply_template(messages, true, enable_thinking).await
+        engine
+            .apply_template(messages, true, enable_thinking, &[])
+            .await
     }
 }
 
@@ -254,6 +247,7 @@ mod tests {
             messages: &[ChatMessage],
             add_generation_prompt: bool,
             enable_thinking: bool,
+            _tools: &[serde_json::Value],
         ) -> Result<String> {
             self.template_calls.lock().unwrap().push((
                 messages.to_vec(),
@@ -272,10 +266,7 @@ mod tests {
     }
 
     fn msg(role: Role, content: &str) -> ChatMessage {
-        ChatMessage {
-            role,
-            content: content.into(),
-        }
+        ChatMessage::new(role, content)
     }
 
     #[tokio::test]

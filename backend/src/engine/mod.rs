@@ -52,5 +52,11 @@ pub trait Engine: Send + Sync {
         messages: &[ChatMessage],
         add_generation_prompt: bool,
         enable_thinking: bool,
+        tools: &[serde_json::Value],
     ) -> Result<String>;
+
+    /// Whether this engine can render tool declarations into its prompt.
+    fn supports_tools(&self) -> bool {
+        false
+    }
 }

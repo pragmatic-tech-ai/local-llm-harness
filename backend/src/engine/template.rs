@@ -2,8 +2,9 @@
 //! chat template.
 
 use minijinja::{context, Environment, Error, ErrorKind};
+use serde_json::Value;
 
-use super::types::{ChatMessage, Role};
+use super::types::ChatMessage;
 
 const TEMPLATE_NAME: &str = "chat";
 
@@ -43,11 +44,13 @@ impl ChatTemplate {
         messages: &[ChatMessage],
         add_generation_prompt: bool,
         enable_thinking: bool,
+        tools: &[Value],
     ) -> Result<String, TemplateError> {
         let msgs: Vec<_> = messages
             .iter()
-            .map(|m| context! { role => Self::role_str(&m.role), content => &m.content })
+            .map(|m| minijinja::Value::from_serialize(m.template_view()))
             .collect();
+        let tools = minijinja::Value::from_serialize(tools);
         let tmpl = self
             .env
             .get_template(TEMPLATE_NAME)
@@ -56,35 +59,23 @@ impl ChatTemplate {
             messages => msgs,
             add_generation_prompt => add_generation_prompt,
             enable_thinking => enable_thinking,
+            tools => tools,
             // llama.cpp adds the BOS token itself at tokenization, so the template must not.
             bos_token => "",
         })
         .map_err(|e| TemplateError::Render(e.to_string()))
-    }
-
-    fn role_str(role: &Role) -> &'static str {
-        match role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::types::{FunctionCall, Role, ToolCall};
 
     fn msgs() -> Vec<ChatMessage> {
         vec![
-            ChatMessage {
-                role: Role::System,
-                content: "be nice".into(),
-            },
-            ChatMessage {
-                role: Role::User,
-                content: "hi".into(),
-            },
+            ChatMessage::new(Role::System, "be nice"),
+            ChatMessage::new(Role::User, "hi"),
         ]
     }
 
@@ -94,11 +85,11 @@ mod tests {
     fn renders_roles_and_generation_prompt() {
         let t = ChatTemplate::from_jinja(CHAT).unwrap();
         assert_eq!(
-            t.render(&msgs(), true, false).unwrap(),
+            t.render(&msgs(), true, false, &[]).unwrap(),
             "<start>system\nbe nice<end><start>user\nhi<end><start>assistant\n"
         );
         assert_eq!(
-            t.render(&msgs(), false, false).unwrap(),
+            t.render(&msgs(), false, false, &[]).unwrap(),
             "<start>system\nbe nice<end><start>user\nhi<end>"
         );
     }
@@ -106,16 +97,16 @@ mod tests {
     #[test]
     fn enable_thinking_variable_is_available() {
         let t = ChatTemplate::from_jinja("{% if enable_thinking %}THINK{% endif %}").unwrap();
-        assert_eq!(t.render(&msgs(), false, true).unwrap(), "THINK");
-        assert_eq!(t.render(&msgs(), false, false).unwrap(), "");
+        assert_eq!(t.render(&msgs(), false, true, &[]).unwrap(), "THINK");
+        assert_eq!(t.render(&msgs(), false, false, &[]).unwrap(), "");
     }
 
     #[test]
     fn enable_thinking_ignored_when_unreferenced() {
         let t = ChatTemplate::from_jinja(CHAT).unwrap();
         assert_eq!(
-            t.render(&msgs(), true, true).unwrap(),
-            t.render(&msgs(), true, false).unwrap()
+            t.render(&msgs(), true, true, &[]).unwrap(),
+            t.render(&msgs(), true, false, &[]).unwrap()
         );
     }
 
@@ -131,7 +122,7 @@ mod tests {
     fn raise_exception_yields_render_error() {
         let t = ChatTemplate::from_jinja("{{ raise_exception('nope') }}").unwrap();
         assert!(matches!(
-            t.render(&msgs(), false, false),
+            t.render(&msgs(), false, false, &[]),
             Err(TemplateError::Render(_))
         ));
     }
@@ -139,7 +130,7 @@ mod tests {
     #[test]
     fn bos_token_is_empty() {
         let t = ChatTemplate::from_jinja("[{{ bos_token }}]").unwrap();
-        assert_eq!(t.render(&msgs(), false, false).unwrap(), "[]");
+        assert_eq!(t.render(&msgs(), false, false, &[]).unwrap(), "[]");
     }
 
     #[test]
@@ -148,10 +139,59 @@ mod tests {
             "{% for m in messages %}{{ m.content.strip() }}{% if m.role.startswith('us') %}!{% endif %}{% endfor %}",
         )
         .unwrap();
-        let m = vec![ChatMessage {
-            role: Role::User,
-            content: "  hi  ".into(),
-        }];
-        assert_eq!(t.render(&m, false, false).unwrap(), "hi!");
+        let m = vec![ChatMessage::new(Role::User, "  hi  ")];
+        assert_eq!(t.render(&m, false, false, &[]).unwrap(), "hi!");
+    }
+
+    const GEMMA4: &str = include_str!("../../tests/fixtures/gemma4-chat-template.jinja");
+
+    fn time_tool() -> Value {
+        serde_json::json!({"type":"function","function":{"name":"get_time","description":"Current time","parameters":{"type":"object","properties":{}}}})
+    }
+
+    #[test]
+    fn gemma4_declares_tools_in_system_turn() {
+        let t = ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let m = vec![ChatMessage::new(Role::User, "what time is it?")];
+        let prompt = t.render(&m, true, false, &[time_tool()]).unwrap();
+        assert!(
+            prompt.contains("declaration:get_time{description:<|\"|>Current time<|\"|>"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn gemma4_renders_assistant_tool_calls_and_tool_results() {
+        let t = ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let mut assistant = ChatMessage::new(Role::Assistant, "");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "get_time".into(),
+                arguments: serde_json::json!({}),
+            },
+        }]);
+        let mut tool = ChatMessage::new(Role::Tool, "");
+        tool.tool_call_id = Some("call_1".into());
+        tool.tool_result = Some(serde_json::json!({"utc": "2026-11-23T13:05:00Z"}));
+        let m = vec![ChatMessage::new(Role::User, "q"), assistant, tool];
+        let prompt = t.render(&m, true, false, &[time_tool()]).unwrap();
+        assert!(
+            prompt.contains("<|tool_call>call:get_time{}<tool_call|>"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("<|tool_response>response:get_time{utc:<|\"|>2026-11-23T13:05:00Z<|\"|>}<tool_response|>"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn gemma4_without_tools_has_no_declarations() {
+        let t = ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let m = vec![ChatMessage::new(Role::User, "hi")];
+        let prompt = t.render(&m, true, false, &[]).unwrap();
+        assert!(!prompt.contains("declaration:"), "{prompt}");
     }
 }

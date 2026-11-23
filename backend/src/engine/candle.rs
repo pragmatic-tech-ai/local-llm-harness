@@ -353,11 +353,16 @@ impl Engine for CandleEngine {
             .map_err(|e| EngineError::Protocol(format!("detokenize failed: {e}")))
     }
 
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
     async fn apply_template(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
         enable_thinking: bool,
+        tools: &[serde_json::Value],
     ) -> Result<String> {
         let src = self.chat_template.as_ref().ok_or_else(|| {
             EngineError::Protocol(format!("model has no `{CHAT_TEMPLATE_KEY}` metadata"))
@@ -365,7 +370,7 @@ impl Engine for CandleEngine {
         let template = ChatTemplate::from_jinja(src)
             .map_err(|e| EngineError::Protocol(format!("chat template compile failed: {e}")))?;
         template
-            .render(messages, add_generation_prompt, enable_thinking)
+            .render(messages, add_generation_prompt, enable_thinking, tools)
             .map_err(|e| EngineError::Protocol(format!("chat template render failed: {e}")))
     }
 
@@ -487,16 +492,10 @@ mod tests {
         const CHAT: &str = "{% for m in messages %}<start_of_turn>{{ m.role }}\n{{ m.content }}<end_of_turn>\n{% endfor %}{% if add_generation_prompt %}<start_of_turn>model\n{% endif %}";
         let template = ChatTemplate::from_jinja(CHAT).unwrap();
         let messages = vec![
-            ChatMessage {
-                role: Role::User,
-                content: "hi".into(),
-            },
-            ChatMessage {
-                role: Role::Assistant,
-                content: "hello".into(),
-            },
+            ChatMessage::new(Role::User, "hi"),
+            ChatMessage::new(Role::Assistant, "hello"),
         ];
-        let rendered = template.render(&messages, true, false).unwrap();
+        let rendered = template.render(&messages, true, false, &[]).unwrap();
         assert_eq!(
             rendered,
             "<start_of_turn>user\nhi<end_of_turn>\n<start_of_turn>assistant\nhello<end_of_turn>\n<start_of_turn>model\n"
