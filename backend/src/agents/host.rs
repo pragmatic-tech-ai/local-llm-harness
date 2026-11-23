@@ -116,6 +116,11 @@ pub struct LocalSupervisorHost {
     models: StdMutex<Vec<DiscoveredModel>>,
     /// Serialises `ensure_ready` so concurrent callers don't restart each other's harness.
     loading: Mutex<()>,
+    /// Change signal handed to subscribers.
+    events: broadcast::Sender<()>,
+    /// The single task forwarding the harness's events into `events`, started by the first
+    /// `subscribe` and aborted when the host is dropped.
+    forwarder: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl LocalSupervisorHost {
@@ -133,6 +138,8 @@ impl LocalSupervisorHost {
             models: StdMutex::new(discover(catalog)),
             catalog: catalog.clone(),
             loading: Mutex::new(()),
+            events: broadcast::channel(Self::EVENT_CAPACITY).0,
+            forwarder: StdMutex::new(None),
         }
     }
 
@@ -204,30 +211,42 @@ impl ModelHost for LocalSupervisorHost {
     }
 
     async fn unload(&self) -> Result<(), HostError> {
+        let _serial = self.loading.lock().await;
         self.harness
             .stop()
             .await
             .map_err(|e| HostError(e.to_string()))
     }
 
-    /// Forwards the manager's events as unit signals. One forwarder task per subscription; it
-    /// ends when the manager closes or the receiver is dropped (noticed on the next event).
+    /// Signals on every harness change. `tokio::sync::broadcast::Sender` has no `closed()`, so
+    /// instead of one task per subscription (which could only notice a dropped receiver on the
+    /// next event) a single forwarder task serves all subscribers; it ends when the harness's
+    /// channel closes or the host is dropped. Must be called inside a tokio runtime.
     fn subscribe(&self) -> broadcast::Receiver<()> {
-        let (tx, rx) = broadcast::channel(Self::EVENT_CAPACITY);
-        let mut source = self.harness.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match source.recv().await {
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if tx.send(()).is_err() {
-                            break;
+        let mut forwarder = self.forwarder.lock().unwrap();
+        if forwarder.is_none() {
+            let mut source = self.harness.subscribe();
+            let tx = self.events.clone();
+            *forwarder = Some(tokio::spawn(async move {
+                loop {
+                    match source.recv().await {
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = tx.send(());
                         }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-            }
-        });
-        rx
+            }));
+        }
+        self.events.subscribe()
+    }
+}
+
+impl Drop for LocalSupervisorHost {
+    fn drop(&mut self) {
+        if let Some(task) = self.forwarder.lock().unwrap().take() {
+            task.abort();
+        }
     }
 }
 
@@ -397,6 +416,8 @@ mod tests {
         starts: StdMutex<Vec<Start>>,
         stops: AtomicUsize,
         tx: broadcast::Sender<HarnessInfo>,
+        /// When set, `start` waits for a permit before completing.
+        gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
     }
 
     impl FakeHarness {
@@ -406,6 +427,7 @@ mod tests {
                 starts: StdMutex::new(Vec::new()),
                 stops: AtomicUsize::new(0),
                 tx: broadcast::channel(16).0,
+                gate: StdMutex::new(None),
             })
         }
 
@@ -457,6 +479,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((runtime.to_string(), model.to_string(), n_ctx));
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
             let info = Self::info(runtime, model, HarnessState::Ready, n_ctx);
             self.set(Some(info.clone()));
             let _ = self.tx.send(info.clone());
@@ -465,6 +491,13 @@ mod tests {
 
         async fn stop(&self) -> Result<(), ManagerError> {
             self.stops.fetch_add(1, Ordering::SeqCst);
+            if let Some(info) = self.current() {
+                let stopped = HarnessInfo {
+                    state: HarnessState::Stopped,
+                    ..info
+                };
+                let _ = self.tx.send(stopped);
+            }
             self.set(None);
             Ok(())
         }
@@ -639,6 +672,71 @@ mod tests {
         host.unload().await.unwrap();
         assert_eq!(harness.stops.load(Ordering::SeqCst), 1);
         assert_eq!(host.state(), HostState::default());
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("unload signals a change")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn forwarder_ends_when_host_is_dropped() {
+        let (host, harness) = Fixtures::host("fwd");
+        let _rx1 = host.subscribe();
+        let _rx2 = host.subscribe();
+        tokio::task::yield_now().await;
+        // One forwarder for all subscribers, holding exactly one harness subscription.
+        assert_eq!(harness.tx.receiver_count(), 1);
+        drop(host);
+        for _ in 0..50 {
+            if harness.tx.receiver_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(harness.tx.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unload_waits_for_an_in_flight_load() {
+        let (host, harness) = Fixtures::host("serial");
+        let host = Arc::new(host);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *harness.gate.lock().unwrap() = Some(Arc::clone(&gate));
+        let loader = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.ensure_ready(&Fixtures::req("gemma", 8192)).await })
+        };
+        while harness.starts().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let unloader = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.unload().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(harness.stops.load(Ordering::SeqCst), 0, "unload must wait");
+        gate.add_permits(1);
+        loader.await.unwrap().unwrap();
+        unloader.await.unwrap().unwrap();
+        assert_eq!(harness.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(host.state(), HostState::default());
+    }
+
+    #[tokio::test]
+    async fn every_served_model_resolves_for_start() {
+        use crate::supervisor::discovery::resolve_model;
+        let catalog = Fixtures::catalog("resolve");
+        let dir = catalog.model_dirs[0].clone();
+        std::fs::write(dir.join("Mixed.Name-Q4.GGUF"), Fixtures::gguf("llama")).unwrap();
+        let models = discover(&catalog);
+        assert!(models.len() >= 2);
+        for m in models {
+            assert!(
+                resolve_model(&catalog, &m.display_name).is_some(),
+                "{} must resolve",
+                m.display_name
+            );
+        }
     }
 
     #[tokio::test]
