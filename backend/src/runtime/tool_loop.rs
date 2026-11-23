@@ -71,6 +71,7 @@ pub struct ToolLoop {
 }
 
 impl ToolLoop {
+    const M_TOOL_CALL: &'static str = "tool_call";
     const M_TURN_DONE: &'static str = "turn_done";
     const M_TURN_REJECTED: &'static str = "turn_rejected";
     const M_TURN_ERROR: &'static str = "turn_error";
@@ -80,7 +81,11 @@ impl ToolLoop {
     const BAD_TURN_DONE: &'static str = "worker sent a malformed turn_done";
     const KIND_FUNCTION: &'static str = "function";
     const SUPPORTS_TOOLS: &'static str = "supports_tools";
+    const FIELD_ID: &'static str = "id";
+    const CALL_ID_PREFIX: &'static str = "call_";
 
+    /// `step_cap` is the maximum number of generate calls per user message; `0` means no
+    /// generate call is made and every run ends `StepLimit` with 0 steps.
     pub fn new(executor: Arc<ToolExecutor>, registry: Arc<ToolRegistry>, step_cap: usize) -> Self {
         Self {
             executor,
@@ -93,6 +98,13 @@ impl ToolLoop {
     /// committed to `session` only when the loop ends `Answered`; any other end (including a
     /// closed sink) leaves the transcript as it was. A closed sink aborts at once with
     /// `Err(SinkClosed)`; dropping the in-flight stream makes the worker stop generating.
+    ///
+    /// The runtime is the authority on call ids. The worker numbers calls from `call_1` on
+    /// every `generate`, so ids repeat across steps and the chat template could bind a later
+    /// result to an earlier call. Each call is renamed `call_{k}`, with k counting every tool
+    /// call already in the scratch transcript plus its position in the step. The relayed
+    /// `tool_call` notes are the one exception to verbatim relay: only their `id` is rewritten
+    /// (by position, matching the order of `turn_done.tool_calls`).
     ///
     /// A failing `model_props` ends the loop with `Error` and a `turn_error` carrying the
     /// link error: without it we cannot know whether to send tools, and guessing would either
@@ -138,19 +150,25 @@ impl ToolLoop {
                 Ok(stream) => stream,
                 Err(e) => return Self::fail(sink, steps, &e.0).await,
             };
-            let done = match Self::read_step(stream, sink).await? {
+            let base = Self::calls_in(&scratch);
+            let done = match Self::read_step(stream, base, sink).await? {
                 StepEnd::Done(done) => done,
                 StepEnd::Rejected => return Self::finish(sink, steps, EndReason::WindowFull).await,
                 StepEnd::WorkerError => return Self::finish(sink, steps, EndReason::Error).await,
                 StepEnd::Broken(message) => return Self::fail(sink, steps, &message).await,
             };
-            let Some((text, calls)) = Self::parse_done(&done) else {
+            let Some((text, mut calls)) = Self::parse_done(&done) else {
                 return Self::fail(sink, steps, Self::BAD_TURN_DONE).await;
             };
+            for (i, call) in calls.iter_mut().enumerate() {
+                call.id = Self::call_id(base + i);
+            }
             scratch.push(Self::assistant_message(&text, &calls));
             if calls.is_empty() {
+                // Commit only once the client has been told; a closed sink keeps the old state.
+                let end = Self::finish(sink, steps, EndReason::Answered).await?;
                 session.transcript = scratch;
-                return Self::finish(sink, steps, EndReason::Answered).await;
+                return Ok(end);
             }
             if steps == self.step_cap {
                 break;
@@ -174,11 +192,20 @@ impl ToolLoop {
     /// Relays notes verbatim until one ends the step; a closed sink drops the stream.
     async fn read_step(
         mut stream: BoxStream<'static, Result<Note, LinkError>>,
+        base: usize,
         sink: &mut dyn LoopSink,
     ) -> Result<StepEnd, SinkClosed> {
+        let mut seen_calls = 0;
         loop {
             match stream.next().await {
-                Some(Ok(note)) => {
+                Some(Ok(mut note)) => {
+                    if note.method == Self::M_TOOL_CALL {
+                        if let Some(fields) = note.params.as_object_mut() {
+                            let id = Self::call_id(base + seen_calls);
+                            fields.insert(Self::FIELD_ID.into(), Value::String(id));
+                        }
+                        seen_calls += 1;
+                    }
                     sink.notify(&note.method, note.params.clone()).await?;
                     match note.method.as_str() {
                         Self::M_TURN_DONE => return Ok(StepEnd::Done(note.params)),
@@ -191,6 +218,20 @@ impl ToolLoop {
                 None => return Ok(StepEnd::Broken(Self::STREAM_ENDED.into())),
             }
         }
+    }
+
+    /// Number of tool calls already in `messages`.
+    fn calls_in(messages: &[ChatMessage]) -> usize {
+        messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// The runtime id of the call at zero-based index `index` within the turn.
+    fn call_id(index: usize) -> String {
+        format!("{}{}", Self::CALL_ID_PREFIX, index + 1)
     }
 
     /// `(content, calls)` from `turn_done` params; `None` if the calls are malformed.
@@ -280,12 +321,14 @@ impl ToolLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::template::ChatTemplate;
     use crate::runtime::policy::ReadOnlyPolicy;
     use crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink, Scripted};
     use crate::runtime::test_tools::TestSource;
     use std::time::Duration;
 
     const CAP: usize = 8;
+    const GEMMA4: &str = include_str!("../../tests/fixtures/gemma4-chat-template.jinja");
 
     struct Fixture {
         tool_loop: ToolLoop,
@@ -323,11 +366,10 @@ mod tests {
         }
 
         fn step(content: &str, calls: Vec<Value>) -> Scripted {
-            Notes::script(vec![
-                Notes::started(),
-                Notes::chunk(),
-                Notes::done(content, calls),
-            ])
+            let mut notes = vec![Notes::started(), Notes::chunk()];
+            notes.extend(calls.iter().map(|c| Notes::note("tool_call", c.clone())));
+            notes.push(Notes::done(content, calls));
+            Notes::script(notes)
         }
 
         fn last(&self) -> &Note {
@@ -675,5 +717,129 @@ mod tests {
         f.run(Some(link.clone())).await.unwrap();
         assert_eq!(link.requests()[0].messages.len(), 3);
         assert_eq!(f.session.transcript().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn call_ids_are_unique_across_steps_and_consistent() {
+        let mut f = Fixture::new();
+        let link = FakeLink::new(
+            true,
+            vec![
+                Fixture::step(
+                    "",
+                    vec![Notes::call("call_1", "echo", json!({"text": "a"}))],
+                ),
+                Fixture::step("", vec![Notes::call("call_1", "nope", json!({}))]),
+                Fixture::step("done", vec![]),
+            ],
+        );
+        let end = f.run(Some(link)).await.unwrap();
+        assert_eq!(end.reason, EndReason::Answered);
+        let relayed: Vec<&Note> = f
+            .sink
+            .notes
+            .iter()
+            .filter(|n| n.method == "tool_call")
+            .collect();
+        let relayed_ids: Vec<&Value> = relayed.iter().map(|n| &n.params["id"]).collect();
+        assert_eq!(relayed_ids, [&json!("call_1"), &json!("call_2")]);
+        let results = f.tool_results();
+        let result_ids: Vec<&Value> = results.iter().map(|n| &n.params["id"]).collect();
+        assert_eq!(result_ids, relayed_ids);
+        let t = f.session.transcript();
+        assert_eq!(t[1].tool_calls.as_ref().unwrap()[0].id, "call_1");
+        assert_eq!(t[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(t[3].tool_calls.as_ref().unwrap()[0].id, "call_2");
+        assert_eq!(t[4].tool_call_id.as_deref(), Some("call_2"));
+
+        let template = ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let prompt = template
+            .render(t, true, false, &f.registry.openai_tools())
+            .unwrap();
+        let echo_at = prompt.find("<|tool_response>response:echo").expect("echo");
+        let nope_at = prompt.find("<|tool_response>response:nope").expect("nope");
+        assert!(echo_at < nope_at, "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn two_calls_in_one_step_keep_order() {
+        let mut f = Fixture::new();
+        let calls = vec![
+            Notes::call("call_1", "echo", json!({"text": "a"})),
+            Notes::call("call_2", "echo", json!({"text": "b"})),
+        ];
+        let link = FakeLink::new(
+            true,
+            vec![Fixture::step("", calls), Fixture::step("done", vec![])],
+        );
+        f.run(Some(link)).await.unwrap();
+        let results = f.tool_results();
+        let contents: Vec<&Value> = results.iter().map(|n| &n.params["content"]).collect();
+        assert_eq!(contents, [&json!({"text": "a"}), &json!({"text": "b"})]);
+        let t = f.session.transcript();
+        assert_eq!(t.len(), 5);
+        assert_eq!(t[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(t[2].tool_result, Some(json!({"text": "a"})));
+        assert_eq!(t[3].tool_call_id.as_deref(), Some("call_2"));
+        assert_eq!(t[3].tool_result, Some(json!({"text": "b"})));
+    }
+
+    #[tokio::test]
+    async fn non_object_arguments_are_committed_as_empty_object() {
+        let mut f = Fixture::new();
+        let call = Notes::call("call_1", "echo", json!([1]));
+        let link = FakeLink::new(
+            true,
+            vec![Fixture::step("", vec![call]), Fixture::step("ok", vec![])],
+        );
+        f.run(Some(link)).await.unwrap();
+        let args = &f.session.transcript()[1].tool_calls.as_ref().unwrap()[0]
+            .function
+            .arguments;
+        assert_eq!(args, &json!({}));
+    }
+
+    #[tokio::test]
+    async fn missing_supports_tools_means_no_tools() {
+        let mut f = Fixture::new();
+        let link = FakeLink::with_props(json!({}), vec![Fixture::step("hi", vec![])]);
+        f.run(Some(link.clone())).await.unwrap();
+        assert!(link.requests()[0].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_turn_done_calls_is_error() {
+        let mut f = Fixture::new();
+        let bad = Notes::note("turn_done", json!({"content": "", "tool_calls": "nope"}));
+        let link = FakeLink::new(true, vec![Notes::script(vec![Notes::started(), bad])]);
+        let end = f.run(Some(link)).await.unwrap();
+        assert_eq!(end.reason, EndReason::Error);
+        let at = f.sink.notes.len() - 2;
+        assert_eq!(f.sink.notes[at].method, "turn_error");
+        assert_eq!(f.sink.notes[at].params["message"], ToolLoop::BAD_TURN_DONE);
+        assert!(f.session.transcript().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sink_closed_at_loop_done_leaves_transcript() {
+        let mut f = Fixture::new();
+        // started, chunk, done accepted; loop_done refused.
+        f.sink = RecordingSink::closing_after(3);
+        let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+        assert_eq!(f.run(Some(link)).await, Err(SinkClosed));
+        assert!(f.session.transcript().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sink_closed_at_failure_turn_error_leaves_transcript() {
+        let mut f = Fixture::new();
+        // started, chunk accepted; the synthesized turn_error is refused.
+        f.sink = RecordingSink::closing_after(2);
+        let link = FakeLink::new(
+            true,
+            vec![Notes::script(vec![Notes::started(), Notes::chunk()])],
+        );
+        assert_eq!(f.run(Some(link)).await, Err(SinkClosed));
+        assert!(f.session.transcript().is_empty());
     }
 }

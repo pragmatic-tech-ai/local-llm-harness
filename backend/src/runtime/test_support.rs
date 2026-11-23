@@ -75,6 +75,16 @@ impl FakeLink {
         })
     }
 
+    /// Like `new`, with arbitrary `model_props` output.
+    pub(crate) fn with_props(props: Value, scripts: Vec<Scripted>) -> Arc<Self> {
+        Arc::new(Self {
+            props: Ok(props),
+            scripts: Mutex::new(scripts.into()),
+            repeat_last: false,
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
     /// Every `generate` call replays `script`.
     pub(crate) fn repeating(supports_tools: bool, script: Scripted) -> Arc<Self> {
         Arc::new(Self {
