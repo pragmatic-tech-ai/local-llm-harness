@@ -16,9 +16,10 @@ use crate::engine::SamplingConfig;
 
 const EXT: &str = "json";
 const ID_PREFIX: &str = "s";
+const TITLE_SEP: &str = " #";
+const MILLIS_PER_SEC: u64 = 1000;
 const ERR_UNKNOWN: &str = "unknown session: ";
-const ERR_LOCK: &str = "session store lock poisoned";
-const ERR_SKIPPED: &str = "skipping unreadable session file";
+const LOG_SKIPPED: &str = "skipping unreadable session file";
 const ERR_NO_NAME: &str = "no file name";
 
 /// An error from the session store; the message is user-presentable.
@@ -47,16 +48,29 @@ impl From<io::Error> for SessionError {
 
 /// Sessions persisted under one directory. Every mutation is written atomically before the
 /// in-memory copy changes, so a failed write leaves both unchanged.
+///
+/// All transcripts are held in memory and `get` returns a clone of the whole record, so
+/// callers should avoid calling it in a hot loop. A poisoned lock is recovered, not hidden.
 pub struct SessionStore {
     root: PathBuf,
     sessions: Mutex<HashMap<String, SessionRecord>>,
     counter: AtomicU64,
+    clock: Clock,
 }
+
+/// A source of unix milliseconds.
+type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
 
 impl SessionStore {
     /// Opens (creating if needed) the store at `root` and loads every `*.json`. Files that
     /// fail to parse are skipped with a message on stderr.
     pub fn open(root: &Path) -> io::Result<Self> {
+        Self::open_with_clock(root, Box::new(Self::system_millis))
+    }
+
+    /// Like [`open`](Self::open) with an injected clock returning unix milliseconds. Ids use
+    /// the clock's value directly and `created`/`updated` use it divided by 1000.
+    pub fn open_with_clock(root: &Path, clock: Clock) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         let mut sessions = HashMap::new();
         for entry in fs::read_dir(root)? {
@@ -68,13 +82,14 @@ impl SessionStore {
                 Ok(rec) => {
                     sessions.insert(rec.id.clone(), rec);
                 }
-                Err(e) => eprintln!("{ERR_SKIPPED} {}: {e}", path.display()),
+                Err(e) => eprintln!("{LOG_SKIPPED} {}: {e}", path.display()),
             }
         }
         Ok(Self {
             root: root.to_path_buf(),
             sessions: Mutex::new(sessions),
             counter: AtomicU64::new(0),
+            clock,
         })
     }
 
@@ -97,34 +112,45 @@ impl SessionStore {
         template_id: &str,
         template: &AgentTemplate,
     ) -> Result<SessionRecord, SessionError> {
-        let mut map = self.lock()?;
-        let n = 1 + map
-            .values()
-            .filter(|r| r.template_id == template_id)
-            .count();
+        let mut map = self.lock();
+        let n = 1 + Self::highest_number(map.values(), template_id, &template.name);
         let title = format!("{} #{n}", template.name);
         let mut id = self.next_id();
-        while map.contains_key(&id) {
+        // Never reuse an id whose file exists on disk (e.g. a skipped corrupt file).
+        while map.contains_key(&id) || self.file_for(&id).exists() {
             id = self.next_id();
         }
-        let rec = SessionRecord::new(id, title, template_id, template.clone(), Self::now_secs());
+        let rec = SessionRecord::new(id, title, template_id, template.clone(), self.now_secs());
         self.persist(&rec)?;
         map.insert(rec.id.clone(), rec.clone());
         Ok(rec)
     }
 
-    /// All sessions, newest `updated` first (ties by id for a stable order).
+    /// The highest `n` among titles of the form `{name} #{n}` for this template; renamed
+    /// sessions (titles without the template's name prefix) are ignored.
+    fn highest_number<'a>(
+        records: impl Iterator<Item = &'a SessionRecord>,
+        template_id: &str,
+        name: &str,
+    ) -> u64 {
+        let prefix = format!("{name}{TITLE_SEP}");
+        records
+            .filter(|r| r.template_id == template_id)
+            .filter_map(|r| r.title.strip_prefix(&prefix)?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// All sessions, newest `updated` first (ties by id descending for a stable order).
     pub fn list(&self) -> Vec<SessionSummary> {
-        let Ok(map) = self.lock() else {
-            return Vec::new();
-        };
+        let map = self.lock();
         let mut out: Vec<SessionSummary> = map.values().map(SessionRecord::summary).collect();
-        out.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.id.cmp(&b.id)));
+        out.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| b.id.cmp(&a.id)));
         out
     }
 
     pub fn get(&self, id: &str) -> Option<SessionRecord> {
-        self.lock().ok()?.get(id).cloned()
+        self.lock().get(id).cloned()
     }
 
     pub fn rename(&self, id: &str, title: &str) -> Result<(), SessionError> {
@@ -132,7 +158,7 @@ impl SessionStore {
     }
 
     pub fn delete(&self, id: &str) -> Result<(), SessionError> {
-        let mut map = self.lock()?;
+        let mut map = self.lock();
         if !map.contains_key(id) {
             return Err(SessionError::unknown(id));
         }
@@ -171,13 +197,13 @@ impl SessionStore {
 
     /// Applies `f` to a copy of the record, persists it, then swaps it in.
     fn mutate(&self, id: &str, f: impl FnOnce(&mut SessionRecord)) -> Result<(), SessionError> {
-        let mut map = self.lock()?;
+        let mut map = self.lock();
         let mut rec = map
             .get(id)
             .cloned()
             .ok_or_else(|| SessionError::unknown(id))?;
         f(&mut rec);
-        rec.updated = Self::now_secs();
+        rec.updated = self.now_secs();
         self.persist(&rec)?;
         map.insert(rec.id.clone(), rec);
         Ok(())
@@ -193,26 +219,25 @@ impl SessionStore {
         self.root.join(format!("{id}.{EXT}"))
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, HashMap<String, SessionRecord>>, SessionError> {
-        self.sessions
-            .lock()
-            .map_err(|_| SessionError(ERR_LOCK.to_string()))
+    /// Locks the map, recovering the data if a panicking thread poisoned the mutex.
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, SessionRecord>> {
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// `s-{unix_millis}-{counter}`: lowercase ASCII, safe as a filename on every platform.
     fn next_id(&self) -> String {
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("{ID_PREFIX}-{millis}-{n}")
+        format!("{ID_PREFIX}-{}-{n}", (self.clock)())
     }
 
-    fn now_secs() -> u64 {
+    fn now_secs(&self) -> u64 {
+        (self.clock)() / MILLIS_PER_SEC
+    }
+
+    fn system_millis() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
     }
 }
@@ -223,6 +248,7 @@ mod tests {
     use crate::agents::template::TemplateRules;
     use crate::agents::template_store::TemplateStore;
     use crate::engine::types::{FunctionCall, Role, ToolCall};
+    use std::sync::Arc;
 
     /// A unique temp directory removed on drop.
     struct TempDir(PathBuf);
@@ -238,6 +264,16 @@ mod tests {
 
         fn store(&self) -> SessionStore {
             SessionStore::open(&self.0.join("sessions")).unwrap()
+        }
+
+        /// A store whose clock is the shared millisecond counter `ms`.
+        fn clocked(&self, ms: &Arc<AtomicU64>) -> SessionStore {
+            let c = Arc::clone(ms);
+            SessionStore::open_with_clock(
+                &self.0.join("sessions"),
+                Box::new(move || c.load(Ordering::SeqCst)),
+            )
+            .unwrap()
         }
 
         fn sample(name: &str, prompt: &str) -> AgentTemplate {
@@ -349,7 +385,7 @@ mod tests {
         drop(s);
         let got = d.store().get(&rec.id).unwrap();
         assert_eq!(got.transcript, transcript);
-        assert!(got.updated >= rec.updated);
+        assert_eq!(got.created, rec.created);
     }
 
     #[test]
@@ -429,5 +465,110 @@ mod tests {
         assert!(s.commit("nope", vec![]).is_err());
         assert!(s.reset("nope").is_err());
         assert!(s.set_overrides("nope", None, None).is_err());
+    }
+
+    #[test]
+    fn create_never_overwrites_an_existing_id_file() {
+        let d = TempDir::new("collide");
+        let ms = Arc::new(AtomicU64::new(5_000));
+        let s = d.clocked(&ms);
+        let planted = d.0.join("sessions").join("s-5000-0.json");
+        fs::write(&planted, "{ corrupt").unwrap();
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        assert_eq!(rec.id, "s-5000-1");
+        assert_eq!(fs::read_to_string(&planted).unwrap(), "{ corrupt");
+    }
+
+    #[test]
+    fn title_numbers_do_not_repeat_after_delete() {
+        let d = TempDir::new("titles");
+        let s = d.store();
+        let t = TempDir::sample("R", "p");
+        let a = s.create("r", &t).unwrap();
+        let b = s.create("r", &t).unwrap();
+        assert_eq!(b.title, "R #2");
+        s.delete(&a.id).unwrap();
+        assert_eq!(s.create("r", &t).unwrap().title, "R #3");
+        // Renamed sessions and other templates are ignored.
+        s.rename(&b.id, "Custom #9").unwrap();
+        assert_eq!(s.create("r", &t).unwrap().title, "R #4");
+        assert_eq!(s.create("other", &t).unwrap().title, "R #1");
+    }
+
+    #[test]
+    fn list_orders_by_updated_then_id_descending_and_updated_bumps() {
+        let d = TempDir::new("order");
+        let ms = Arc::new(AtomicU64::new(10_000));
+        let s = d.clocked(&ms);
+        let t = TempDir::sample("R", "p");
+        let a = s.create("r", &t).unwrap();
+        let b = s.create("r", &t).unwrap();
+        assert_eq!(a.updated, 10);
+        // Same `updated`: id descending.
+        let ids: Vec<String> = s.list().into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec![b.id.clone(), a.id.clone()]);
+        // Each mutation bumps `updated`.
+        ms.store(11_000, Ordering::SeqCst);
+        s.rename(&a.id, "n").unwrap();
+        assert_eq!(s.get(&a.id).unwrap().updated, 11);
+        ms.store(12_000, Ordering::SeqCst);
+        s.set_overrides(&a.id, None, Some(true)).unwrap();
+        assert_eq!(s.get(&a.id).unwrap().updated, 12);
+        ms.store(13_000, Ordering::SeqCst);
+        s.reset(&a.id).unwrap();
+        assert_eq!(s.get(&a.id).unwrap().updated, 13);
+        ms.store(14_000, Ordering::SeqCst);
+        s.commit(&a.id, vec![]).unwrap();
+        assert_eq!(s.get(&a.id).unwrap().updated, 14);
+        assert_eq!(s.get(&b.id).unwrap().updated, 10);
+        assert_eq!(s.list()[0].id, a.id);
+    }
+
+    #[test]
+    fn concurrent_mutations_keep_both_effects_and_a_parseable_file() {
+        let d = TempDir::new("conc");
+        let s = Arc::new(d.store());
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        let transcript = TempDir::rich_transcript();
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let s = Arc::clone(&s);
+            let id = rec.id.clone();
+            let tr = transcript.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..10 {
+                    if i % 2 == 0 {
+                        s.commit(&id, tr.clone()).unwrap();
+                    } else {
+                        s.set_overrides(&id, None, Some(true)).unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let got = s.get(&rec.id).unwrap();
+        assert_eq!(got.transcript, transcript);
+        assert_eq!(got.enable_thinking, Some(true));
+        let text =
+            fs::read_to_string(d.0.join("sessions").join(format!("{}.json", rec.id))).unwrap();
+        assert_eq!(serde_json::from_str::<SessionRecord>(&text).unwrap(), got);
+    }
+
+    #[test]
+    fn poisoned_lock_is_recovered() {
+        let d = TempDir::new("poison");
+        let s = Arc::new(d.store());
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        let s2 = Arc::clone(&s);
+        let _ = std::thread::spawn(move || {
+            let _g = s2.sessions.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(s.sessions.is_poisoned());
+        assert!(s.get(&rec.id).is_some());
+        assert_eq!(s.list().len(), 1);
     }
 }
