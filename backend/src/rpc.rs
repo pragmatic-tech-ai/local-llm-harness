@@ -650,6 +650,12 @@ pub(crate) mod test_support {
         /// Sends one request; returns the notifications received before its response, then the
         /// response frame.
         pub(crate) async fn request(&mut self, method: &str, params: Value) -> (Vec<Value>, Value) {
+            let id = self.send_request(method, params).await;
+            self.response_to(id).await
+        }
+
+        /// Sends one request without waiting for its response; returns its id.
+        pub(crate) async fn send_request(&mut self, method: &str, params: Value) -> u64 {
             let id = self.next_id;
             self.next_id += 1;
             let frame = json!({"id": id, "method": method, "params": params});
@@ -657,6 +663,12 @@ pub(crate) mod test_support {
                 .send(Message::text(frame.to_string()))
                 .await
                 .expect("send");
+            id
+        }
+
+        /// Reads frames until the response to request `id`; returns the other frames read
+        /// before it, then the response frame.
+        pub(crate) async fn response_to(&mut self, id: u64) -> (Vec<Value>, Value) {
             let mut notes = Vec::new();
             while let Some(frame) = self.ws.next().await {
                 let Message::Text(text) = frame.expect("frame") else {

@@ -1,20 +1,19 @@
 use backend::agents::dispatcher::{Dispatcher, ExplicitLoadPolicy};
 use backend::agents::host::{LocalHarness, LocalSupervisorHost, ModelHost};
 use backend::agents::session_store::SessionStore;
-use backend::agents::template::TemplateRules;
 use backend::agents::template_store::{TemplateNode, TemplateStore};
 use backend::engine::{build_engine, EngineConfig, EngineKind};
 use backend::rpc;
 use backend::runtime::builtin::{BuiltinSource, Sandbox};
+use backend::runtime::catalog_source::DiscoveredCatalog;
 use backend::runtime::executor::ToolExecutor;
 use backend::runtime::hub::Hub;
 use backend::runtime::policy::ReadOnlyPolicy;
 use backend::runtime::registry::ToolRegistry;
-use backend::runtime::server::{CatalogView, PlacementWatcher, RuntimeDeps, RuntimeServer};
+use backend::runtime::server::{PlacementWatcher, RuntimeDeps, RuntimeServer};
 use backend::runtime::tool_loop::ToolLoop;
 use backend::supervisor::catalog::{Catalog, HostConfigs};
-use backend::supervisor::control::{self, CatalogListing};
-use backend::supervisor::discovery::discover;
+use backend::supervisor::control::{self, RuntimeStatus};
 use backend::supervisor::manager::{HarnessManager, ManagerConfig, ProcessLauncher, WsProbe};
 use clap::builder::BoolishValueParser;
 use clap::Parser;
@@ -86,17 +85,13 @@ impl Config {
     }
 
     /// Binds the runtime server's port. A failure degrades rather than aborts: the control
-    /// plane stays up and no `chat_url` is published.
-    async fn bind_runtime(addr: &str) -> Option<TcpListener> {
-        match TcpListener::bind(addr).await {
-            Ok(listener) => Some(listener),
-            Err(e) => {
-                eprintln!(
-                    "runtime bind {addr} failed: {e}; chat through the runtime is unavailable"
-                );
-                None
-            }
-        }
+    /// plane stays up, publishes no runtime url and reports the error from `hello`.
+    async fn bind_runtime(addr: &str) -> Result<TcpListener, String> {
+        TcpListener::bind(addr).await.map_err(|e| {
+            let reason = format!("runtime bind {addr} failed: {e}");
+            eprintln!("{reason}; chat through the runtime is unavailable");
+            reason
+        })
     }
 
     fn engine_config(&self) -> EngineConfig {
@@ -118,7 +113,8 @@ struct AgentsStack {
     host_names: Vec<String>,
     templates: TemplateStore,
     sessions: SessionStore,
-    view: CatalogView,
+    /// The editor's catalog and the template rules: models re-discovered on every read.
+    source: Arc<DiscoveredCatalog>,
 }
 
 impl AgentsStack {
@@ -136,28 +132,30 @@ impl AgentsStack {
     }
 
     /// Opens the template and session stores (an IO error means the agents data is
-    /// unavailable).
+    /// unavailable; the message says so).
     fn open(
         catalog: &Arc<Catalog>,
         host_names: Vec<String>,
         registry: &ToolRegistry,
     ) -> Result<Self, String> {
-        let rules = TemplateRules {
-            runtimes: catalog.runtimes.iter().map(|r| r.name.clone()).collect(),
-            models: discover(catalog)
-                .into_iter()
-                .map(|m| (m.display_name, m.runtimes))
-                .collect(),
-            tools: registry.specs().into_iter().map(|s| s.name).collect(),
-        };
-        let view = CatalogView {
-            runtimes: CatalogListing::runtimes(catalog),
-            models: CatalogListing::models(catalog),
-            hosts: host_names.clone(),
-        };
+        Self::open_stores(catalog, host_names, registry)
+            .map_err(|e| format!("{} {e}", Self::ERR_UNAVAILABLE))
+    }
+
+    fn open_stores(
+        catalog: &Arc<Catalog>,
+        host_names: Vec<String>,
+        registry: &ToolRegistry,
+    ) -> Result<Self, String> {
+        let source = Arc::new(DiscoveredCatalog::new(
+            Arc::clone(catalog),
+            registry.specs().into_iter().map(|s| s.name).collect(),
+            host_names.clone(),
+        ));
         let data_dir = catalog.agents.data_dir();
-        let templates = TemplateStore::open(&data_dir.join(Self::TEMPLATES_DIR), rules)
-            .map_err(|e| e.to_string())?;
+        let templates =
+            TemplateStore::open(&data_dir.join(Self::TEMPLATES_DIR), Arc::clone(&source))
+                .map_err(|e| e.to_string())?;
         let sessions =
             SessionStore::open(&data_dir.join(Self::SESSIONS_DIR)).map_err(|e| e.to_string())?;
         Ok(Self {
@@ -165,7 +163,7 @@ impl AgentsStack {
             host_names,
             templates,
             sessions,
-            view,
+            source,
         })
     }
 
@@ -193,7 +191,7 @@ impl AgentsStack {
             dispatcher: Arc::new(Dispatcher::new(hosts, Box::new(ExplicitLoadPolicy))),
             registry,
             tool_loop,
-            catalog: self.view,
+            catalog: self.source,
             hub: Arc::new(Hub::new()),
         }
     }
@@ -229,23 +227,29 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
     let tool_loop = Arc::new(ToolLoop::new(executor, registry.clone()));
     // The manager owns its catalog while the control server shares one via Arc: one clone.
     let shared = Arc::new(catalog.clone());
-    // A misconfigured host list aborts; unusable agents data only disables the runtime.
+    // A misconfigured host list aborts; unusable agents data only disables the runtime, and
+    // the control plane's `hello` says why.
     let host_names = AgentsStack::host_names(&shared)?;
-    let stack = match AgentsStack::open(&shared, host_names, &registry) {
-        Ok(stack) => Some(stack),
+    let runtime = match AgentsStack::open(&shared, host_names, &registry) {
+        Ok(stack) => Config::bind_runtime(&config.runtime_bind)
+            .await
+            .map(|listener| (stack, listener)),
         Err(e) => {
-            eprintln!("{} {e}", AgentsStack::ERR_UNAVAILABLE);
-            None
+            eprintln!("{e}");
+            Err(e)
         }
     };
-    let runtime_listener = match stack {
-        Some(_) => Config::bind_runtime(&config.runtime_bind).await,
-        None => None,
-    };
-    let runtime_addr = runtime_listener
+    let runtime_addr = runtime
         .as_ref()
-        .map(TcpListener::local_addr)
+        .ok()
+        .map(|(_, listener)| listener.local_addr())
         .transpose()?;
+    let status = match (&runtime, runtime_addr) {
+        (Err(e), _) => RuntimeStatus::disabled(e.clone()),
+        (Ok(_), addr) => addr
+            .map(|addr| RuntimeStatus::serving(&shared.advertise_host, addr.port()))
+            .unwrap_or_default(),
+    };
     let manager = Arc::new(HarnessManager::new(
         catalog,
         ProcessLauncher::new(),
@@ -255,7 +259,7 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
             ..ManagerConfig::default()
         },
     ));
-    if let (Some(stack), Some(listener), Some(addr)) = (stack, runtime_listener, runtime_addr) {
+    if let (Ok((stack, listener)), Some(addr)) = (runtime, runtime_addr) {
         let deps = stack.into_deps(manager.clone(), registry, tool_loop);
         println!(
             "runtime listening on ws://{} ({} tools, {} templates, {} sessions)",
@@ -275,7 +279,7 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
         shared.runtimes.len(),
         shared.model_dirs.len()
     );
-    control::serve(listener, manager, shared).await;
+    control::serve(listener, manager, shared, status).await;
     Ok(())
 }
 
@@ -355,8 +359,9 @@ mod tests {
     async fn runtime_bind_failure_degrades_to_none() {
         let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = taken.local_addr().unwrap().to_string();
-        assert!(Config::bind_runtime(&addr).await.is_none());
-        assert!(Config::bind_runtime("127.0.0.1:0").await.is_some());
+        let err = Config::bind_runtime(&addr).await.unwrap_err();
+        assert!(err.starts_with("runtime bind"), "{err}");
+        assert!(Config::bind_runtime("127.0.0.1:0").await.is_ok());
     }
 
     /// A temp data dir removed on drop, so a failing assertion still cleans up.
@@ -429,8 +434,9 @@ exe = \"x\"
             other => panic!("unexpected tree: {other:?}"),
         }
         assert!(deps.sessions.list().is_empty());
-        assert_eq!(deps.catalog.hosts, ["hive"]);
-        assert_eq!(deps.catalog.runtimes.len(), 1);
+        let view = deps.catalog.view();
+        assert_eq!(view.hosts, ["hive"]);
+        assert_eq!(view.runtimes.len(), 1);
     }
 
     #[test]
@@ -439,7 +445,11 @@ exe = \"x\"
         std::fs::write(&dir.0, b"not a directory").unwrap();
         let catalog = DataDir::catalog(&dir.0.join("data"), "");
         let names = AgentsStack::host_names(&catalog).unwrap();
-        assert!(AgentsStack::open(&catalog, names, &DataDir::registry()).is_err());
+        let err = AgentsStack::open(&catalog, names, &DataDir::registry())
+            .err()
+            .expect("unusable");
+        // This text is what `hello` reports as `runtime_error`.
+        assert!(err.starts_with(AgentsStack::ERR_UNAVAILABLE), "{err}");
     }
 
     #[test]

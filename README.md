@@ -10,22 +10,30 @@ a thinking on/off toggle). Built to learn LLM engineering from the bottom up.
 
 ## Status
 
-**Backend: complete and live-proven.** A standalone Rust sidecar (`backend/`) that
-talks to a llama.cpp `llama-server`, plus the Electron shell that spawns it:
+**Backend: complete and live-proven.** A standalone Rust backend (`backend/`) that talks to
+a llama.cpp `llama-server` (or runs llama.cpp / candle in-process), plus the Electron/mural
+app (`app/`) that reaches it through the supervisor:
 
 - `Engine` trait + `HttpEngine` over llama.cpp native endpoints (`/props`,
   `/tokenize`, `/detokenize`, `/completion` streaming with logprobs, `/apply-template`).
 - `ChatSession`: prompt rendered via `/apply-template` (exact bytes shown), token
   accounting, warn-and-stop on a full context window, atomic turn commit.
-- WebSocket/JSON-RPC server: `model_props`, `tokenize`, `set_sampling`, `send_turn`
+- Worker WebSocket/JSON-RPC server: `model_props`, `tokenize`, `set_sampling`, `send_turn`
   (emits `turn_started{prompt,prompt_tokens,n_ctx}` → `turn_chunk*` →
   `turn_done`/`turn_error`, or `turn_rejected`); a thinking on/off toggle.
-- ~~Electron `Sidecar` that spawns/stops the backend binary~~: removed with the agent-templates slice; the app now reaches the agent runtime through the supervisor (`supervisor.url`).
-- 27 backend tests, clippy-clean; validated end-to-end against the real Gemma model
-  (both thinking modes).
+- Supervisor (`--supervisor`, control plane `:8778`): starts and stops worker harnesses
+  from a catalog, and hosts the agent runtime (`:8779`). Its `hello` advertises the
+  runtime url (or why the runtime is off); the app finds the runtime through it.
+- Agent runtime: agent **templates** (TOML files in groups) and persisted **sessions**
+  started from them, each with its own transcript, tool subset, step budget and model;
+  the tool loop runs a session's turns and the dispatcher loads its model on demand.
+- Backend tests run on the hive (`scripts/hive-test.sh`, never on the dev machine);
+  validated end-to-end against the real Gemma model (both thinking modes).
 
-**Frontend: deferred** — the mural UI (streaming transcript + instrument panel) is a
-follow-up. See `docs/frontend-later/`.
+**App: live.** Two capabilities on the rail: **Sessions** (the session list, a New session
+dialog, and the chat + instrument panel bound to the open session, with Load / Unload model)
+and **Agents** (the template tree and the template editor).
+See `docs/specs/2026-11-23-agent-templates-sessions-design.md`.
 
 ## Engine (inference server)
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { SupervisorClient, type HarnessInfo } from './SupervisorClient'
+import { SupervisorClient, type HarnessInfo, type SupervisorHello } from './SupervisorClient'
 import { FakeSocket } from './FakeSocket'
 
 describe('SupervisorClient', () =>
@@ -37,12 +37,31 @@ describe('SupervisorClient', () =>
             { id: 'a', runtime: 'r', model: 'm', state: 'loading' },
             { id: 'b', runtime: 'r', model: 'm', state: 'ready', chat_url: 'ws://192.168.1.101:9001' }
         ]
-        expect(SupervisorClient.RuntimeUrl('ws://localhost:8778', harnesses)).toBe('ws://localhost:9001')
+        expect(SupervisorClient.RuntimeUrl('ws://localhost:8778', null, harnesses)).toBe('ws://localhost:9001')
+    })
+
+    it('hello_parses_and_its_runtime_url_wins_over_chat_url', async () =>
+    {
+        const socket = new FakeSocket()
+        const client = new SupervisorClient(() => socket)
+        client.Connect('ws://x')
+        socket.Open()
+        const pending = client.Hello()
+        expect(JSON.parse(socket.sent[0]).method).toBe('hello')
+        const hello: SupervisorHello = { runtime_url: 'ws://192.168.1.101:9100', runtime_error: null }
+        client.HandleFrame(JSON.stringify({ id: 1, result: hello }))
+        await expect(pending).resolves.toEqual(hello)
+        const harnesses: HarnessInfo[] = [{ id: 'b', runtime: 'r', model: 'm', state: 'ready', chat_url: 'ws://192.168.1.101:9001' }]
+        expect(SupervisorClient.RuntimeUrl('ws://hive.local:8778', hello, harnesses)).toBe('ws://hive.local:9100')
+        // No runtime url in hello (the runtime is off): the harnesses, then the default port.
+        const off: SupervisorHello = { runtime_url: null, runtime_error: 'agents data unavailable: x' }
+        expect(SupervisorClient.RuntimeUrl('ws://hive.local:8778', off, harnesses)).toBe('ws://hive.local:9001')
+        expect(SupervisorClient.RuntimeUrl('ws://hive.local:8778', off, [])).toBe('ws://hive.local:8779')
     })
 
     it('runtime_url_falls_back_to_8779', () =>
     {
-        expect(SupervisorClient.RuntimeUrl('ws://hive.local:8778', [])).toBe('ws://hive.local:8779')
-        expect(SupervisorClient.RuntimeUrl('wss://hive.local:8778/', [{ id: 'a', runtime: 'r', model: 'm', state: 'stopped' }])).toBe('wss://hive.local:8779')
+        expect(SupervisorClient.RuntimeUrl('ws://hive.local:8778', null, [])).toBe('ws://hive.local:8779')
+        expect(SupervisorClient.RuntimeUrl('wss://hive.local:8778/', null, [{ id: 'a', runtime: 'r', model: 'm', state: 'stopped' }])).toBe('wss://hive.local:8779')
     })
 })

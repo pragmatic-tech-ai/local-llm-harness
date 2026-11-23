@@ -113,10 +113,13 @@ class StubProvider
     }
 }
 
-/** A supervisor socket that is open at once and answers every request (list_harnesses) with no harnesses, unless silent. */
+/**
+ * A supervisor socket that is open at once and answers each request with the reply frame `replies` gives for its
+ * method (by default `[]`: no harnesses, and a hello naming no runtime), unless silent.
+ */
 class SupervisorSocket extends FakeSocket
 {
-    constructor(private readonly silent: boolean)
+    constructor(private readonly silent: boolean, private readonly replies: Map<string, Record<string, unknown>>)
     {
         super()
         this.readyState = 1
@@ -127,8 +130,9 @@ class SupervisorSocket extends FakeSocket
         super.send(data)
         if (!this.silent)
         {
-            const request = JSON.parse(data) as { id: number }
-            this.onmessage?.({ data: JSON.stringify({ id: request.id, result: [] }) })
+            const request = JSON.parse(data) as { id: number, method: string }
+            const reply = this.replies.get(request.method) ?? { result: [] }
+            this.onmessage?.({ data: JSON.stringify({ id: request.id, ...reply }) })
         }
     }
 }
@@ -144,6 +148,8 @@ class Rig
     public readonly service: SessionsService
     /** When set, the supervisor never answers (discovery must time out). */
     public SupervisorSilent = false
+    /** The supervisor's reply frame per method (`{ result }` or `{ error }`); unlisted methods answer `[]`. */
+    public readonly SupervisorReplies = new Map<string, Record<string, unknown>>()
 
     constructor(url: string = 'ws://hive:8778')
     {
@@ -159,7 +165,7 @@ class Rig
             }),
             () => new SupervisorClient(() =>
             {
-                const socket = new SupervisorSocket(this.SupervisorSilent)
+                const socket = new SupervisorSocket(this.SupervisorSilent, this.SupervisorReplies)
                 this.supervisorSockets.push(socket)
                 return socket
             }))
@@ -250,7 +256,7 @@ describe('SessionsService', () =>
         const rig = new Rig()
         expect(rig.host.viewed).toEqual([rig.service.View])
         await rig.Connect()
-        expect(JSON.parse(rig.supervisorSockets[0].sent[0]).method).toBe('list_harnesses')
+        expect(JSON.parse(rig.supervisorSockets[0].sent[0]).method).toBe('hello')
         expect(rig.urls).toEqual(['ws://hive:8779'])
         expect(rig.supervisorSockets[0].closeCalls).toBe(1)
         expect(rig.Methods()).toEqual(['list_sessions'])
@@ -472,7 +478,7 @@ describe('SessionsService', () =>
         await Rig.Flush()
         rig.Socket.Close()
         await Rig.Flush()
-        expect(rig.service.Panel.StatusText).toBe('delete failed: Harness not connected')
+        expect(rig.service.Panel.StatusText).toBe('delete failed: Runtime not connected')
     })
 
     it('connection_state_shows_on_panel_and_marks_placement_stale', async () =>
@@ -513,6 +519,42 @@ describe('SessionsService', () =>
         expect(rig.supervisorSockets).toHaveLength(2)
         await vi.advanceTimersByTimeAsync(3000)
         expect(rig.urls).toEqual(['ws://hive:8779', 'ws://hive:8779'])
+    })
+
+    it('hello_runtime_url_is_preferred_and_an_old_supervisor_falls_back_to_chat_url', async () =>
+    {
+        const rig = new Rig('')
+        rig.SupervisorReplies.set('hello', { result: { runtime_url: 'ws://192.168.1.101:9100', runtime_error: null } })
+        rig.settings.Change('ws://hive:8778')
+        await Rig.Flush()
+        expect(rig.urls).toEqual(['ws://hive:9100'])
+        const old = new Rig('')
+        old.SupervisorReplies.set('hello', { error: { code: -32601, message: 'unknown method: hello' } })
+        old.SupervisorReplies.set('list_harnesses', { result: [{ id: 'a', runtime: 'r', model: 'm', state: 'ready', chat_url: 'ws://x:9001' }] })
+        old.settings.Change('ws://hive:8778')
+        await Rig.Flush()
+        expect(old.urls).toEqual(['ws://hive:9001'])
+    })
+
+    it('a_runtime_off_on_the_supervisor_shows_why_and_is_asked_again_on_retry', async () =>
+    {
+        vi.useFakeTimers()
+        const rig = new Rig('')
+        const reasons: string[] = []
+        rig.service.OnRuntimeErrorChanged.Subscribe(text => reasons.push(text))
+        rig.SupervisorReplies.set('hello', { result: { runtime_url: null, runtime_error: 'agents data unavailable: denied' } })
+        rig.settings.Change('ws://hive:8778')
+        await vi.advanceTimersByTimeAsync(0)
+        // The runtime socket is not tried while the supervisor says it is off.
+        expect(rig.urls).toEqual([])
+        expect(rig.service.RuntimeError).toBe('agents data unavailable: denied')
+        expect(rig.service.Panel.EmptyText).toBe('The runtime is off on the supervisor: agents data unavailable: denied')
+        // Fixed on the hive: the retry finds the runtime and connects.
+        rig.SupervisorReplies.set('hello', { result: { runtime_url: 'ws://h:8779', runtime_error: null } })
+        await vi.advanceTimersByTimeAsync(1000)
+        expect(rig.urls).toEqual(['ws://hive:8779'])
+        expect(rig.service.RuntimeError).toBe('')
+        expect(reasons).toEqual(['agents data unavailable: denied', ''])
     })
 
     it('new_session_is_disabled_while_the_shown_session_runs_a_turn', async () =>

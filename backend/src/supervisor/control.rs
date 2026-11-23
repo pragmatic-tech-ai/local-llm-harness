@@ -7,11 +7,16 @@
 //!
 //! `stop` requires an `id` but otherwise ignores it: the manager owns a single harness, so
 //! stopping always stops that one (the id is accepted for forward compatibility).
+//!
+//! `hello` describes the agent runtime this supervisor hosts: `{runtime_url, runtime_error}`.
+//! `runtime_url` is the runtime's websocket whenever its port is bound, whether or not a model
+//! is loaded (a Ready harness's `chat_url` names the same endpoint); `runtime_error` says why
+//! the runtime is disabled when it is (unusable agents data, a failed bind).
 
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::error::RecvError;
@@ -85,6 +90,33 @@ struct StopParams {
     id: String,
 }
 
+/// What the control plane reports about the agent runtime (the `hello` result).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RuntimeStatus {
+    /// The runtime's websocket while its port is bound, model loaded or not.
+    pub runtime_url: Option<String>,
+    /// Why the runtime is disabled, when it is.
+    pub runtime_error: Option<String>,
+}
+
+impl RuntimeStatus {
+    /// A runtime bound on `port`, advertised on `host`.
+    pub fn serving(host: &str, port: u16) -> Self {
+        Self {
+            runtime_url: Some(format!("ws://{host}:{port}")),
+            runtime_error: None,
+        }
+    }
+
+    /// No runtime, because of `reason`.
+    pub fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            runtime_url: None,
+            runtime_error: Some(reason.into()),
+        }
+    }
+}
+
 /// Path-free JSON views of the catalog, shared by the control server and the agent runtime.
 pub struct CatalogListing;
 
@@ -131,9 +163,11 @@ impl CatalogListing {
 pub struct ControlServer<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> {
     manager: Arc<HarnessManager<L, P>>,
     catalog: Arc<Catalog>,
+    runtime: RuntimeStatus,
 }
 
 impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, P> {
+    const METHOD_HELLO: &'static str = "hello";
     const METHOD_LIST_RUNTIMES: &'static str = "list_runtimes";
     const METHOD_LIST_MODELS: &'static str = "list_models";
     const METHOD_LIST_HARNESSES: &'static str = "list_harnesses";
@@ -141,13 +175,22 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
     const METHOD_STOP: &'static str = "stop";
     const NOTIFY_CHANGED: &'static str = "harness_changed";
 
-    pub fn new(manager: Arc<HarnessManager<L, P>>, catalog: Arc<Catalog>) -> Self {
-        Self { manager, catalog }
+    pub fn new(
+        manager: Arc<HarnessManager<L, P>>,
+        catalog: Arc<Catalog>,
+        runtime: RuntimeStatus,
+    ) -> Self {
+        Self {
+            manager,
+            catalog,
+            runtime,
+        }
     }
 
     /// Handle one request. This is the unit-tested seam (no socket involved).
     pub async fn dispatch(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         match method {
+            Self::METHOD_HELLO => serde_json::to_value(&self.runtime).map_err(RpcError::internal),
             Self::METHOD_LIST_RUNTIMES => Ok(self.list_runtimes()),
             Self::METHOD_LIST_MODELS => Ok(self.list_models()),
             Self::METHOD_LIST_HARNESSES => {
@@ -266,13 +309,15 @@ impl<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static> ControlServer<L, 
     }
 }
 
-/// Accept control connections forever, serving `manager` and `catalog`.
+/// Accept control connections forever, serving `manager` and `catalog`, and reporting
+/// `runtime` from `hello`.
 pub async fn serve<L: WorkerLauncher + 'static, P: ReadinessProbe + 'static>(
     listener: TcpListener,
     manager: Arc<HarnessManager<L, P>>,
     catalog: Arc<Catalog>,
+    runtime: RuntimeStatus,
 ) {
-    Arc::new(ControlServer::new(manager, catalog))
+    Arc::new(ControlServer::new(manager, catalog, runtime))
         .serve(listener)
         .await;
 }
@@ -382,7 +427,33 @@ mod tests {
             chat_port: None,
         };
         let manager = HarnessManager::new(cat.clone(), NullLauncher, ReadyProbe, config);
-        ControlServer::new(Arc::new(manager), Arc::new(cat))
+        ControlServer::new(Arc::new(manager), Arc::new(cat), RuntimeStatus::default())
+    }
+
+    #[tokio::test]
+    async fn hello_reports_the_runtime_url_without_a_loaded_model() {
+        let s = ControlServer {
+            runtime: RuntimeStatus::serving("hive.local", 9100),
+            ..server("hello")
+        };
+        let v = s.dispatch("hello", Value::Null).await.unwrap();
+        assert_eq!(
+            v,
+            json!({"runtime_url": "ws://hive.local:9100", "runtime_error": null})
+        );
+        assert_eq!(
+            s.dispatch("list_harnesses", Value::Null).await.unwrap(),
+            json!([])
+        );
+        let off = ControlServer {
+            runtime: RuntimeStatus::disabled("agents data unavailable: x"),
+            ..server("hello-off")
+        };
+        let v = off.dispatch("hello", Value::Null).await.unwrap();
+        assert_eq!(
+            v,
+            json!({"runtime_url": null, "runtime_error": "agents data unavailable: x"})
+        );
     }
 
     #[tokio::test]

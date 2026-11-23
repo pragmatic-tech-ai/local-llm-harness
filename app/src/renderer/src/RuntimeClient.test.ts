@@ -209,18 +209,6 @@ describe('RuntimeClient', () =>
         expect(seen).toEqual([call, result, done])
     })
 
-    it('list_tools_sends_method', async () =>
-    {
-        const socket = new FakeSocket()
-        const client = new RuntimeClient(() => socket)
-        client.Connect('ws://x')
-        socket.Open()
-        const pending = client.ListTools()
-        expect(JSON.parse(socket.sent[0]).method).toBe('list_tools')
-        client.HandleFrame(JSON.stringify({ id: 1, result: [{ name: 'get_time', description: 'd', side_effects: false }] }))
-        await expect(pending).resolves.toEqual([{ name: 'get_time', description: 'd', side_effects: false }])
-    })
-
     it('each_method_sends_its_wire_name_and_params', async () =>
     {
         const template = { name: 'T' } as AgentTemplate
@@ -229,7 +217,9 @@ describe('RuntimeClient', () =>
         const summary = { id: 's', title: 't', template_id: 'a', template_name: 'T', runtime: 'r', model: 'm', updated: 7, placement, busy: false }
         const attached = { summary, snapshot: template, transcript: [{ role: 'user', content: 'hi' }], sampling, enable_thinking: true, placement }
         const nodes = [{ kind: 'template', id: 'a', path: '', name: 'T', runtime: 'r', model: 'm', error: null }]
-        const record = { id: 'a', path: 'g', template }
+        const record = { id: 'a', path: 'g', template, error: 'unknown tool: nope' }
+        // A server that predates the error field: the record reads as valid.
+        const bare = { id: 'a', path: 'g', template }
         const catalog = { runtimes: [{ name: 'r' }], models: [{ name: 'm' }], hosts: ['h'] }
         const specs = [{ name: 'echo', description: 'd', parameters: {}, side_effects: false }]
         const props = { n_ctx: 4096, model_name: 'm' }
@@ -238,6 +228,7 @@ describe('RuntimeClient', () =>
         const table: { call: (c: RuntimeClient) => Promise<unknown>, method: string, params: unknown, reply: unknown, result?: unknown }[] = [
             { call: c => c.ListTemplates(), method: 'list_templates', params: {}, reply: nodes },
             { call: c => c.GetTemplate('a'), method: 'get_template', params: { id: 'a' }, reply: record },
+            { call: c => c.GetTemplate('a'), method: 'get_template', params: { id: 'a' }, reply: bare, result: { ...bare, error: null } },
             { call: c => c.SaveTemplate('a', 'g', template), method: 'save_template', params: { id: 'a', path: 'g', template }, reply: { id: 'a' }, result: 'a' },
             { call: c => c.SaveTemplate(undefined, undefined, template), method: 'save_template', params: { template }, reply: { id: 'new' }, result: 'new' },
             { call: c => c.DeleteTemplate('a'), method: 'delete_template', params: { id: 'a' }, reply: null, result: undefined },
@@ -247,7 +238,6 @@ describe('RuntimeClient', () =>
             { call: c => c.MoveTemplate('a', 'g'), method: 'move_template', params: { id: 'a', path: 'g' }, reply: null, result: undefined },
             { call: c => c.ListCatalog(), method: 'list_catalog', params: {}, reply: catalog },
             { call: c => c.ListAllTools(), method: 'list_all_tools', params: {}, reply: specs },
-            { call: c => c.ListTools(), method: 'list_tools', params: {}, reply: specs },
             { call: c => c.ListSessions(), method: 'list_sessions', params: {}, reply: [summary] },
             { call: c => c.CreateSession('t'), method: 'create_session', params: { template_id: 't' }, reply: summary },
             { call: c => c.AttachSession('s'), method: 'attach_session', params: { id: 's' }, reply: attached },
@@ -257,7 +247,6 @@ describe('RuntimeClient', () =>
             { call: c => c.UnloadSessionModel('s'), method: 'unload_session_model', params: { id: 's' }, reply: null, result: undefined },
             { call: c => c.SetThinking(true), method: 'set_thinking', params: { enable: true }, reply: null, result: undefined },
             { call: c => c.SetSampling(sampling), method: 'set_sampling', params: { config: sampling }, reply: null, result: undefined },
-            { call: c => c.Reset(), method: 'reset', params: {}, reply: null, result: undefined },
             { call: c => c.SendTurn('hi'), method: 'send_turn', params: { content: 'hi' }, reply: null, result: undefined },
             { call: c => c.ModelProps(), method: 'model_props', params: {}, reply: props },
             { call: c => c.Tokenize('abc'), method: 'tokenize', params: { text: 'abc' }, reply: tokens }

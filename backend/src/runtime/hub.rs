@@ -135,15 +135,6 @@ impl Hub {
         reached
     }
 
-    /// Marks `session` busy; `false` when it already is.
-    pub fn try_busy(&self, session: &str) -> bool {
-        self.lock().busy.insert(session.to_string())
-    }
-
-    pub fn clear_busy(&self, session: &str) {
-        self.lock().busy.remove(session);
-    }
-
     pub fn is_busy(&self, session: &str) -> bool {
         self.lock().busy.contains(session)
     }
@@ -294,7 +285,6 @@ mod tests {
         let hub = Arc::new(Hub::new());
         let guard = hub.hold_busy(SESSION).expect("free");
         assert!(hub.hold_busy(SESSION).is_none());
-        assert!(!hub.try_busy(SESSION));
         drop(guard);
         assert!(!hub.is_busy(SESSION));
         let shared = Arc::clone(&hub);

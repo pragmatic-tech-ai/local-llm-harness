@@ -19,6 +19,7 @@ export class AgentsTreeViewModel extends Observable
     private static readonly PropIsEmpty = 'IsEmpty'
     private static readonly RootLabel = '(root)'
     private static readonly RefreshFailedFormat = 'templates unavailable: {0}'
+    private static readonly RuntimeOffFormat = 'The runtime is off on the supervisor: {0}'
 
     public readonly Roots = new ObservableCollection<TemplateTreeNodeViewModel>()
     /** The user picked a node in the tree; the owner decides (Select or KeepSelection). */
@@ -41,6 +42,7 @@ export class AgentsTreeViewModel extends Observable
     private readonly refreshCommand: RelayCommand
     private _selected: TemplateTreeNodeViewModel | null = null
     private _statusText = ''
+    private runtimeError = ''
     private client: RuntimeClient | null = null
     private subscriptions: IDisposable[] = []
     /** Orders refreshes so a slow early reply cannot overwrite a newer one. */
@@ -183,6 +185,21 @@ export class AgentsTreeViewModel extends Observable
         this.SetStatus(text)
     }
 
+    /** Why the supervisor says the runtime is off, shown on the status line ("" clears it once the runtime is back). */
+    public SetRuntimeError(text: string): void
+    {
+        const shown = this.RuntimeErrorText(this.runtimeError)
+        this.runtimeError = text
+        if (text.length > 0)
+        {
+            this.SetStatus(this.RuntimeErrorText(text))
+        }
+        else if (shown.length > 0 && this._statusText === shown)
+        {
+            this.SetStatus('')
+        }
+    }
+
     public Find(id: string): TemplateTreeNodeViewModel | undefined
     {
         return TemplateTreeNodeViewModel.FindTemplate(this.Roots, id)
@@ -282,6 +299,11 @@ export class AgentsTreeViewModel extends Observable
         {
             command.RaiseCanExecuteChanged()
         }
+    }
+
+    private RuntimeErrorText(error: string): string
+    {
+        return error.length > 0 ? TextFormat.Format(AgentsTreeViewModel.RuntimeOffFormat, error) : ''
     }
 
     private SetStatus(text: string): void

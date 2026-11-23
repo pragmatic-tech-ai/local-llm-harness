@@ -24,6 +24,7 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
     private static readonly SwitchLockedText = 'Finish the running turn before switching sessions.'
     private static readonly NoSessionsText = 'No sessions yet.'
     private static readonly ReconnectingText = 'Connecting to the runtime…'
+    private static readonly RuntimeOffFormat = 'The runtime is off on the supervisor: {0}'
     private static readonly DisconnectedText = 'Not connected: set the supervisor URL in Settings.'
 
     public readonly Sessions = new ObservableCollection<SessionRowViewModel>()
@@ -44,7 +45,15 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
     private _selected: SessionRowViewModel | null = null
     private _statusText = ''
     private connection = ConnectionState.Disconnected
-    /** The shown session runs a turn: switching to another row is refused. */
+    /** Why the supervisor says the runtime is off ("" when it is not). */
+    private runtimeError = ''
+    /**
+     * Counts every placement / busy notification; a row's last one is recorded per field, so a list reply computed
+     * before a newer notification does not overwrite it.
+     */
+    private noteCounter = 0
+    private readonly placementNoted = new Map<string, number>()
+    private readonly busyNoted = new Map<string, number>()
     private switchLocked = false
     private client: RuntimeClient | null = null
     private subscriptions: IDisposable[] = []
@@ -69,12 +78,22 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
         this.subscriptions = []
         this.client = client
         this.refreshToken++
+        this.placementNoted.clear()
+        this.busyNoted.clear()
         if (client !== null)
         {
             this.subscriptions.push(
                 client.OnSessionsChanged.Subscribe(() => void this.Refresh()),
-                client.OnPlacementChanged.Subscribe(p => this.Find(p.id)?.SetPlacement(p.placement)),
-                client.OnSessionBusy.Subscribe(p => this.Find(p.id)?.SetBusy(p.busy)))
+                client.OnPlacementChanged.Subscribe(p =>
+                {
+                    this.placementNoted.set(p.id, ++this.noteCounter)
+                    this.Find(p.id)?.SetPlacement(p.placement)
+                }),
+                client.OnSessionBusy.Subscribe(p =>
+                {
+                    this.busyNoted.set(p.id, ++this.noteCounter)
+                    this.Find(p.id)?.SetBusy(p.busy)
+                }))
         }
         else
         {
@@ -151,20 +170,28 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
     /** The runtime connection as the owner reports it; anything but Connected replaces the empty-list hint. */
     public SetConnection(state: ConnectionState): void
     {
-        if (this.connection === state)
+        if (this.connection !== state)
         {
-            return
+            this.ChangeHint(() => { this.connection = state })
         }
-        const oldText = this.EmptyText
-        const oldShows = this.ShowsEmptyText
-        this.connection = state
-        this.RaisePropertyChanged(SessionsPanelViewModel.PropEmptyText, oldText, this.EmptyText)
-        this.RaisePropertyChanged(SessionsPanelViewModel.PropShowsEmptyText, oldShows, this.ShowsEmptyText)
     }
 
-    /** The hint shown above the list: the connection state, or that there are no sessions. */
+    /** Why the supervisor says the runtime is off ("" when it is not); shown instead of "Connecting…". */
+    public SetRuntimeError(text: string): void
+    {
+        if (this.runtimeError !== text)
+        {
+            this.ChangeHint(() => { this.runtimeError = text })
+        }
+    }
+
+    /** The hint shown above the list: the connection state (or why the runtime is off), or that there are no sessions. */
     public get EmptyText(): string
     {
+        if (this.connection !== ConnectionState.Connected && this.runtimeError.length > 0)
+        {
+            return TextFormat.Format(SessionsPanelViewModel.RuntimeOffFormat, this.runtimeError)
+        }
         switch (this.connection)
         {
             case ConnectionState.Connected:
@@ -200,13 +227,14 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
             return
         }
         const token = ++this.refreshToken
+        const asked = this.noteCounter
         try
         {
             const sessions = await client.ListSessions()
             if (token === this.refreshToken)
             {
                 this.SetStatus('')
-                this.Reconcile(sessions)
+                this.Reconcile(sessions.map(s => this.KeepNewerNotes(s, asked)))
             }
         }
         catch (e)
@@ -307,6 +335,36 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
             this.SetSelected(null)
             this.OnSelectionLost.Raise(selected.Id)
         }
+    }
+
+    /**
+     * The listed row, except that a placement or busy flag notified after the list was asked for (at `asked`) is
+     * newer than the reply, so the row keeps the notified value.
+     */
+    private KeepNewerNotes(summary: SessionSummary, asked: number): SessionSummary
+    {
+        const row = this.Find(summary.id)
+        if (row === undefined)
+        {
+            return summary
+        }
+        const placementNewer = (this.placementNoted.get(summary.id) ?? 0) > asked
+        const busyNewer = (this.busyNoted.get(summary.id) ?? 0) > asked
+        return {
+            ...summary,
+            placement: placementNewer ? row.Placement : summary.placement,
+            busy: busyNewer ? row.Busy : summary.busy,
+        }
+    }
+
+    /** Applies a change to what the hint depends on, then raises the hint properties. */
+    private ChangeHint(mutate: () => void): void
+    {
+        const oldText = this.EmptyText
+        const oldShows = this.ShowsEmptyText
+        mutate()
+        this.RaisePropertyChanged(SessionsPanelViewModel.PropEmptyText, oldText, this.EmptyText)
+        this.RaisePropertyChanged(SessionsPanelViewModel.PropShowsEmptyText, oldShows, this.ShowsEmptyText)
     }
 
     private ForRow(arg: unknown, action: (row: SessionRowViewModel) => void): void

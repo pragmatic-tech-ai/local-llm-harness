@@ -1,6 +1,7 @@
 //! Fakes shared by runtime tests: a scripted worker link/connector, a recording sink, a temp
 //! dir and a complete `RuntimeDeps` builder ([`TestRuntime`]).
-//! Import as `crate::runtime::test_support::{FakeConnector, FakeLink, RecordingSink, Notes}`.
+//! Import as `crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink,
+//! Scripted, TempDir, TestRuntime}`.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -297,13 +298,13 @@ impl TestRuntime {
             dispatcher: Arc::new(Dispatcher::new(hosts, Box::new(ExplicitLoadPolicy))),
             registry: registry.clone(),
             tool_loop: Arc::new(super::tool_loop::ToolLoop::new(executor, registry)),
-            catalog: Self::catalog(),
+            catalog: Arc::new(Self::catalog()),
             hub: Arc::new(super::hub::Hub::new()),
         };
         Self { deps, host, dir }
     }
 
-    /// Runtime `llamacpp` and model `tiny` (servable by it), plus every registry tool.
+    /// Runtime `llamacpp` and model `tiny` (servable by it), every registry tool and the host.
     pub(crate) fn rules(
         registry: &super::registry::ToolRegistry,
     ) -> crate::agents::template::TemplateRules {
@@ -311,6 +312,7 @@ impl TestRuntime {
             runtimes: vec![Self::RUNTIME.to_string()],
             models: vec![(Self::MODEL.to_string(), vec![Self::RUNTIME.to_string()])],
             tools: registry.specs().into_iter().map(|s| s.name).collect(),
+            hosts: vec![Self::HOST.to_string()],
         }
     }
 

@@ -4,7 +4,7 @@ import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/ser
 import { ApplicationSettings, ButtonVariant, DialogAction, DialogService, type IActivatable } from '@pragmatic-tech-ai/mural/framework'
 import { TypedSignal, type IDisposable } from './JsonRpcConnection'
 import { RuntimeClient } from './RuntimeClient'
-import { SupervisorClient, type HarnessInfo } from './SupervisorClient'
+import { SupervisorClient, type HarnessInfo, type SupervisorHello } from './SupervisorClient'
 import { SupervisorUrlSettingKey } from './SettingsKeys'
 import type { SessionSummary } from './agents'
 import { ConnectionState } from './ConnectionState'
@@ -15,14 +15,24 @@ import { NewSessionDialogViewModel } from './NewSessionDialogViewModel'
 import { TextPromptViewModel } from './TextPromptViewModel'
 import { TextFormat } from './TextFormat'
 
+/** What one discovery found: the runtime url to try, and why the supervisor says the runtime is off ("" when on). */
+interface IRuntimeDiscovery
+{
+    Url: string
+    Error: string
+}
+
 /**
  * The Sessions capability. Owns the app's single runtime connection (`Client`, shared with the Agents capability),
  * the side-pane list (`Panel`) and the host-area session view (`View`, shown in the content host from the start).
  * Each connection attempt asks the supervisor (named by the `supervisor.url` setting, bounded by a timeout) for the
- * runtime's `chat_url`, falling back to the supervisor host on :8779. A failed or dropped connection retries with
- * backoff (1 s, 2 s, 4 s, ... capped at 10 s) and re-attaches the session that was shown. `Connection` reports the
- * state; the panel and the session header show it. The content host is shared with the Agents capability, so
- * activating the Sessions rail re-presents the session view.
+ * runtime's url: `hello`'s `runtime_url`, else (an older supervisor) a harness's `chat_url`, else the supervisor host
+ * on :8779. When `hello` reports a `runtime_error` (the runtime is off, e.g. its data folder is unusable) that text is
+ * `RuntimeError`, shown by the Sessions and Agents panels, and the runtime socket is not tried until a later
+ * discovery clears it. A failed or dropped connection retries with backoff (1 s, 2 s, 4 s, ... capped at 10 s) and
+ * re-attaches the session that was shown. `Connection` reports the state; the panel and the session header show it.
+ * The content host is shared with the Agents capability, so activating the Sessions rail re-presents the session
+ * view.
  */
 export class SessionsService extends ServiceBase implements IActivatable
 {
@@ -51,10 +61,13 @@ export class SessionsService extends ServiceBase implements IActivatable
     public readonly View: SessionViewModel
     /** Raised whenever `Connection` changes. */
     public readonly OnConnectionChanged = new TypedSignal<ConnectionState>()
+    /** Raised whenever `RuntimeError` changes. */
+    public readonly OnRuntimeErrorChanged = new TypedSignal<string>()
 
     private readonly host: ContentHostService
     private readonly subscriptions: IDisposable[] = []
     private connection = ConnectionState.Disconnected
+    private runtimeError = ''
     private supervisorUrl = ''
     /** Bumped on every settings change so a stale discovery or retry is dropped. */
     private generation = 0
@@ -91,6 +104,12 @@ export class SessionsService extends ServiceBase implements IActivatable
     public get Connection(): ConnectionState
     {
         return this.connection
+    }
+
+    /** Why the supervisor says its runtime is off, from the last discovery ("" when it is not). */
+    public get RuntimeError(): string
+    {
+        return this.runtimeError
     }
 
     /** The rail switched (back) to Sessions: present the session view in the shared content host. */
@@ -221,6 +240,7 @@ export class SessionsService extends ServiceBase implements IActivatable
         this.Client.Disconnect()
         this.Panel.Bind(null)
         this.View.Clear()
+        this.SetRuntimeError('')
         if (supervisorUrl.length === 0)
         {
             this.SetConnection(ConnectionState.Disconnected)
@@ -234,19 +254,20 @@ export class SessionsService extends ServiceBase implements IActivatable
     {
         const generation = this.generation
         this.SetConnection(ConnectionState.Reconnecting)
-        const runtimeUrl = await this.DiscoverRuntimeUrl(this.supervisorUrl)
+        const found = await this.DiscoverRuntime(this.supervisorUrl)
         if (generation !== this.generation)
         {
             return
         }
-        if (runtimeUrl === null)
+        this.SetRuntimeError(found?.Error ?? '')
+        if (found === null || found.Error.length > 0)
         {
             this.ScheduleReconnect()
             return
         }
         try
         {
-            this.Client.Connect(runtimeUrl)
+            this.Client.Connect(found.Url)
         }
         catch
         {
@@ -255,11 +276,13 @@ export class SessionsService extends ServiceBase implements IActivatable
     }
 
     /**
-     * Asks the supervisor for its harnesses' `chat_url`. An unreachable or silent supervisor (no answer within the
-     * timeout) still yields the default runtime port; a malformed url yields null.
+     * Asks the supervisor for the runtime: `hello` first; a supervisor that does not know it is asked for its
+     * harnesses' `chat_url`. An unreachable or silent supervisor (no answer within the timeout) still yields the
+     * default runtime port; a malformed url yields null.
      */
-    private async DiscoverRuntimeUrl(supervisorUrl: string): Promise<string | null>
+    private async DiscoverRuntime(supervisorUrl: string): Promise<IRuntimeDiscovery | null>
     {
+        let hello: SupervisorHello | null = null
         let harnesses: HarnessInfo[] = []
         const supervisor = this.supervisorFactory()
         let timer: ReturnType<typeof setTimeout> | null = null
@@ -270,7 +293,11 @@ export class SessionsService extends ServiceBase implements IActivatable
             {
                 timer = setTimeout(() => reject(new Error(SessionsService.DiscoveryTimedOut)), SessionsService.DiscoveryTimeoutMs)
             })
-            harnesses = await Promise.race([supervisor.ListHarnesses(), timeout])
+            hello = await Promise.race([supervisor.Hello().catch(() => null), timeout])
+            if (hello === null)
+            {
+                harnesses = await Promise.race([supervisor.ListHarnesses(), timeout])
+            }
         }
         catch
         {
@@ -286,7 +313,7 @@ export class SessionsService extends ServiceBase implements IActivatable
         }
         try
         {
-            return SupervisorClient.RuntimeUrl(supervisorUrl, harnesses)
+            return { Url: SupervisorClient.RuntimeUrl(supervisorUrl, hello, harnesses), Error: hello?.runtime_error ?? '' }
         }
         catch
         {
@@ -298,6 +325,7 @@ export class SessionsService extends ServiceBase implements IActivatable
     private OnConnected(): void
     {
         this.attempt = 0
+        this.SetRuntimeError('')
         this.SetConnection(ConnectionState.Connected)
         this.Panel.Bind(this.Client)
         void this.Panel.Refresh()
@@ -348,6 +376,16 @@ export class SessionsService extends ServiceBase implements IActivatable
         {
             this.connection = state
             this.OnConnectionChanged.Raise(state)
+        }
+    }
+
+    private SetRuntimeError(text: string): void
+    {
+        this.Panel.SetRuntimeError(text)
+        if (this.runtimeError !== text)
+        {
+            this.runtimeError = text
+            this.OnRuntimeErrorChanged.Raise(text)
         }
     }
 

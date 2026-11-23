@@ -174,10 +174,9 @@ describe('TemplateEditorViewModel', () =>
         await rig.LoadCatalog()
         const broken: TemplateLeafNode = { kind: 'template', id: 't2', path: 'Examples', name: 'Broken', runtime: '', model: '', error: 't2: missing field `n_ctx`' }
         void rig.editor.Open(new TemplateTreeNodeViewModel(broken))
-        await new Promise(r => setTimeout(r, 0))
+        // get_template cannot read a file that does not parse: the editor falls back to the defaults.
+        await rig.Fail('get_template', 't2: missing field `n_ctx`')
         const e = rig.editor
-        // get_template cannot read a broken file: the editor seeds the defaults instead of asking.
-        expect(rig.Frames().map(f => f.method)).not.toContain('get_template')
         expect(e.HasTemplate).toBe(true)
         expect(e.ErrorText).toBe('t2: missing field `n_ctx`')
         expect(e.Name).toBe('Broken')
@@ -194,6 +193,32 @@ describe('TemplateEditorViewModel', () =>
         await rig.Respond('save_template', { id: 't2' })
         expect(e.ErrorText).toBe('')
         expect(e.SaveCommand.CanExecute(undefined)).toBe(false)
+    })
+
+    it('template_failing_validation_opens_with_its_real_fields_and_the_error', async () =>
+    {
+        const rig = new Rig()
+        await rig.LoadCatalog()
+        const flagged: TemplateLeafNode = { ...Rig.Leaf, error: 'unknown tool: nope' }
+        void rig.editor.Open(new TemplateTreeNodeViewModel(flagged))
+        const template: AgentTemplate = { ...Rig.Researcher, system_prompt: 'keep me', tools: ['read_file', 'nope'], step_budget: 3 }
+        await rig.Respond('get_template', { id: 't1', path: 'Examples', template, error: 'unknown tool: nope' })
+        const e = rig.editor
+        expect(rig.Frames().map(f => f.method)).toContain('get_template')
+        expect(e.ErrorText).toBe('unknown tool: nope')
+        expect(e.SystemPrompt).toBe('keep me')
+        expect(e.StepBudgetText).toBe('3')
+        expect(e.Model).toBe('gemma-4')
+        expect(e.IsDirty).toBe(false)
+        // Broken, so Save (which repairs it) is offered while clean; Revert keeps the error shown.
+        expect(e.SaveCommand.CanExecute(undefined)).toBe(true)
+        e.SystemPrompt = 'edited'
+        e.Revert()
+        expect(e.SystemPrompt).toBe('keep me')
+        expect(e.ErrorText).toBe('unknown tool: nope')
+        // A catalog arriving later does not reseed the real fields.
+        await rig.LoadCatalog()
+        expect(e.SystemPrompt).toBe('keep me')
     })
 
     it('unparsable_numbers_show_field_errors_and_disable_save', async () =>

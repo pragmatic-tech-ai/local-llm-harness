@@ -2,7 +2,9 @@
 //!
 //! A [`ModelHost`] answers "can you serve this runtime+model", reports what it currently has
 //! loaded, hands out a [`WorkerLink`] to the loaded model, and loads/unloads on demand. The
-//! dispatcher (a later task) picks a host per [`ModelRequirement`].
+//! [`Dispatcher`](crate::agents::dispatcher::Dispatcher) picks a host per [`ModelRequirement`].
+//! [`ModelHost::identity`] names the exact harness a link reaches, so a turn can tell a reload
+//! of its model (a new instance) from the harness it started on.
 //!
 //! [`LocalSupervisorHost`] is the first host: it wraps the in-process harness manager. It holds
 //! the manager behind the small [`LocalHarness`] trait (implemented for every
@@ -52,6 +54,16 @@ pub struct HostState {
     pub loading: bool,
 }
 
+/// The harness a host is serving right now: its runtime, model and context size, plus which
+/// start of it this is (a reload of the same model is a new `instance`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessIdentity {
+    pub runtime: String,
+    pub model: String,
+    pub n_ctx: Option<u32>,
+    pub instance: u64,
+}
+
 /// A host operation failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -64,11 +76,15 @@ pub trait ModelHost: Send + Sync {
     /// Whether this host can ever serve `req` (cheap; no loading).
     fn serves(&self, req: &ModelRequirement) -> bool;
     fn state(&self) -> HostState;
+    /// The Ready harness this host serves now, if any.
+    fn identity(&self) -> Option<HarnessIdentity>;
+    /// Re-reads which models this host can serve (models added or removed on disk). Hosts
+    /// with a fixed model list keep the default, which does nothing.
+    fn refresh(&self) {}
     /// A link to the loaded model, only if it matches `req` exactly (runtime, model, n_ctx).
     fn current_link(&self, req: &ModelRequirement) -> Option<Arc<dyn WorkerLink>>;
     /// A link to a model matching `req`, loading it (and evicting what is loaded) if needed.
     async fn ensure_ready(&self, req: &ModelRequirement) -> Result<Arc<dyn WorkerLink>, HostError>;
-    async fn unload(&self) -> Result<(), HostError>;
     /// Unload only if the loaded model is `req`'s runtime and model (any n_ctx). The check and the
     /// stop happen atomically under the host's loading lock, so a concurrent load cannot slip in
     /// between. Returns whether anything was unloaded.
@@ -160,11 +176,6 @@ impl LocalSupervisorHost {
         }
     }
 
-    /// Re-run model discovery (call after models are added or removed on disk).
-    pub fn refresh(&self) {
-        *self.models.lock().unwrap() = discover(&self.catalog);
-    }
-
     /// Same runtime and model (any state, any n_ctx): "this session's model".
     fn same_model(info: &HarnessInfo, req: &ModelRequirement) -> bool {
         info.runtime == req.runtime && info.model == req.model
@@ -214,6 +225,21 @@ impl ModelHost for LocalSupervisorHost {
         }
     }
 
+    fn identity(&self) -> Option<HarnessIdentity> {
+        let info = self.harness.current()?;
+        (info.state == HarnessState::Ready).then_some(HarnessIdentity {
+            runtime: info.runtime,
+            model: info.model,
+            n_ctx: info.n_ctx,
+            instance: info.instance,
+        })
+    }
+
+    /// Re-runs model discovery.
+    fn refresh(&self) {
+        *self.models.lock().unwrap() = discover(&self.catalog);
+    }
+
     fn current_link(&self, req: &ModelRequirement) -> Option<Arc<dyn WorkerLink>> {
         self.link_if_matching(req)
     }
@@ -229,14 +255,6 @@ impl ModelHost for LocalSupervisorHost {
             .map_err(|e| HostError(e.to_string()))?;
         self.link_if_matching(req)
             .ok_or_else(|| HostError(Self::ERR_NOT_READY.to_string()))
-    }
-
-    async fn unload(&self) -> Result<(), HostError> {
-        let _serial = self.loading.lock().await;
-        self.harness
-            .stop()
-            .await
-            .map_err(|e| HostError(e.to_string()))
     }
 
     async fn unload_if(&self, req: &ModelRequirement) -> Result<bool, HostError> {
@@ -299,7 +317,8 @@ impl Drop for LocalSupervisorHost {
 /// A scripted host for dispatcher tests.
 ///
 /// API: `FakeHost::new(name)`, `FakeHost::serving(name, &[(runtime, model)])`,
-/// `FakeHost::with_link(name, link)`, `.link()`, `.set_state(HostState)` (fires the signal),
+/// `FakeHost::with_link(name, link)`, `.link()`, `.set_state(HostState)` (fires the signal;
+/// a loaded state is a new harness instance),
 /// `.fire()`, `.fail_ensure(Option<&str>)`, `.ensure_ready_calls()`, `.unload_calls()`, plus the
 /// `ModelHost` trait. All constructors return `Arc<FakeHost>`.
 #[cfg(test)]
@@ -321,6 +340,8 @@ pub(crate) struct FakeHost {
     started: std::sync::atomic::AtomicUsize,
     /// The (runtime, model) a scripted in-progress load is for (`HostState` has no model for it).
     loading_model: StdMutex<Option<(String, String)>>,
+    /// The harness instance of the loaded state; bumped by every `set_state` that loads.
+    instance: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -378,6 +399,7 @@ impl FakeHost {
             loads: StdMutex::new(Vec::new()),
             started: std::sync::atomic::AtomicUsize::new(0),
             loading_model: StdMutex::new(None),
+            instance: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -410,8 +432,13 @@ impl FakeHost {
         Arc::clone(&self.link)
     }
 
-    /// Replace the reported state and fire the change signal.
+    /// Replace the reported state and fire the change signal. A loaded state is a fresh
+    /// harness instance, even when it names the model already loaded (a reload).
     pub(crate) fn set_state(&self, state: HostState) {
+        if state.loaded.is_some() {
+            self.instance
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         *self.state.lock().unwrap() = state;
         self.fire();
     }
@@ -459,6 +486,16 @@ impl ModelHost for FakeHost {
         self.state.lock().unwrap().clone()
     }
 
+    fn identity(&self) -> Option<HarnessIdentity> {
+        let (runtime, model, n_ctx) = self.state.lock().unwrap().loaded.clone()?;
+        Some(HarnessIdentity {
+            runtime,
+            model,
+            n_ctx,
+            instance: self.instance.load(std::sync::atomic::Ordering::SeqCst),
+        })
+    }
+
     fn current_link(&self, req: &ModelRequirement) -> Option<Arc<dyn WorkerLink>> {
         self.loaded_matches(req)
             .then(|| Arc::clone(&self.link) as Arc<dyn WorkerLink>)
@@ -499,14 +536,6 @@ impl ModelHost for FakeHost {
             .unwrap()
             .push((req.model.clone(), evicted, matched));
         Ok(Arc::clone(&self.link) as Arc<dyn WorkerLink>)
-    }
-
-    async fn unload(&self) -> Result<(), HostError> {
-        let _serial = self.loading.lock().await;
-        self.unload_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.set_state(HostState::default());
-        Ok(())
     }
 
     async fn unload_if(&self, req: &ModelRequirement) -> Result<bool, HostError> {
@@ -583,6 +612,7 @@ mod tests {
                 url: None,
                 chat_url: None,
                 n_ctx,
+                instance: 0,
             }
         }
 
@@ -621,7 +651,8 @@ mod tests {
             if let Some(gate) = gate {
                 gate.acquire().await.unwrap().forget();
             }
-            let info = Self::info(runtime, model, HarnessState::Ready, n_ctx);
+            let mut info = Self::info(runtime, model, HarnessState::Ready, n_ctx);
+            info.instance = self.starts().len() as u64;
             self.set(Some(info.clone()));
             let _ = self.tx.send(info.clone());
             Ok(info)
@@ -797,6 +828,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_names_the_ready_harness_and_each_start() {
+        let (host, _harness) = Fixtures::host("identity");
+        assert_eq!(host.identity(), None);
+        host.ensure_ready(&Fixtures::req("gemma", 8192))
+            .await
+            .unwrap();
+        let first = host.identity().expect("ready");
+        assert_eq!(
+            (first.model.as_str(), first.n_ctx, first.instance),
+            ("gemma", Some(8192), 1)
+        );
+        // A reload of the same model at another context is a new instance.
+        host.ensure_ready(&Fixtures::req("gemma", 4096))
+            .await
+            .unwrap();
+        assert_ne!(host.identity(), Some(first));
+    }
+
+    #[tokio::test]
     async fn unload_stops_and_subscribe_forwards_changes() {
         let (host, harness) = Fixtures::host("sub");
         let mut rx = host.subscribe();
@@ -807,7 +857,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        host.unload().await.unwrap();
+        assert!(host.unload_if(&Fixtures::req("gemma", 8192)).await.unwrap());
         assert_eq!(harness.stops.load(Ordering::SeqCst), 1);
         assert_eq!(host.state(), HostState::default());
         tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -905,36 +955,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unload_waits_for_an_in_flight_load() {
-        let (host, harness) = Fixtures::host("serial");
-        let host = Arc::new(host);
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        *harness.gate.lock().unwrap() = Some(Arc::clone(&gate));
-        let loader = {
-            let host = Arc::clone(&host);
-            tokio::spawn(async move { host.ensure_ready(&Fixtures::req("gemma", 8192)).await })
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while harness.starts().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the load never started");
-        let unloader = {
-            let host = Arc::clone(&host);
-            tokio::spawn(async move { host.unload().await })
-        };
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(harness.stops.load(Ordering::SeqCst), 0, "unload must wait");
-        gate.add_permits(1);
-        loader.await.unwrap().unwrap();
-        unloader.await.unwrap().unwrap();
-        assert_eq!(harness.stops.load(Ordering::SeqCst), 1);
-        assert_eq!(host.state(), HostState::default());
-    }
-
-    #[tokio::test]
     async fn every_served_model_resolves_for_start() {
         use crate::supervisor::discovery::resolve_model;
         let catalog = Fixtures::catalog("resolve");
@@ -967,7 +987,7 @@ mod tests {
             fake.ensure_ready(&Fixtures::req("gemma", 1)).await.err(),
             Some(HostError("boom".into()))
         );
-        fake.unload().await.unwrap();
+        assert!(fake.unload_if(&Fixtures::req("gemma", 1)).await.unwrap());
         assert_eq!(fake.unload_calls(), 1);
     }
 }

@@ -90,9 +90,12 @@ impl HostConfigs {
     const KIND_SUPERVISOR: &'static str = "supervisor";
     const IMPLICIT_NAME: &'static str = "hive";
     const ERR_UNSUPPORTED: &'static str = "host kind not supported yet";
+    const ERR_DUPLICATE: &'static str = "duplicate host name";
+    const ERR_SECOND_LOCAL: &'static str = "more than one local host";
 
     /// The catalog's hosts: the implicit local `hive` supervisor when none are listed; any
-    /// entry that is not a local `supervisor` is rejected for now.
+    /// entry that is not a local `supervisor` is rejected for now, as are two hosts with one
+    /// name and a second local host (each would wrap the same harness manager).
     pub fn build(catalog: &Catalog) -> Result<Vec<HostConfig>, String> {
         if catalog.hosts.is_empty() {
             return Ok(vec![HostConfig {
@@ -101,9 +104,18 @@ impl HostConfigs {
                 local: true,
             }]);
         }
+        let mut names = std::collections::HashSet::new();
+        let mut locals = 0;
         for host in &catalog.hosts {
             if host.kind != Self::KIND_SUPERVISOR || !host.local {
                 return Err(format!("{}: {}", Self::ERR_UNSUPPORTED, host.kind));
+            }
+            if !names.insert(host.name.as_str()) {
+                return Err(format!("{}: {}", Self::ERR_DUPLICATE, host.name));
+            }
+            locals += usize::from(host.local);
+            if locals > 1 {
+                return Err(format!("{}: {}", Self::ERR_SECOND_LOCAL, host.name));
             }
         }
         Ok(catalog.hosts.clone())
@@ -313,6 +325,29 @@ kind = \"supervisor\"
         )
         .unwrap();
         assert!(HostConfigs::build(&c).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_names_and_a_second_local_host() {
+        let host = |name: &str| {
+            format!(
+                "[[host]]
+name = \"{name}\"
+kind = \"supervisor\"
+local = true
+"
+            )
+        };
+        let dup = Catalog::from_toml(&format!("{}{}", host("box"), host("box"))).unwrap();
+        assert_eq!(
+            HostConfigs::build(&dup),
+            Err("duplicate host name: box".to_string())
+        );
+        let two = Catalog::from_toml(&format!("{}{}", host("a"), host("b"))).unwrap();
+        assert_eq!(
+            HostConfigs::build(&two),
+            Err("more than one local host: b".to_string())
+        );
     }
 
     #[test]

@@ -52,11 +52,13 @@ class FakeDialogs
     }
 }
 
-/** The part of SessionsService the Agents capability uses: the shared client and the connection state. */
+/** The part of SessionsService the Agents capability uses: the shared client, the connection state and the runtime error. */
 class FakeSessions
 {
     public readonly OnConnectionChanged = new TypedSignal<ConnectionState>()
+    public readonly OnRuntimeErrorChanged = new TypedSignal<string>()
     public Connection = ConnectionState.Connected
+    public RuntimeError = ''
 
     constructor(public readonly Client: RuntimeClient)
     {
@@ -66,6 +68,12 @@ class FakeSessions
     {
         this.Connection = state
         this.OnConnectionChanged.Raise(state)
+    }
+
+    public ReportRuntimeError(text: string): void
+    {
+        this.RuntimeError = text
+        this.OnRuntimeErrorChanged.Raise(text)
     }
 }
 
@@ -551,6 +559,17 @@ describe('AgentsService', () =>
         rig.sessions.Change(ConnectionState.Connected)
         expect(rig.Methods().slice(-3)).toEqual(['list_templates', 'list_catalog', 'list_all_tools'])
         expect(rig.Panel.NewTemplateCommand.CanExecute(undefined)).toBe(true)
+    })
+
+    it('a_runtime_turned_off_on_the_supervisor_shows_why_in_the_tree', async () =>
+    {
+        const rig = new Rig()
+        await rig.Ready()
+        rig.sessions.Change(ConnectionState.Reconnecting)
+        rig.sessions.ReportRuntimeError('agents data unavailable: denied')
+        expect(rig.Panel.StatusText).toBe('The runtime is off on the supervisor: agents data unavailable: denied')
+        rig.sessions.ReportRuntimeError('')
+        expect(rig.Panel.StatusText).toBe('')
     })
 
     it('works_without_a_navigation_service', async () =>

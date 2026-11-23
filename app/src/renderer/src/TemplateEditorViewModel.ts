@@ -11,10 +11,12 @@ import { TextFormat } from './TextFormat'
  * The host-area template editor. One stable instance: Open shows a template from the tree, OpenNew an unsaved
  * `Untitled` draft, Clear the empty state. The number fields are text so a typo can be shown rather than sent: one
  * that does not parse gets a field error and disables Save. Runtime / model / host come from `list_catalog`, the
- * models filtered by the runtime; a value the catalog lacks stays as a marked choice. A template file that fails to
- * load opens with its error in ErrorText and the fields seeded from the defaults (plus what the tree node carries),
- * so Save repairs it. Validation errors from `save_template` show in ErrorText; a catalog failure shows in
- * CatalogError until a retry (EnsureCatalog, on the next open or refresh) succeeds.
+ * models filtered by the runtime; a value the catalog lacks stays as a marked choice. A template that parses but
+ * fails validation (`get_template`'s `error`, the tree marks it broken) opens with its real fields and the error in
+ * ErrorText; only a file that does not load at all (it does not parse, or its id is a duplicate) opens with the
+ * fields seeded from the defaults plus what the tree node carries. Either way Save repairs it. Validation errors from
+ * `save_template` show in ErrorText; a catalog failure shows in CatalogError until a retry (EnsureCatalog, on the
+ * next open or refresh) succeeds.
  */
 export class TemplateEditorViewModel extends Observable implements IToolChoiceOwner
 {
@@ -78,8 +80,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private templateId: string | null = null
     private path = ''
     private isNew = false
-    /** Opened from the defaults because the file did not load: Save (which repairs it) is allowed while clean. */
+    /** The template is broken (fails validation, or did not load): Save (which repairs it) is allowed while clean. */
     private broken = false
+    /** The file did not load, so the fields came from the defaults (a catalog arriving later completes them). */
+    private seeded = false
     private saving = false
     /** `get_template` for the shown template is in flight. */
     private loading = false
@@ -446,7 +450,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
                     this.Fill(this.Defaults(loaded.name, loaded.runtime, loaded.model, true))
                     return
                 }
-                if (this.broken && (loaded.runtime === '' || loaded.model === ''))
+                if (this.seeded && (loaded.runtime === '' || loaded.model === ''))
                 {
                     this.Fill(this.Defaults(loaded.name, loaded.runtime, loaded.model, false))
                     return
@@ -479,7 +483,8 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
 
     /**
      * Shows a template from the tree. The id is recorded at once (the form goes read-only until `get_template`
-     * replies), so a refresh landing meanwhile targets this template; a broken one opens from the defaults.
+     * replies), so a refresh landing meanwhile targets this template; one whose file does not load opens from the
+     * defaults.
      */
     public async Open(node: TemplateTreeNodeViewModel): Promise<void>
     {
@@ -509,6 +514,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.path = path
         this.isNew = true
         this.broken = false
+        this.seeded = false
         this.loading = false
         this.errorText = ''
         this.Fill(this.Defaults(TemplateEditorViewModel.DefaultName, '', '', true))
@@ -524,6 +530,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.path = ''
         this.isNew = false
         this.broken = false
+        this.seeded = false
         this.loading = false
         this.errorText = ''
         this.Fill(this.Defaults('', '', '', false))
@@ -539,6 +546,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.templateId = null
         this.isNew = true
         this.broken = false
+        this.seeded = false
         this.loading = false
         this.errorText = TemplateEditorViewModel.DeletedText
         this.RaiseAll()
@@ -573,6 +581,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
             this.templateId = id
             this.isNew = false
             this.broken = false
+            this.seeded = false
             this.errorText = ''
             this.loaded = template
             this.baseline = sent
@@ -625,11 +634,6 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         {
             return
         }
-        if (node.Error !== null)
-        {
-            this.Seed(node, id, node.Error)
-            return
-        }
         if (!onlyIfClean)
         {
             // Record the request now: the tree shows this template, so must everything that asks the editor.
@@ -653,15 +657,17 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
             this.open = true
             this.path = record.path
             this.isNew = false
-            this.broken = false
-            this.errorText = ''
+            // A validation failure still reads: the real fields, with the reason it is flagged.
+            this.broken = record.error !== null
+            this.seeded = false
+            this.errorText = record.error ?? ''
             this.Fill(record.template)
         }
         catch (e)
         {
             if (token === this.openToken && !(onlyIfClean && this.IsDirty))
             {
-                this.Seed(node, id, TextFormat.Message(e))
+                this.Seed(node, id, node.Error ?? TextFormat.Message(e))
             }
         }
         finally
@@ -674,7 +680,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         }
     }
 
-    /** Opens a template whose file cannot be read: the defaults, overlaid with what the tree node carries. */
+    /** Opens a template whose file does not load: the defaults, overlaid with what the tree node carries. */
     private Seed(node: TemplateTreeNodeViewModel, id: string, error: string): void
     {
         const leaf = node.IsTemplate ? node.Node as TemplateLeafNode : null
@@ -683,6 +689,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.path = node.Path
         this.isNew = false
         this.broken = true
+        this.seeded = true
         this.loading = false
         this.errorText = error
         this.Fill(this.Defaults(node.Name, leaf?.runtime ?? '', leaf?.model ?? '', false))

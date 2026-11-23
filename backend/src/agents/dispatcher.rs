@@ -12,7 +12,7 @@ use futures::stream::{self, StreamExt};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::agents::host::{ModelHost, ModelRequirement};
+use crate::agents::host::{HarnessIdentity, ModelHost, ModelRequirement};
 use crate::agents::session::SessionRecord;
 use crate::runtime::worker::WorkerLink;
 
@@ -140,6 +140,21 @@ impl Dispatcher {
     /// the first, so an eviction mid-turn surfaces as an error.
     pub fn current_link(&self, req: &ModelRequirement) -> Option<Arc<dyn WorkerLink>> {
         self.policy.choose_host(req, &self.hosts)?.current_link(req)
+    }
+
+    /// The harness the host chosen for `req` serves right now (whatever model it is), if any.
+    /// A turn records it with its first link and compares it before every later step.
+    pub fn identity(&self, req: &ModelRequirement) -> Option<HarnessIdentity> {
+        self.policy.choose_host(req, &self.hosts)?.identity()
+    }
+
+    /// Re-reads which models every host serves, then signals subscribers so placements that
+    /// changed with it (a model dropped on disk or removed) are announced.
+    pub fn refresh(&self) {
+        for host in &self.hosts {
+            host.refresh();
+        }
+        let _ = self.events.send(());
     }
 
     /// Load the model (evicting what is loaded on the chosen host) and return its link.
@@ -281,6 +296,24 @@ mod tests {
             d.status(&Fixtures::req("gemma-3", 4096, None));
         }
         assert_eq!(hive.ensure_ready_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn identity_follows_reloads_and_refresh_signals() {
+        let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-4")]);
+        let d = Fixtures::dispatcher(&[&hive]);
+        let req = Fixtures::req("gemma-4", 8192, None);
+        assert_eq!(d.identity(&req), None);
+        hive.set_state(Fixtures::loaded("gemma-4", 8192));
+        let first = d.identity(&req).expect("loaded");
+        hive.set_state(Fixtures::loaded("gemma-4", 8192));
+        assert_ne!(d.identity(&req), Some(first));
+        let mut rx = d.subscribe();
+        d.refresh();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("refresh signals")
+            .unwrap();
     }
 
     #[test]

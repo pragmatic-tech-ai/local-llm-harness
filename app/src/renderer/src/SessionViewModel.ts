@@ -51,6 +51,8 @@ export class SessionViewModel extends Observable
     private stale = false
     /** Orders attaches: a late reply for an earlier selection is dropped. */
     private attachToken = 0
+    /** Counts `placement_changed` for the shown session, so a reply computed before one does not overwrite it. */
+    private placementNotes = 0
 
     constructor(client: RuntimeClient)
     {
@@ -63,6 +65,7 @@ export class SessionViewModel extends Observable
             {
                 if (p.id === this.shownId)
                 {
+                    this.placementNotes++
                     this.ApplyPlacement(p.placement)
                 }
             }),
@@ -196,6 +199,7 @@ export class SessionViewModel extends Observable
         this.shownId = id
         this.Chat.Bind(null)
         this.Update(() => { this.status = SessionViewModel.AttachingText })
+        const notesBefore = this.placementNotes
         let attached: AttachedSession
         try
         {
@@ -213,10 +217,12 @@ export class SessionViewModel extends Observable
         {
             return
         }
+        // A placement_changed that arrived after the attach was sent is newer than the reply's placement.
+        const placementNewer = this.placementNotes !== notesBefore && this.placement !== null
         this.Update(() =>
         {
             this.snapshot = attached.snapshot
-            this.placement = attached.placement
+            this.placement = placementNewer ? this.placement : attached.placement
             this.status = ''
         })
         this.Chat.Bind(this.client)
@@ -224,11 +230,23 @@ export class SessionViewModel extends Observable
         this.Panel.ApplySession(attached.sampling, attached.enable_thinking)
     }
 
-    /** The connection dropped: the chat goes inert until the session is re-attached. */
+    /**
+     * The connection dropped: the chat goes inert until the session is re-attached. A first-message load the runtime
+     * was announcing is lost with the connection, so "loading model…" ends here (the re-attach shows the placement).
+     */
     public Detach(): void
     {
         this.attachToken++
         this.Chat.Bind(null)
+        if (this.turnLoading || this.loading)
+        {
+            this.Update(() =>
+            {
+                this.turnLoading = false
+                this.loading = false
+                this.status = ''
+            })
+        }
     }
 
     /** Shows nothing (the shown session was deleted, or the connection went away for good). */
@@ -273,6 +291,7 @@ export class SessionViewModel extends Observable
             this.loading = true
             this.status = SessionViewModel.LoadingText
         })
+        const notesBefore = this.placementNotes
         try
         {
             const placement = await this.client.LoadSessionModel(id)
@@ -283,7 +302,11 @@ export class SessionViewModel extends Observable
                     this.loading = false
                     this.status = ''
                 })
-                this.ApplyPlacement(placement)
+                // A placement_changed since the request is newer than the reply.
+                if (this.placementNotes === notesBefore)
+                {
+                    this.ApplyPlacement(placement)
+                }
             }
         }
         catch (e)

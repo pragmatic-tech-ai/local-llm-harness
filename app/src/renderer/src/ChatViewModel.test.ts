@@ -142,7 +142,7 @@ describe('ChatViewModel', () =>
         const rig = new Rig(false)
         rig.Send('hi')
         await rig.Flush()
-        expect(rig.Reply(1).Text).toContain('[send failed: Harness not connected]')
+        expect(rig.Reply(1).Text).toContain('[send failed: Runtime not connected]')
         rig.Send('again')
         expect(rig.Count()).toBe(4)
     })

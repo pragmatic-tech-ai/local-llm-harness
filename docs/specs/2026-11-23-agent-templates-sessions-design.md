@@ -255,8 +255,8 @@ The connection becomes session-aware. Existing methods take a `session_id`, or a
 connection's **attached** session:
 
 - **Templates:**
-  - `list_templates` returns the tree, `[{kind:"group", name, path, children} | {kind:"template", id, path, name, model, runtime}]`
-  - `get_template {id}`
+  - `list_templates` returns the tree, `[{kind:"group", name, path, children} | {kind:"template", id, path, name, model, runtime, error}]`
+  - `get_template {id}` returns `{id, path, template, error}`
   - `save_template {id?, path, fields}` validates tools, runtime and model against the
     catalog and registry, and returns the id
   - `delete_template {id}`
@@ -292,8 +292,8 @@ Several app windows attached to the same session all receive its notifications.
 
 - **Rail.** Two capability modules: **Sessions** (renamed from Runtime, keeping its icon) and
   **Agents** (new icon). The `supervisor.url` setting stays under the Sessions module. The
-  app still discovers `chat_url` through the supervisor, so the runtime endpoint keeps one
-  source of truth.
+  app still discovers the runtime through the supervisor (`hello`'s `runtime_url`), so the
+  runtime endpoint keeps one source of truth.
 - **Sessions panel.** A **New session** button, then the session list. Each row shows the
   title, template name and a state dot: live = model loaded, idle = needs load,
   unavailable = no host. Right-click gives rename and delete. Selecting a row opens the
@@ -385,6 +385,44 @@ Several app windows attached to the same session all receive its notifications.
     the combos.
   - Both are served on the runtime port, from the in-process catalog and host list. The app
     edits templates without touching the control port.
+- **Catalog freshness.** Model discovery is re-run on `list_catalog`, on `list_templates` and
+  `save_template` validation, and on `create_session` (which also refreshes the hosts' model
+  lists), so a model file dropped into a model directory is offered, accepted and servable
+  without a supervisor restart. Runtimes, tools and hosts stay fixed at startup: changing
+  them in the catalog needs a supervisor restart.
+- **Validation in the tree.** `list_templates` applies the same validation as `save_template`
+  (tools, step budget, runtime, model, host), so a template that parses but fails it is listed
+  with `error` set to the validation text. `get_template` still returns such a template, with
+  `error: string | null` in its result, and fails only when the file does not parse (or its
+  id is a duplicate). `create_session` refuses a template that fails validation, with that
+  text as the RPC error. The editor shows the real fields and the error; it falls back to the
+  defaults (plus the tree node's fields) only when the file does not parse. The New session
+  dialog disables Create for a flagged template.
+- **Hosts.** Duplicate host names and more than one local host are rejected at startup. A
+  template's `host` must name a configured host (`unknown host: {h}`).
+- **Concurrent requests.** Requests on one runtime connection run concurrently and responses
+  are matched by id: a running turn or model load never holds up the template, session-list
+  or catalog methods. Attaching and the chat methods on the attached session (`set_sampling`,
+  `set_thinking`, `reset`, `send_turn`, `model_props`, `tokenize`, `list_tools`) are started
+  in arrival order, so a `set_sampling` sent before `send_turn` applies to it and an
+  `attach_session` sent after `send_turn` does not retarget it. Attaching elsewhere while a
+  turn runs leaves the turn to the session's other connections (it aborts if none remain).
+- **A turn is bound to its harness.** The harness identity (model, context size and the
+  manager's start instance) is recorded with the first step's link. If a later step finds the
+  host serving another harness, a reload of the same model included, the turn ends with
+  `turn_error {message: "model changed"}` then `loop_done {reason: "error"}`.
+- **`updated` means activity.** Only a committed turn, `create_session` and
+  `rename_session` move `updated` (and so the list order); sampling and thinking overrides
+  and `reset` do not.
+- **`send_turn` errors.** When the sender's own session is deleted mid-turn the reply is
+  `session deleted`; when the answer was shown but committing it failed, it is
+  `answer shown but not saved: {e}`.
+- **Runtime discovery.** The supervisor's control plane answers `hello` with
+  `{runtime_url, runtime_error}`. `runtime_url` is the bound runtime's websocket whether or not
+  a model is loaded; `runtime_error` says why the runtime is off (unusable agents data, a
+  failed bind). The app prefers `runtime_url`, then a Ready harness's `chat_url` (an older
+  supervisor), then the supervisor host on :8779; while `runtime_error` is set the Sessions
+  and Agents panels show it and the runtime socket is not tried.
 
 ## Extension points (designed now, built later)
 

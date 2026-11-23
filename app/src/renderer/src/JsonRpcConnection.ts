@@ -23,7 +23,7 @@ export interface IDisposable
     Dispose(): void
 }
 
-/** Typed signal: handlers subscribe, the owner raises (mirrors SidecarExitSignal). Used for every app-level event, not only turn notes. */
+/** Typed signal: handlers subscribe, the owner raises. Used for every app-level event, not only turn notes. */
 export class TypedSignal<T>
 {
     private static readonly HandlerFailedMessage = 'Signal handler threw'
@@ -68,8 +68,8 @@ export class TypedSignal<T>
  */
 export abstract class JsonRpcConnection
 {
-    private static readonly NotConnectedMessage = 'Harness not connected'
-    private static readonly SocketErrorMessage = 'Harness socket error'
+    private static readonly NotConnectedMessage = 'Runtime not connected'
+    private static readonly SocketErrorMessage = 'Runtime socket error'
     private static readonly RpcErrorFallback = 'RPC error'
     private static readonly SocketConnecting = 0
     private static readonly SocketOpen = 1

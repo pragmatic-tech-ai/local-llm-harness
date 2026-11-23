@@ -16,7 +16,8 @@ import { TextFormat } from './TextFormat'
 /**
  * The Agents capability: the template tree in the side pane (`Panel`) and the template editor in the content host
  * (`Editor`, shown when the capability is activated or a template is opened). It talks over the Sessions capability's
- * runtime connection (no second socket) and follows its connection state. The dialogs behind the tree's commands
+ * runtime connection (no second socket) and follows its connection state; when the supervisor says the runtime is
+ * off, the tree's status line says why. The dialogs behind the tree's commands
  * live here. Unsaved editor changes are guarded: picking another template, starting a new one, or leaving the rail
  * asks Discard / Cancel first.
  */
@@ -71,6 +72,7 @@ export class AgentsService extends ServiceBase implements IActivatable
         this.Editor = new TemplateEditorViewModel(this.client)
         this.subscriptions.push(
             sessions.OnConnectionChanged.Subscribe(state => this.ApplyConnection(state)),
+            sessions.OnRuntimeErrorChanged.Subscribe(text => this.Panel.SetRuntimeError(text)),
             this.Panel.OnSelectRequested.Subscribe(node => void this.RequestSelect(node)),
             this.Panel.OnRefreshed.Subscribe(() => this.OnTreeRefreshed()),
             this.Panel.OnNewTemplateRequested.Subscribe(path => void this.NewTemplate(path)),
@@ -86,6 +88,7 @@ export class AgentsService extends ServiceBase implements IActivatable
                 .subscribe(() => this.OnActiveServiceChanged(navigation))
             this.subscriptions.push({ Dispose: () => active.dispose() })
         }
+        this.Panel.SetRuntimeError(sessions.RuntimeError)
         this.ApplyConnection(sessions.Connection)
     }
 

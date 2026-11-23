@@ -94,7 +94,6 @@ export class RuntimeClient extends JsonRpcConnection
     private static readonly MethodTokenize = 'tokenize'
     private static readonly MethodSetSampling = 'set_sampling'
     private static readonly MethodSendTurn = 'send_turn'
-    private static readonly MethodListTools = 'list_tools'
     private static readonly MethodListTemplates = 'list_templates'
     private static readonly MethodGetTemplate = 'get_template'
     private static readonly MethodSaveTemplate = 'save_template'
@@ -113,7 +112,6 @@ export class RuntimeClient extends JsonRpcConnection
     private static readonly MethodLoadSessionModel = 'load_session_model'
     private static readonly MethodUnloadSessionModel = 'unload_session_model'
     private static readonly MethodSetThinking = 'set_thinking'
-    private static readonly MethodReset = 'reset'
     private static readonly NoteSessionsChanged = 'sessions_changed'
     private static readonly NoteTemplatesChanged = 'templates_changed'
     private static readonly NotePlacementChanged = 'placement_changed'
@@ -157,12 +155,6 @@ export class RuntimeClient extends JsonRpcConnection
         await this.Request<null>(RuntimeClient.MethodSetSampling, { config })
     }
 
-    /** The agent runtime's tool catalogue (a plain worker rejects this). */
-    public ListTools(): Promise<ToolSpec[]>
-    {
-        return this.Request<ToolSpec[]>(RuntimeClient.MethodListTools, {})
-    }
-
     /** Resolves when the send_turn response arrives, i.e. after the stream's terminal notification. */
     public async SendTurn(content: string): Promise<void>
     {
@@ -174,9 +166,11 @@ export class RuntimeClient extends JsonRpcConnection
         return this.Request<TemplateNode[]>(RuntimeClient.MethodListTemplates, {})
     }
 
-    public GetTemplate(id: string): Promise<TemplateRecord>
+    /** The template; `error` says why it fails validation (null when it passes, or from a server without the field). */
+    public async GetTemplate(id: string): Promise<TemplateRecord>
     {
-        return this.Request<TemplateRecord>(RuntimeClient.MethodGetTemplate, { id })
+        const record = await this.Request<TemplateRecord>(RuntimeClient.MethodGetTemplate, { id })
+        return { ...record, error: record.error ?? null }
     }
 
     /** Creates a template when id is omitted, else replaces it; resolves to the id. The server defaults a missing path to the root. */
@@ -225,7 +219,7 @@ export class RuntimeClient extends JsonRpcConnection
         return this.Request<CatalogInfo>(RuntimeClient.MethodListCatalog, {})
     }
 
-    /** Every tool in the runtime registry (ListTools is the attached session's own subset). */
+    /** Every tool in the runtime registry (the template editor's checkboxes). */
     public ListAllTools(): Promise<ToolSpec[]>
     {
         return this.Request<ToolSpec[]>(RuntimeClient.MethodListAllTools, {})
@@ -270,12 +264,6 @@ export class RuntimeClient extends JsonRpcConnection
     public async SetThinking(enable: boolean): Promise<void>
     {
         await this.Request<null>(RuntimeClient.MethodSetThinking, { enable })
-    }
-
-    /** Resets the attached session transcript to its initial state. */
-    public async Reset(): Promise<void>
-    {
-        await this.Request<null>(RuntimeClient.MethodReset, {})
     }
 
     protected Dispatch(method: string, params: unknown): void

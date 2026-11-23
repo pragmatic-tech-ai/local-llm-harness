@@ -13,10 +13,14 @@ policy seam stays, unused.
 
 ## Steps
 
-1. **Agent definitions.** A named bundle of system prompt, tool set, step budget and
-   preferred runtime + model. Picked in the app, it configures the runtime session and
-   drives the supervisor's start/stop lifecycle, as the supervisor design anticipated. It
-   gets its own capability on the navigation rail. Everything below hangs off this.
+1. **Agent definitions.** *Shipped 2026-11-23* as agent templates and sessions
+   (`docs/specs/2026-11-23-agent-templates-sessions-design.md`). A template is a named
+   bundle of system prompt, tool set, step budget, runtime + model + context size and
+   sampling defaults, stored as a TOML file in groups and edited in the **Agents**
+   capability. A session is started from a template (snapshotting it) and persisted with
+   its transcript; the **Sessions** capability lists and opens sessions. The dispatcher
+   loads a session's model on an explicit Load or on its first message, through the
+   supervisor. Everything below hangs off this.
 2. **Agent trace in the instrument panel.** Per step: context fill, tokens, tool latency,
    and why the loop stopped. This makes every later capability measurable on the small
    model.

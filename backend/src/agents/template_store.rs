@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use super::atomic_file::AtomicFile;
-use super::template::{AgentTemplate, TemplateRules};
+use super::template::{AgentTemplate, RulesSource, TemplateRules};
 
 const EXT: &str = "toml";
 const SEED_GROUP: &str = "Examples";
@@ -118,23 +118,24 @@ impl TemplateNode {
 
 pub struct TemplateStore {
     root: PathBuf,
-    rules: TemplateRules,
+    /// Read on every validation, so the rules follow the catalog (see [`RulesSource`]).
+    rules: Box<dyn RulesSource>,
     write_lock: Mutex<()>,
 }
 
 impl TemplateStore {
     /// Opens (creating if needed) the store at `root`; seeds `Examples/Default.toml` when the
     /// root is missing or empty.
-    pub fn open(root: &Path, rules: TemplateRules) -> io::Result<Self> {
+    pub fn open(root: &Path, rules: impl RulesSource + 'static) -> io::Result<Self> {
         let fresh = !root.exists() || fs::read_dir(root)?.next().is_none();
         fs::create_dir_all(root)?;
         let store = Self {
             root: root.to_path_buf(),
-            rules,
+            rules: Box::new(rules),
             write_lock: Mutex::new(()),
         };
         if fresh {
-            let seed = store.seed_template();
+            let seed = Self::seed_template(&store.rules.rules());
             let dir = root.join(SEED_GROUP);
             fs::create_dir_all(&dir)?;
             Self::write_atomic(&dir, SEED_ID, &seed)?;
@@ -142,21 +143,20 @@ impl TemplateStore {
         Ok(store)
     }
 
-    fn seed_template(&self) -> AgentTemplate {
+    fn seed_template(rules: &TemplateRules) -> AgentTemplate {
         let capable = |m: &&(String, Vec<String>)| m.1.iter().any(|r| r == SEED_RUNTIME);
-        let model = self
-            .rules
+        let model = rules
             .models
             .iter()
             .filter(capable)
             .find(|m| m.0.contains(SEED_MODEL_HINT))
-            .or_else(|| self.rules.models.iter().find(capable))
+            .or_else(|| rules.models.iter().find(capable))
             .map(|m| m.0.clone())
             .unwrap_or_default();
         AgentTemplate {
             name: SEED_NAME.to_string(),
             system_prompt: String::new(),
-            tools: self.rules.tools.clone(),
+            tools: rules.tools.clone(),
             step_budget: SEED_STEP_BUDGET,
             runtime: SEED_RUNTIME.to_string(),
             model,
@@ -167,17 +167,19 @@ impl TemplateStore {
         }
     }
 
-    /// The whole tree. Templates whose id (file stem) occurs more than once anywhere in the tree
-    /// are all flagged with `duplicate template id: {id}`.
+    /// The whole tree. A template that fails to parse, or parses but fails the same validation
+    /// as `save`, carries the error text. Templates whose id (file stem) occurs more than once
+    /// anywhere in the tree are all flagged with `duplicate template id: {id}`.
     pub fn tree(&self) -> Vec<TemplateNode> {
-        let mut nodes = Self::read_level(&self.root, "");
+        let rules = self.rules.rules();
+        let mut nodes = Self::read_level(&self.root, "", &rules);
         let mut counts = HashMap::new();
         TemplateNode::count_ids(&nodes, &mut counts);
         TemplateNode::flag_duplicates(&mut nodes, &counts);
         nodes
     }
 
-    fn read_level(dir: &Path, rel: &str) -> Vec<TemplateNode> {
+    fn read_level(dir: &Path, rel: &str, rules: &TemplateRules) -> Vec<TemplateNode> {
         let mut nodes = Vec::new();
         let Ok(entries) = fs::read_dir(dir) else {
             return nodes;
@@ -194,7 +196,7 @@ impl TemplateStore {
                 nodes.push(TemplateNode::Group {
                     name: file_name,
                     path: child_rel.clone(),
-                    children: Self::read_level(&p, &child_rel),
+                    children: Self::read_level(&p, &child_rel, rules),
                 });
             } else if p.extension().and_then(|e| e.to_str()) == Some(EXT) {
                 let id = p
@@ -207,12 +209,12 @@ impl TemplateStore {
                     .and_then(|s| toml::from_str::<AgentTemplate>(&s).map_err(|e| e.to_string()));
                 nodes.push(match parsed {
                     Ok(t) => TemplateNode::Template {
+                        error: rules.validate(&t).err(),
                         id,
                         path: rel.to_string(),
                         name: t.name,
                         runtime: t.runtime,
                         model: t.model,
-                        error: None,
                     },
                     Err(e) => TemplateNode::Template {
                         name: id.clone(),
@@ -237,13 +239,20 @@ impl TemplateStore {
         Ok((t, rel))
     }
 
+    /// Why `t` fails validation against the current rules, or `None` when it passes.
+    pub fn check(&self, t: &AgentTemplate) -> Option<String> {
+        self.rules.rules().validate(t).err()
+    }
+
     pub fn save(
         &self,
         id: Option<&str>,
         path: &str,
         t: &AgentTemplate,
     ) -> Result<String, TemplateError> {
-        self.rules.validate(t).map_err(TemplateError)?;
+        if let Some(e) = self.check(t) {
+            return Err(TemplateError(e));
+        }
         let dir = self.dir_for(path)?;
         let _g = self.lock()?;
         let (id, old) = match id {
@@ -558,7 +567,7 @@ mod tests {
                 n_ctx: 4096,
                 enable_thinking: true,
                 sampling: Some(crate::engine::SamplingConfig::default()),
-                host: Some("laptop".into()),
+                host: Some("hive".into()),
             }
         }
     }
@@ -679,6 +688,106 @@ mod tests {
         );
         assert!(s.get("bad").is_err());
         assert!(s.get("default").is_ok());
+    }
+
+    /// A rule set the test can change after the store is open.
+    struct ChangingRules(std::sync::Arc<Mutex<TemplateRules>>);
+
+    impl RulesSource for ChangingRules {
+        fn rules(&self) -> TemplateRules {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn template_failing_validation_is_listed_with_its_error() {
+        let d = TempDir::new("invalid");
+        let s = d.store();
+        // (id, runtime, extra TOML, the validation error)
+        let cases = [
+            (
+                "tool",
+                "llamacpp",
+                "tools = [\"nope\"]",
+                "unknown tool: nope",
+            ),
+            (
+                "budget",
+                "llamacpp",
+                "step_budget = 0",
+                "step_budget must be at least 1",
+            ),
+            (
+                "runtime",
+                "candle",
+                "",
+                "runtime candle cannot load model gemma-4-e4b",
+            ),
+            ("host", "llamacpp", "host = \"far\"", "unknown host: far"),
+        ];
+        for (id, runtime, extra, _) in cases {
+            let body = format!(
+                "name = \"{id}\"
+runtime = \"{runtime}\"
+model = \"gemma-4-e4b\"
+n_ctx = 4096
+{extra}
+"
+            );
+            fs::write(d.0.join("templates").join(format!("{id}.toml")), body).unwrap();
+        }
+        let tree = s.tree();
+        for (id, _, _, want) in cases {
+            let node = tree
+                .iter()
+                .find(|n| matches!(n, TemplateNode::Template { id: i, .. } if i == id))
+                .unwrap_or_else(|| panic!("{id} missing"));
+            let TemplateNode::Template {
+                error, name, model, ..
+            } = node
+            else {
+                unreachable!()
+            };
+            assert_eq!(error.as_deref(), Some(want), "{id}");
+            // Parsed, so the node carries the template's real fields.
+            assert_eq!(name, id);
+            assert_eq!(model, "gemma-4-e4b");
+            // Still readable, so the editor can show and repair it.
+            let (t, _) = s.get(id).unwrap();
+            assert_eq!(s.check(&t).as_deref(), Some(want));
+        }
+    }
+
+    #[test]
+    fn rules_are_read_on_every_use() {
+        let d = TempDir::new("liverules");
+        let shared = std::sync::Arc::new(Mutex::new(TemplateRules::for_tests()));
+        let s = TemplateStore::open(
+            &d.0.join("templates"),
+            ChangingRules(std::sync::Arc::clone(&shared)),
+        )
+        .unwrap();
+        let mut t = TempDir::sample("Fresh");
+        t.model = "dropped-in".into();
+        assert_eq!(
+            s.save(None, "", &t).unwrap_err().0,
+            "unknown model: dropped-in"
+        );
+        shared
+            .lock()
+            .unwrap()
+            .models
+            .push(("dropped-in".into(), vec!["llamacpp".into()]));
+        let id = s.save(None, "", &t).unwrap();
+        assert!(s
+            .tree()
+            .iter()
+            .any(|n| matches!(n, TemplateNode::Template { id: i, error: None, .. } if *i == id)));
+        // Removed again: the tree flags it without a restart.
+        shared.lock().unwrap().models.pop();
+        assert!(s.tree().iter().any(
+            |n| matches!(n, TemplateNode::Template { id: i, error: Some(_), .. } if *i == id)
+        ));
     }
 
     #[test]
@@ -915,6 +1024,7 @@ mod tests {
                 ("beta".into(), vec!["llamacpp".into()]),
             ],
             tools: vec![],
+            hosts: vec![],
         };
         let s = TemplateStore::open(&d.0.join("templates"), rules).unwrap();
         assert_eq!(s.get("default").unwrap().0.model, "alpha");

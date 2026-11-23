@@ -44,6 +44,11 @@ pub struct HarnessInfo {
     /// without one (the engine then picked its own default, which is not recorded).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n_ctx: Option<u32>,
+    /// Which start of a harness this is: a fresh number for every harness that became Ready
+    /// (`0` before that). Runtime-internal, so a reload of the same model is told apart; not on
+    /// the wire.
+    #[serde(skip)]
+    pub instance: u64,
 }
 
 /// Why a manager operation failed.
@@ -515,6 +520,7 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
             url: None,
             chat_url: None,
             n_ctx: n_ctx_override,
+            instance: 0,
         };
         self.shared.publish(info.clone());
 
@@ -541,6 +547,7 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
             generation,
         });
         info.state = HarnessState::Ready;
+        info.instance = generation;
         info.url = Some(format!(
             "ws://{}:{}",
             self.catalog.advertise_host, self.catalog.worker_port

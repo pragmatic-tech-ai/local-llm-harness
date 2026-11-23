@@ -60,6 +60,13 @@ pub struct SessionStore {
     clock: Clock,
 }
 
+/// Whether a mutation moves `updated` (last activity: a committed turn, create or rename).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bump {
+    Updated,
+    Kept,
+}
+
 /// A source of unix milliseconds.
 type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
 
@@ -176,8 +183,9 @@ impl SessionStore {
         self.lock().get(id).cloned()
     }
 
+    /// Retitles the session and bumps `updated`.
     pub fn rename(&self, id: &str, title: &str) -> Result<(), SessionError> {
-        self.mutate(id, |r| r.title = title.to_string())
+        self.mutate(id, Bump::Updated, |r| r.title = title.to_string())
     }
 
     pub fn delete(&self, id: &str) -> Result<(), SessionError> {
@@ -196,37 +204,46 @@ impl SessionStore {
 
     /// Replaces the transcript and bumps `updated`.
     pub fn commit(&self, id: &str, transcript: Vec<ChatMessage>) -> Result<(), SessionError> {
-        self.mutate(id, |r| r.transcript = transcript)
+        self.mutate(id, Bump::Updated, |r| r.transcript = transcript)
     }
 
+    /// Replaces the sampling and thinking overrides; `updated` (last activity) is kept.
     pub fn set_overrides(
         &self,
         id: &str,
         sampling: Option<SamplingConfig>,
         enable_thinking: Option<bool>,
     ) -> Result<(), SessionError> {
-        self.mutate(id, |r| {
+        self.mutate(id, Bump::Kept, |r| {
             r.sampling = sampling;
             r.enable_thinking = enable_thinking;
         })
     }
 
-    /// Returns the transcript to its initial state, derived from the snapshot.
+    /// Returns the transcript to its initial state, derived from the snapshot; `updated` is
+    /// kept.
     pub fn reset(&self, id: &str) -> Result<(), SessionError> {
-        self.mutate(id, |r| {
+        self.mutate(id, Bump::Kept, |r| {
             r.transcript = SessionRecord::initial_transcript(&r.snapshot)
         })
     }
 
     /// Applies `f` to a copy of the record, persists it, then swaps it in.
-    fn mutate(&self, id: &str, f: impl FnOnce(&mut SessionRecord)) -> Result<(), SessionError> {
+    fn mutate(
+        &self,
+        id: &str,
+        bump: Bump,
+        f: impl FnOnce(&mut SessionRecord),
+    ) -> Result<(), SessionError> {
         let mut map = self.lock();
         let mut rec = map
             .get(id)
             .cloned()
             .ok_or_else(|| SessionError::unknown(id))?;
         f(&mut rec);
-        rec.updated = self.now_secs();
+        if bump == Bump::Updated {
+            rec.updated = self.now_secs();
+        }
         self.persist(&rec)?;
         map.insert(rec.id.clone(), rec);
         Ok(())
@@ -546,16 +563,16 @@ mod tests {
         // Same `updated`: id descending.
         let ids: Vec<String> = s.list().into_iter().map(|x| x.id).collect();
         assert_eq!(ids, vec![b.id.clone(), a.id.clone()]);
-        // Each mutation bumps `updated`.
+        // A rename and a commit bump `updated`; overrides and a reset keep it.
         ms.store(11_000, Ordering::SeqCst);
         s.rename(&a.id, "n").unwrap();
         assert_eq!(s.get(&a.id).unwrap().updated, 11);
         ms.store(12_000, Ordering::SeqCst);
         s.set_overrides(&a.id, None, Some(true)).unwrap();
-        assert_eq!(s.get(&a.id).unwrap().updated, 12);
+        assert_eq!(s.get(&a.id).unwrap().updated, 11);
         ms.store(13_000, Ordering::SeqCst);
         s.reset(&a.id).unwrap();
-        assert_eq!(s.get(&a.id).unwrap().updated, 13);
+        assert_eq!(s.get(&a.id).unwrap().updated, 11);
         ms.store(14_000, Ordering::SeqCst);
         s.commit(&a.id, vec![]).unwrap();
         assert_eq!(s.get(&a.id).unwrap().updated, 14);

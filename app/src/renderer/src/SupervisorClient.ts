@@ -10,15 +10,28 @@ export interface HarnessInfo
     chat_url?: string
 }
 
+/** The supervisor's `hello`: the agent runtime it hosts (its url while bound, model loaded or not) or why it is off. */
+export interface SupervisorHello
+{
+    runtime_url: string | null
+    runtime_error: string | null
+}
+
 /**
- * JSON-RPC client for the supervisor control server, used only to discover the agent runtime endpoint:
- * the supervisor advertises the runtime as `chat_url` on its harnesses.
+ * JSON-RPC client for the supervisor control server, used only to discover the agent runtime endpoint: `hello`
+ * advertises it as `runtime_url` (an older supervisor only as `chat_url` on a Ready harness).
  */
 export class SupervisorClient extends JsonRpcConnection
 {
+    private static readonly MethodHello = 'hello'
     private static readonly MethodListHarnesses = 'list_harnesses'
-    /** The runtime's port when no harness advertises a `chat_url`. */
+    /** The runtime's port when the supervisor advertises none. */
     private static readonly DefaultRuntimePort = '8779'
+
+    public Hello(): Promise<SupervisorHello>
+    {
+        return this.Request<SupervisorHello>(SupervisorClient.MethodHello, {})
+    }
 
     public ListHarnesses(): Promise<HarnessInfo[]>
     {
@@ -27,22 +40,21 @@ export class SupervisorClient extends JsonRpcConnection
 
     /**
      * The runtime url: the supervisor url (scheme and host kept, so a tunnel or LAN name still works) with its port
-     * replaced by the port of the first advertised `chat_url`, else by the default runtime port.
+     * replaced by the port of `hello`'s `runtime_url`, else of the first advertised `chat_url`, else by the default
+     * runtime port.
      */
-    public static RuntimeUrl(supervisorUrl: string, harnesses: readonly HarnessInfo[]): string
+    public static RuntimeUrl(supervisorUrl: string, hello: SupervisorHello | null, harnesses: readonly HarnessInfo[]): string
     {
         const supervisor = new URL(supervisorUrl)
+        const advertised = [hello?.runtime_url, ...harnesses.map(h => h.chat_url)]
         let port = SupervisorClient.DefaultRuntimePort
-        for (const harness of harnesses)
+        for (const url of advertised)
         {
-            if (harness.chat_url)
+            const candidate = SupervisorClient.PortOf(url)
+            if (candidate !== null)
             {
-                const advertised = new URL(harness.chat_url).port
-                if (advertised.length > 0)
-                {
-                    port = advertised
-                    break
-                }
+                port = candidate
+                break
             }
         }
         return `${supervisor.protocol}//${supervisor.hostname}:${port}`
@@ -51,5 +63,16 @@ export class SupervisorClient extends JsonRpcConnection
     protected Dispatch(): void
     {
         // The supervisor's harness notifications served the removed picker; nothing listens now.
+    }
+
+    /** The explicit port of an advertised url, or null (none advertised, or no port in it). */
+    private static PortOf(url: string | null | undefined): string | null
+    {
+        if (typeof url !== 'string' || url.length === 0)
+        {
+            return null
+        }
+        const port = new URL(url).port
+        return port.length > 0 ? port : null
     }
 }

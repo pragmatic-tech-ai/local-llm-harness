@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod catalog_source;
 pub mod executor;
 pub mod hub;
 pub mod policy;

@@ -209,6 +209,40 @@ describe('SessionsPanelViewModel', () =>
         expect(rig.panel.ShowsEmptyText).toBe(true)
     })
 
+    it('runtime_error_replaces_connecting_until_connected', () =>
+    {
+        const rig = new Rig()
+        rig.panel.SetConnection(ConnectionState.Reconnecting)
+        rig.panel.SetRuntimeError('agents data unavailable: denied')
+        expect(rig.panel.EmptyText).toBe('The runtime is off on the supervisor: agents data unavailable: denied')
+        rig.panel.SetConnection(ConnectionState.Connected)
+        expect(rig.panel.EmptyText).toBe('No sessions yet.')
+        rig.panel.SetConnection(ConnectionState.Reconnecting)
+        rig.panel.SetRuntimeError('')
+        expect(rig.panel.EmptyText).toBe('Connecting to the runtime…')
+    })
+
+    it('a_list_reply_older_than_a_notification_keeps_the_notified_state', async () =>
+    {
+        const rig = new Rig()
+        await rig.Load([Rig.Row('a', Rig.NeedsLoad), Rig.Row('b', Rig.NeedsLoad)])
+        // The list is asked for, then the model loads and a turn starts before the (older) reply lands.
+        const done = rig.panel.Refresh()
+        rig.Notify('placement_changed', { id: 'a', placement: Rig.Ready })
+        rig.Notify('session_busy', { id: 'a', busy: true })
+        await rig.List([Rig.Row('a', Rig.NeedsLoad), Rig.Row('b', Rig.Ready)])
+        await done
+        const [a, b] = rig.panel.Sessions.ToArray()
+        expect(a.Placement).toEqual(Rig.Ready)
+        expect(a.Busy).toBe(true)
+        // No notification for b since the request: the reply applies.
+        expect(b.Placement).toEqual(Rig.Ready)
+        // A later list reply (asked after the notes) applies in full.
+        await rig.Load([Rig.Row('a', Rig.NeedsLoad), Rig.Row('b', Rig.Ready)])
+        expect(rig.panel.Sessions.ToArray()[0].Placement).toEqual(Rig.NeedsLoad)
+        expect(rig.panel.Sessions.ToArray()[0].Busy).toBe(false)
+    })
+
     it('report_error_shows_on_status_line', () =>
     {
         const rig = new Rig()
@@ -222,7 +256,7 @@ describe('SessionsPanelViewModel', () =>
         const done = rig.panel.Refresh()
         rig.socket.Close()
         await done
-        expect(rig.panel.StatusText).toBe('sessions unavailable: Harness not connected')
+        expect(rig.panel.StatusText).toBe('sessions unavailable: Runtime not connected')
     })
 })
 

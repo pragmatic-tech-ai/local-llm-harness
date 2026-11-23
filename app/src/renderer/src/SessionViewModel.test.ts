@@ -179,6 +179,36 @@ describe('SessionViewModel', () =>
         expect(rig.view.CanLoad).toBe(true)
     })
 
+    it('a_reconnect_during_a_first_message_load_ends_loading_model', async () =>
+    {
+        const rig = new Rig()
+        const needsLoad: Placement = { state: PlacementState.NeedsLoad, host: 'local', evicts: null }
+        await rig.Show(needsLoad)
+        rig.Notify('session_loading', { id: 's1' })
+        expect(rig.view.PlacementText).toBe('loading model…')
+        // The socket drops before turn_started: the turn is lost with it.
+        rig.view.Detach()
+        expect(rig.view.PlacementText).toBe('model not loaded')
+        // Re-attached (same session): Load follows the placement again.
+        await rig.Show(needsLoad)
+        expect(rig.view.PlacementText).toBe('model not loaded')
+        expect(rig.view.CanLoad).toBe(true)
+    })
+
+    it('an_attach_reply_older_than_a_placement_change_keeps_the_change', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.NeedsLoad, host: 'local', evicts: null })
+        const ready: Placement = { state: PlacementState.Ready, host: 'local' }
+        // Re-attach; the model finishes loading before the (older) reply lands.
+        const done = rig.view.Attach('s1')
+        rig.Notify('placement_changed', { id: 's1', placement: ready })
+        await rig.Respond('attach_session', Rig.Attached({ state: PlacementState.NeedsLoad, host: 'local', evicts: null }))
+        await done
+        expect(rig.view.PlacementText).toBe('live on local')
+        expect(rig.view.CanUnload).toBe(true)
+    })
+
     it('stale_marks_placement_and_disables_load', async () =>
     {
         const rig = new Rig()

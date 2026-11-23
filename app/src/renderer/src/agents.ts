@@ -51,6 +51,8 @@ export interface TemplateRecord
     id: string
     path: string
     template: AgentTemplate
+    /** Why the template fails validation (it parsed, so `template` is real); null when it passes. */
+    error: string | null
 }
 
 /** Where a session's model stands on its host (the wire `placement.state`). */
