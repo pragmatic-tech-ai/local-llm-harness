@@ -227,6 +227,23 @@ mod tests {
     }
 
     #[test]
+    fn chat_message_round_trips_with_all_tool_fields() {
+        let mut msg = ChatMessage::new(Role::Tool, "ok");
+        msg.tool_calls = Some(vec![ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "f".into(),
+                arguments: serde_json::json!({"a": 1}),
+            },
+        }]);
+        msg.tool_call_id = Some("c1".into());
+        msg.tool_result = Some(serde_json::json!({"x": [1, 2]}));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<ChatMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
     fn template_view_uses_tool_result_as_content_for_tool_role() {
         let mut tool = ChatMessage::new(Role::Tool, "ignored");
         tool.tool_call_id = Some("c1".into());

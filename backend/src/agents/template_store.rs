@@ -8,10 +8,10 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+use super::atomic_file::AtomicFile;
 use super::template::{AgentTemplate, TemplateRules};
 
 const EXT: &str = "toml";
-const TMP_EXT: &str = "tmp";
 const SEED_GROUP: &str = "Examples";
 const SEED_NAME: &str = "Default";
 const SEED_ID: &str = "default";
@@ -511,13 +511,7 @@ impl TemplateStore {
     fn write_atomic(dir: &Path, id: &str, t: &AgentTemplate) -> io::Result<()> {
         let body = toml::to_string_pretty(t)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let tmp = dir.join(format!(".{id}.{EXT}.{TMP_EXT}"));
-        let result =
-            fs::write(&tmp, body).and_then(|_| fs::rename(&tmp, dir.join(format!("{id}.{EXT}"))));
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        result
+        AtomicFile::write(dir, &format!("{id}.{EXT}"), body.as_bytes())
     }
 }
 
