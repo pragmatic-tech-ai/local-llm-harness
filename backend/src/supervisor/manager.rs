@@ -1160,7 +1160,10 @@ mod tests {
         // Explicit → `-c <n>`.
         http.n_ctx = Some(2048);
         let plan = SpawnPlan::build(&http, &model, &cat, None).unwrap();
-        assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "2048"]));
+        assert!(plan.children[0]
+            .args
+            .windows(2)
+            .any(|w| w == ["-c", "2048"]));
     }
 
     #[test]
@@ -1192,7 +1195,10 @@ mod tests {
         http.internal_port = Some(8080);
         http.server_exe = Some(PathBuf::from("llama-server.exe"));
         let plan = SpawnPlan::build(&http, &model, &cat, Some(8192)).unwrap();
-        assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "8192"]));
+        assert!(plan.children[0]
+            .args
+            .windows(2)
+            .any(|w| w == ["-c", "8192"]));
     }
 
     #[tokio::test]
@@ -1207,7 +1213,11 @@ mod tests {
 
     #[tokio::test]
     async fn start_records_n_ctx_in_info() {
-        let m = manager("nctxreq", FakeLauncher::default(), FakeProbe::new(Mode::Ready));
+        let m = manager(
+            "nctxreq",
+            FakeLauncher::default(),
+            FakeProbe::new(Mode::Ready),
+        );
         let info = m.start("llamacpp", "lla", Some(4096)).await.unwrap();
         assert_eq!(info.n_ctx, Some(4096));
         assert_eq!(m.current().unwrap().n_ctx, Some(4096));

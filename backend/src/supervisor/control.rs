@@ -484,7 +484,10 @@ mod tests {
     async fn start_accepts_n_ctx_override() {
         let s = server("nctx");
         let v = s
-            .dispatch("start", json!({"runtime": "candle", "model": "gem", "n_ctx": 8192}))
+            .dispatch(
+                "start",
+                json!({"runtime": "candle", "model": "gem", "n_ctx": 8192}),
+            )
             .await
             .unwrap();
         assert_eq!(v["id"], "candle:gem");

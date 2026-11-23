@@ -14,7 +14,9 @@
 //! session-list or catalog methods behind it. Attaching and the chat methods do their part
 //! that reads or changes the attachment, the session's overrides or its busy flag when they
 //! are started, so they take effect in arrival order: a `set_sampling` sent before `send_turn`
-//! is applied first, and an `attach_session` sent after `send_turn` does not retarget it.
+//! is applied first, and an `attach_session` sent after `send_turn` does not retarget it. A
+//! request whose handling panics is answered with an internal error (`request failed`); a
+//! busy flag it held is released as it unwinds.
 //! List-level notifications (`sessions_changed`, `templates_changed`, `placement_changed`,
 //! `session_busy`) reach every connection; a turn's notifications and `session_loading` reach
 //! only the connections attached to its session. A committed turn broadcasts
@@ -43,7 +45,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use futures::stream::SplitSink;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
@@ -399,6 +401,10 @@ impl RuntimeConnection {
     /// The client was shown the answer, but committing it failed.
     const ERR_NOT_SAVED: &'static str = "answer shown but not saved: ";
     const CLIENT_GONE: &'static str = "client connection closed";
+    /// The sender attached to another session while its turn ran, leaving the turn no sink.
+    const ERR_DETACHED: &'static str = "session detached";
+    /// A request's handling panicked.
+    const ERR_REQUEST_FAILED: &'static str = "request failed";
 
     /// Registers a connection with the hub; the receiver yields every frame to write to it.
     pub fn new(deps: RuntimeDeps) -> (Self, mpsc::UnboundedReceiver<Value>) {
@@ -430,7 +436,7 @@ impl RuntimeConnection {
                     continue;
                 }
             };
-            let pending = self.start(&request.method, request.params);
+            let pending = Self::guarded(self.start(&request.method, request.params));
             let id = request.id;
             let hub = Arc::clone(&self.deps.hub);
             let conn = self.conn;
@@ -460,7 +466,19 @@ impl RuntimeConnection {
     /// starts it the same way and awaits the rest in a task.
     #[cfg(test)]
     pub(crate) async fn dispatch(&self, method: &str, params: Value) -> Result<Value, RpcError> {
-        self.start(method, params).await
+        Self::guarded(self.start(method, params)).await
+    }
+
+    /// `pending`, with a panic in it answered as an internal error (`request failed`) instead
+    /// of leaving the request unanswered. Unwinding drops the future's state first, so a busy
+    /// guard it held is released.
+    fn guarded(pending: Pending) -> Pending {
+        Box::pin(async move {
+            std::panic::AssertUnwindSafe(pending)
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(RpcError::internal(Self::ERR_REQUEST_FAILED)))
+        })
     }
 
     /// Starts one request. Attaching and the chat methods do everything that reads or changes
@@ -579,16 +597,18 @@ impl RuntimeConnection {
         // Read after taking busy, so no other turn or reset changes it underneath.
         let rec = SharedRequests::record(&self.deps, &id).map_err(|_| Self::no_session())?;
         let deps = self.deps.clone();
+        let conn = self.conn;
         Ok(Box::pin(async move {
             let _busy = busy;
-            Self::run_turn(&deps, &id, rec, &p.content).await
+            Self::run_turn(&deps, conn, &id, rec, &p.content).await
         }))
     }
 
-    /// Runs the turn. The transcript is committed only when the loop ends `Answered`, after
-    /// `loop_done`.
+    /// Runs the turn sent by `conn`. The transcript is committed only when the loop ends
+    /// `Answered`, after `loop_done`.
     async fn run_turn(
         deps: &RuntimeDeps,
+        conn: ConnId,
         id: &str,
         rec: SessionRecord,
         content: &str,
@@ -625,6 +645,10 @@ impl RuntimeConnection {
             // Deleting a session detaches its connections, which closes the turn's sink.
             Err(SinkClosed) if !deps.sessions.contains(id) => {
                 Err(RpcError::internal(Self::ERR_DELETED))
+            }
+            // The sender is still connected but attached elsewhere, and no one else was.
+            Err(SinkClosed) if deps.hub.attached(conn).is_some_and(|s| s != id) => {
+                Err(RpcError::internal(Self::ERR_DETACHED))
             }
             Err(SinkClosed) => Err(RpcError::internal(Self::CLIENT_GONE)),
         }
@@ -1407,6 +1431,38 @@ mod tests {
         gate.add_permits(1);
         let err = turn.await.unwrap().unwrap_err();
         assert_eq!(err.message, C::ERR_DELETED);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_request_is_answered_and_releases_busy() {
+        // `idle` has no generate script, so the turn's generate call panics.
+        let rt = TestRuntime::new("panic", Client::idle());
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        let err = a.send().await.unwrap_err();
+        assert_eq!(err.code, crate::rpc::ERR_INTERNAL);
+        assert_eq!(err.message, C::ERR_REQUEST_FAILED);
+        assert!(!rt.deps.hub.is_busy(&id));
+        // The session is usable again: the next turn can take busy.
+        assert!(rt.deps.hub.hold_busy(&id).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_turn_left_by_attaching_elsewhere_reports_session_detached() {
+        let rt = TestRuntime::new("detached", Client::answering());
+        let gate = Client::gated(&rt);
+        let mut a = Client::new(&rt);
+        let first = a.open_session().await;
+        let second = a.create().await;
+        a.attach(&first).await;
+        let turn = a.spawn_send();
+        Client::until_loading(&rt).await;
+        a.attach(&second).await;
+        gate.add_permits(1);
+        let err = turn.await.unwrap().unwrap_err();
+        assert_eq!(err.message, C::ERR_DETACHED);
+        assert!(rt.deps.sessions.get(&first).unwrap().transcript.is_empty());
     }
 
     #[tokio::test]
