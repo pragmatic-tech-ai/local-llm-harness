@@ -397,6 +397,13 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
         self.shared.current().into_iter().collect()
     }
 
+    /// The local worker URL while the current harness is Ready; `None` otherwise.
+    pub fn ready_worker_url(&self) -> Option<String> {
+        let info = self.shared.current()?;
+        (info.state == HarnessState::Ready)
+            .then(|| format!("ws://{}:{}", Self::LOCAL_HOST, self.catalog.worker_port))
+    }
+
     /// Subscribe to `harness_changed` events.
     pub fn subscribe(&self) -> broadcast::Receiver<HarnessInfo> {
         self.shared.tx.subscribe()
@@ -956,6 +963,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_worker_url_only_when_ready() {
+        let m = manager("rwu", FakeLauncher::default(), FakeProbe::new(Mode::Ready));
+        assert_eq!(m.ready_worker_url(), None);
+        m.start("llamacpp", "lla", None).await.unwrap();
+        assert_eq!(m.ready_worker_url().as_deref(), Some("ws://127.0.0.1:8777"));
+        let failing = manager("rwu2", FakeLauncher::default(), FakeProbe::new(Mode::Never));
+        failing.start("llamacpp", "lla", None).await.unwrap_err();
+        assert_eq!(failing.ready_worker_url(), None);
+    }
+
+    #[tokio::test]
     async fn start_times_out_to_failed() {
         let l = FakeLauncher::default();
         let m = manager("timeout", l.clone(), FakeProbe::new(Mode::Never));
@@ -1086,7 +1104,10 @@ mod tests {
         // Explicit → `-c <n>`.
         http.n_ctx = Some(2048);
         let plan = SpawnPlan::build(&http, &model, &cat, None).unwrap();
-        assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "2048"]));
+        assert!(plan.children[0]
+            .args
+            .windows(2)
+            .any(|w| w == ["-c", "2048"]));
     }
 
     #[test]
@@ -1118,7 +1139,10 @@ mod tests {
         http.internal_port = Some(8080);
         http.server_exe = Some(PathBuf::from("llama-server.exe"));
         let plan = SpawnPlan::build(&http, &model, &cat, Some(8192)).unwrap();
-        assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "8192"]));
+        assert!(plan.children[0]
+            .args
+            .windows(2)
+            .any(|w| w == ["-c", "8192"]));
     }
 
     #[tokio::test]

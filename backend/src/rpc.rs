@@ -504,6 +504,23 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A real `serve` loop on an ephemeral loopback port.
+    pub(crate) struct TestServer;
+
+    impl TestServer {
+        /// Starts `serve` over `engine` with the given window size; returns its address.
+        pub(crate) async fn spawn(engine: Arc<dyn Engine>, n_ctx: usize) -> std::net::SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let props = ModelProps {
+                n_ctx,
+                model_name: "fake".into(),
+            };
+            tokio::spawn(serve(listener, engine, props, None));
+            addr
+        }
+    }
+
     /// A WebSocket client connected to a real `serve` loop on an ephemeral port.
     pub(crate) struct TestClient {
         ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -513,13 +530,7 @@ pub(crate) mod test_support {
     impl TestClient {
         /// Starts `serve` over `engine` with the given window size and connects to it.
         pub(crate) async fn connect(engine: Arc<dyn Engine>, n_ctx: usize) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            let props = ModelProps {
-                n_ctx,
-                model_name: "fake".into(),
-            };
-            tokio::spawn(serve(listener, engine, props, None));
+            let addr = TestServer::spawn(engine, n_ctx).await;
             let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
                 .await
                 .expect("connect");
