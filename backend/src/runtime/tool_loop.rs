@@ -658,8 +658,8 @@ mod tests {
     #[tokio::test]
     async fn closed_sink_during_tool_results_aborts() {
         let mut f = Fixture::new();
-        // started, chunk, done are accepted; the tool_result notification is refused.
-        f.sink = RecordingSink::closing_after(3);
+        // started, chunk, tool_call, done are accepted; the tool_result notification is refused.
+        f.sink = RecordingSink::closing_after(4);
         let link = FakeLink::new(
             true,
             vec![
@@ -671,6 +671,10 @@ mod tests {
         assert_eq!(result, Err(SinkClosed));
         assert_eq!(link.requests().len(), 1);
         assert!(f.session.transcript().is_empty());
+        assert_eq!(
+            f.sink.methods(),
+            ["turn_started", "turn_chunk", "tool_call", "turn_done"]
+        );
     }
 
     #[tokio::test]
