@@ -194,7 +194,10 @@ impl<'a> ValueReader<'a> {
         let text = &rest[..len];
         let integral = !text.contains(['.', 'e', 'E']);
         let parsed = if integral {
-            text.parse::<i64>().ok().map(Number::from)
+            text.parse::<i64>()
+                .ok()
+                .map(Number::from)
+                .or_else(|| text.parse::<u64>().ok().map(Number::from))
         } else {
             None
         };
@@ -217,8 +220,9 @@ impl<'a> ValueReader<'a> {
         }
         let colon = self
             .rest()
-            .find(':')
-            .ok_or_else(|| "object key without `:`".to_string())?;
+            .find([':', ',', '{', '}'])
+            .filter(|&i| self.rest().as_bytes()[i] == b':')
+            .ok_or_else(|| format!("object key without `:` at byte {}", self.pos))?;
         let key = self.rest()[..colon].trim().to_string();
         if key.is_empty() {
             return Err("empty object key".to_string());
@@ -293,12 +297,20 @@ pub struct GemmaToolParser {
     content: String,
     calls: Vec<ParsedCall>,
     finished: bool,
+    /// Set once the stream is over (response marker or `finish()`); later pushes are ignored.
+    closed: bool,
 }
 
 impl GemmaToolParser {
     const TEXT_DELIMS: [&'static str; 2] =
         [GemmaToolFormat::CALL_OPEN, GemmaToolFormat::RESPONSE_OPEN];
-    const OUTSIDE_DELIMS: [&'static str; 2] = [GemmaToolFormat::CALL_CLOSE, GemmaToolFormat::QUOTE];
+    const OUTSIDE_DELIMS: [&'static str; 3] = [
+        GemmaToolFormat::CALL_CLOSE,
+        GemmaToolFormat::QUOTE,
+        GemmaToolFormat::RESPONSE_OPEN,
+    ];
+    const QUOTE_AT: usize = 1;
+    const RESPONSE_AT: usize = 2;
     const INSIDE_DELIMS: [&'static str; 1] = [GemmaToolFormat::QUOTE];
     const UNTERMINATED: &'static str = "unterminated tool call";
 
@@ -311,6 +323,7 @@ impl GemmaToolParser {
             content: String::new(),
             calls: Vec::new(),
             finished: false,
+            closed: false,
         }
     }
 
@@ -330,7 +343,7 @@ impl GemmaToolParser {
 
     pub fn push(&mut self, text: &str) -> Vec<ParseEvent> {
         let mut events = Vec::new();
-        if self.finished {
+        if self.closed {
             return events;
         }
         self.pending.push_str(text);
@@ -339,7 +352,7 @@ impl GemmaToolParser {
                 Mode::Text => self.step_text(&mut events),
                 Mode::InCall => self.step_call(&mut events),
             };
-            if !progressed || self.finished {
+            if !progressed || self.closed {
                 break;
             }
         }
@@ -349,9 +362,10 @@ impl GemmaToolParser {
     /// Signals end of stream; see the type docs for the unterminated-call behaviour.
     pub fn finish(&mut self) -> Vec<ParseEvent> {
         let mut events = Vec::new();
-        if self.finished {
+        if self.closed {
             return events;
         }
+        self.closed = true;
         match self.mode {
             Mode::Text => {
                 let held = std::mem::take(&mut self.pending);
@@ -384,9 +398,7 @@ impl GemmaToolParser {
                         self.scan_pos = 0;
                         self.in_string = false;
                     } else {
-                        self.pending.clear();
-                        self.finished = true;
-                        events.push(ParseEvent::ResponseMarker);
+                        self.end_with_response(events);
                     }
                     return true;
                 }
@@ -414,17 +426,22 @@ impl GemmaToolParser {
                 &Self::OUTSIDE_DELIMS
             };
             match GemmaToolFormat::classify(&self.pending[i..], delims) {
-                Match::Full(which) if self.in_string || which == 1 => {
+                Match::Full(which) if self.in_string || which == Self::QUOTE_AT => {
                     self.in_string = !self.in_string;
                     i += GemmaToolFormat::QUOTE.len();
                 }
-                Match::Full(_) => {
+                Match::Full(which) => {
                     let body = self.pending[..i].to_string();
-                    self.pending.drain(..i + GemmaToolFormat::CALL_CLOSE.len());
+                    let delim_len = Self::OUTSIDE_DELIMS[which].len();
+                    self.pending.drain(..i + delim_len);
                     self.mode = Mode::Text;
                     self.scan_pos = 0;
                     let call = self.build_call(body, None);
                     events.push(ParseEvent::Call(call));
+                    if which == Self::RESPONSE_AT {
+                        // The response opener outside a string implicitly ends the call.
+                        self.end_with_response(events);
+                    }
                     return true;
                 }
                 Match::Partial => {
@@ -436,6 +453,13 @@ impl GemmaToolParser {
         }
         self.scan_pos = self.pending.len();
         false
+    }
+
+    fn end_with_response(&mut self, events: &mut Vec<ParseEvent>) {
+        self.pending.clear();
+        self.finished = true;
+        self.closed = true;
+        events.push(ParseEvent::ResponseMarker);
     }
 
     fn build_call(&mut self, body: String, forced_error: Option<String>) -> ParsedCall {
@@ -479,12 +503,142 @@ mod tests {
     const READ_FILE: &str =
         "<|tool_call>call:read_file{max_bytes:100,path:<|\"|>notes.txt<|\"|>}<tool_call|>";
 
-    fn feed_chars(parser: &mut GemmaToolParser, text: &str) -> Vec<ParseEvent> {
-        let mut events = Vec::new();
-        for c in text.chars() {
-            events.extend(parser.push(&c.to_string()));
+    struct TestFeed;
+
+    impl TestFeed {
+        fn chars(parser: &mut GemmaToolParser, text: &str) -> Vec<ParseEvent> {
+            let mut events = Vec::new();
+            for c in text.chars() {
+                events.extend(parser.push(&c.to_string()));
+            }
+            events
         }
-        events
+
+        /// Parses `text` whole and char-by-char; asserts both agree and returns the whole-fed parser.
+        fn both(text: &str) -> GemmaToolParser {
+            let mut whole = GemmaToolParser::new();
+            whole.push(text);
+            whole.finish();
+            let mut slow = GemmaToolParser::new();
+            Self::chars(&mut slow, text);
+            slow.finish();
+            assert_eq!(slow.calls(), whole.calls(), "calls differ for {:?}", text);
+            assert_eq!(
+                slow.content(),
+                whole.content(),
+                "content differs for {:?}",
+                text
+            );
+            assert_eq!(
+                slow.finished(),
+                whole.finished(),
+                "finished differs for {:?}",
+                text
+            );
+            whole
+        }
+    }
+
+    #[test]
+    fn parse_value_accepts_u64_beyond_i64() {
+        let v = GemmaToolFormat::parse_value("{n:18446744073709551615}").unwrap();
+        assert_eq!(v["n"].as_u64(), Some(u64::MAX));
+        assert!(GemmaToolFormat::parse_value("{n:99999999999999999999}").is_ok());
+    }
+
+    #[test]
+    fn malformed_bare_key_errors() {
+        assert!(GemmaToolFormat::parse_value("{a,b:1}").is_err());
+        assert!(GemmaToolFormat::parse_value("{a}").is_err());
+        assert!(GemmaToolFormat::parse_value("{a{b:1}:2}").is_err());
+        assert!(GemmaToolFormat::parse_value("{x:1,y}").is_err());
+    }
+
+    #[test]
+    fn response_marker_inside_call_ends_it_implicitly() {
+        let text = "hi <|tool_call>call:get_time{}<|tool_response>response:x{}";
+        let p = TestFeed::both(text);
+        assert!(p.finished());
+        assert_eq!(p.content(), "hi ");
+        let calls = p.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].parse_error.is_none());
+        assert_eq!(calls[0].name, "get_time");
+        let mut q = GemmaToolParser::new();
+        let events = TestFeed::chars(&mut q, text);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], ParseEvent::Call(_)));
+        assert_eq!(events[1], ParseEvent::ResponseMarker);
+    }
+
+    #[test]
+    fn response_marker_inside_string_is_opaque() {
+        let p = TestFeed::both("<|tool_call>call:f{s:<|\"|>a<|tool_response>b<|\"|>}<tool_call|>");
+        assert!(!p.finished());
+        assert_eq!(p.calls()[0].arguments, json!({"s":"a<|tool_response>b"}));
+    }
+
+    #[test]
+    fn finish_closes_parser_and_ids_stop_advancing() {
+        let mut p = GemmaToolParser::new();
+        p.push("<|tool_call>call:a{}<tool_call|>");
+        p.finish();
+        assert!(p.push("<|tool_call>call:b{}<tool_call|>").is_empty());
+        assert!(p.finish().is_empty());
+        assert_eq!(p.calls().len(), 1);
+        assert_eq!(p.content(), "");
+    }
+
+    #[test]
+    fn unterminated_string_at_finish_reports_error() {
+        let mut p = GemmaToolParser::new();
+        p.push("<|tool_call>call:f{s:<|\"|>abc<tool_call|>");
+        assert!(p.calls().is_empty());
+        let events = p.finish();
+        assert_eq!(events.len(), 1);
+        let calls = p.calls();
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(
+            calls[0].parse_error.as_deref(),
+            Some("unterminated tool call")
+        );
+    }
+
+    #[test]
+    fn whole_and_char_fed_agree_over_corpus() {
+        let corpus = [
+            "plain text",
+            "",
+            "a <|x b <|to",
+            "before<|tool_call>call:a{x:1}<tool_call|>after",
+            "t<|tool_call>call:a{}<tool_call|><|tool_call>call:b{y:[1,2]}<tool_call|>",
+            "text then<|tool_response>response:a{}",
+            "t <|tool_call>call:a{}<tool_call|> more<|tool_response>r",
+            "<|tool_call>call:a{s:<|\"|>}<tool_call|><|\"|>}<tool_call|>",
+            "héllo ✓ <|tool_call>call:a{s:<|\"|>ü<|\"|>}<tool_call|>",
+            "<|tool_call>call:a{bad",
+        ];
+        for text in corpus {
+            TestFeed::both(text);
+        }
+    }
+
+    #[test]
+    fn stray_close_marker_in_text_stays_content() {
+        let p = TestFeed::both("a <tool_call|> b");
+        assert_eq!(p.content(), "a <tool_call|> b");
+        assert!(p.calls().is_empty());
+    }
+
+    #[test]
+    fn quote_delimiter_as_last_chunk_before_brace() {
+        let mut p = GemmaToolParser::new();
+        p.push("<|tool_call>call:f{s:<|\"|>x");
+        p.push("<|\"|>");
+        assert!(p.calls().is_empty());
+        p.push("}<tool_call|>");
+        assert_eq!(p.calls()[0].arguments, json!({"s":"x"}));
+        assert!(p.calls()[0].parse_error.is_none());
     }
 
     #[test]
@@ -580,7 +734,7 @@ mod tests {
         let mut whole = GemmaToolParser::new();
         whole.push(READ_FILE);
         let mut slow = GemmaToolParser::new();
-        let events = feed_chars(&mut slow, READ_FILE);
+        let events = TestFeed::chars(&mut slow, READ_FILE);
         assert_eq!(events.len(), 1);
         assert_eq!(slow.calls(), whole.calls());
         assert_eq!(slow.calls()[0].name, "read_file");
@@ -593,7 +747,7 @@ mod tests {
         let mut whole = GemmaToolParser::new();
         whole.push(text);
         let mut slow = GemmaToolParser::new();
-        feed_chars(&mut slow, text);
+        TestFeed::chars(&mut slow, text);
         for p in [&whole, &slow] {
             let calls = p.calls();
             assert_eq!(calls.len(), 1);
@@ -634,7 +788,7 @@ mod tests {
     #[test]
     fn text_before_response_marker_is_content() {
         let mut p = GemmaToolParser::new();
-        feed_chars(&mut p, "hi<|tool_response>junk");
+        TestFeed::chars(&mut p, "hi<|tool_response>junk");
         assert_eq!(p.content(), "hi");
         assert!(p.finished());
     }
