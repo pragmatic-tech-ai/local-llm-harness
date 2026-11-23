@@ -24,7 +24,6 @@
 //! closed sink: the in-flight generation is dropped and nothing is committed. A gone client is
 //! only noticed when a write to it fails. Cancelling a turn from the client is out of scope.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -204,15 +203,13 @@ impl SessionView {
 }
 
 /// Watches the dispatcher's signal and broadcasts `placement_changed` for every session whose
-/// placement differs from the last one seen. A session first seen at a signal (created since
-/// the previous one) is recorded silently: its creator got the placement in the
-/// `create_session` row and every client re-lists on `sessions_changed`. Stops when the
-/// dispatcher is dropped.
+/// placement differs from the one recorded in the hub. `create_session` seeds the new
+/// session's placement there, so a change before the next signal is still announced. Stops when
+/// the dispatcher is dropped.
 pub struct PlacementWatcher {
     sessions: Arc<SessionStore>,
     dispatcher: Weak<Dispatcher>,
     hub: Arc<Hub>,
-    last: HashMap<String, Placement>,
 }
 
 impl PlacementWatcher {
@@ -235,33 +232,32 @@ impl PlacementWatcher {
         })
     }
 
-    /// A watcher that has recorded the current placements.
+    /// A watcher that has recorded the current placements (silently).
     fn new(deps: &RuntimeDeps) -> Self {
+        deps.hub
+            .update_placements(|| SessionView::placements(&deps.sessions, &deps.dispatcher));
         PlacementWatcher {
             sessions: Arc::clone(&deps.sessions),
             dispatcher: Arc::downgrade(&deps.dispatcher),
             hub: Arc::clone(&deps.hub),
-            last: SessionView::placements(&deps.sessions, &deps.dispatcher)
-                .into_iter()
-                .collect(),
         }
     }
 
-    /// Broadcasts the changes since the last call; `false` once the dispatcher is gone.
+    /// Broadcasts the changes since the recorded placements; `false` once the dispatcher is
+    /// gone.
     fn publish(&mut self) -> bool {
         let Some(dispatcher) = self.dispatcher.upgrade() else {
             return false;
         };
-        let now = SessionView::placements(&self.sessions, &dispatcher);
-        for (id, placement) in &now {
-            if self.last.get(id).is_some_and(|seen| seen != placement) {
-                self.hub.broadcast(
-                    RuntimeServer::PLACEMENT_CHANGED,
-                    json!({ "id": id, "placement": placement }),
-                );
-            }
+        let changed = self
+            .hub
+            .update_placements(|| SessionView::placements(&self.sessions, &dispatcher));
+        for (id, placement) in changed {
+            self.hub.broadcast(
+                RuntimeServer::PLACEMENT_CHANGED,
+                json!({ "id": id, "placement": placement }),
+            );
         }
-        self.last = now.into_iter().collect();
         true
     }
 }
@@ -509,7 +505,7 @@ impl RuntimeConnection {
                 Self::to_value(tools)
             }
             Self::M_RESET => {
-                let id = self.attached_id()?;
+                let id = self.attached_session()?;
                 // Held for the reset, so a reset and a turn exclude each other.
                 let _busy = self
                     .deps
@@ -591,8 +587,10 @@ impl RuntimeConnection {
             .sessions
             .create(&p.template_id, &template)
             .map_err(RpcError::internal)?;
+        let row = SessionView::row_of(&self.deps, &rec);
+        self.deps.hub.seed_placement(&rec.id, row.placement.clone());
         self.sessions_changed()?;
-        Self::to_value(SessionView::row_of(&self.deps, &rec))
+        Self::to_value(row)
     }
 
     fn attach_session(&self, params: Value) -> Result<Value, RpcError> {
@@ -625,7 +623,7 @@ impl RuntimeConnection {
     /// Runs one user message on the attached session. The session is busy for the whole turn;
     /// the transcript is committed only when the loop ends `Answered`, after `loop_done`.
     async fn send_turn(&self, params: Value) -> Result<Value, RpcError> {
-        let id = self.attached_id()?;
+        let id = self.attached_session()?;
         let p: ContentParams = Frames::params(params)?;
         let _busy = self
             .deps
@@ -696,6 +694,16 @@ impl RuntimeConnection {
             .ok_or_else(Self::no_session)
     }
 
+    /// The attached session's id, only if the session still exists (so no busy flag is ever
+    /// taken, or broadcast, for a deleted id). Callers re-read the record once they hold busy.
+    fn attached_session(&self) -> Result<String, RpcError> {
+        let id = self.attached_id()?;
+        if !self.deps.sessions.contains(&id) {
+            return Err(Self::no_session());
+        }
+        Ok(id)
+    }
+
     /// The attached session's record; a session deleted meanwhile counts as none attached.
     fn attached(&self) -> Result<SessionRecord, RpcError> {
         let id = self.attached_id()?;
@@ -749,6 +757,7 @@ mod tests {
     const METHOD: &str = "method";
     const PARAMS: &str = "params";
     const RESULT: &str = "result";
+    const LOAD_ERROR: &str = "boom";
 
     /// One in-process connection and the frames queued for it.
     struct Client {
@@ -1012,7 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn failed_load_reports_turn_error_then_no_harness() {
         let rt = TestRuntime::new("loadfail", Client::idle());
-        rt.host.fail_ensure(Some("boom"));
+        rt.host.fail_ensure(Some(LOAD_ERROR));
         let mut a = Client::new(&rt);
         let id = a.open_session().await;
         a.drain();
@@ -1022,7 +1031,7 @@ mod tests {
         let error = Client::position(&methods, TURN_ERROR);
         assert!(Client::position(&methods, RuntimeServer::SESSION_LOADING) < error);
         assert_eq!(methods[error + 1], LOOP_DONE);
-        assert_eq!(frames[error][PARAMS], json!({ "message": "boom" }));
+        assert_eq!(frames[error][PARAMS], json!({ "message": LOAD_ERROR }));
         assert_eq!(
             frames[error + 1][PARAMS],
             json!({ "steps": 0, "reason": "no_harness" })
@@ -1187,12 +1196,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn placement_watcher_records_new_sessions_silently() {
+    async fn placement_watcher_compares_new_sessions_with_their_seed() {
         let rt = TestRuntime::new("newsess", Client::idle());
         let mut watcher = PlacementWatcher::new(&rt.deps);
         let mut a = Client::new(&rt);
         let id = a.create().await;
         a.drain();
+        // Seeded `needs_load` by create_session: an unchanged signal announces nothing.
         assert!(watcher.publish());
         assert!(a.drain().is_empty());
         rt.load();
@@ -1200,6 +1210,67 @@ mod tests {
         let frames = a.drain();
         assert_eq!(Client::methods(&frames), [RuntimeServer::PLACEMENT_CHANGED]);
         assert_eq!(frames[0][PARAMS]["id"], id.as_str());
+    }
+
+    #[tokio::test]
+    async fn eviction_right_after_create_is_announced() {
+        let rt = TestRuntime::new("seedevict", Client::idle());
+        rt.load();
+        let mut watcher = PlacementWatcher::new(&rt.deps);
+        let mut a = Client::new(&rt);
+        let row = a
+            .call(
+                C::M_CREATE_SESSION,
+                json!({ "template_id": TestRuntime::TEMPLATE_ID }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row["placement"]["state"], "ready");
+        a.drain();
+        // Evicted before the watcher ever saw the session.
+        rt.host.set_state(HostState::default());
+        assert!(watcher.publish());
+        let frames = a.drain();
+        assert_eq!(Client::methods(&frames), [RuntimeServer::PLACEMENT_CHANGED]);
+        assert_eq!(frames[0][PARAMS]["id"], row["id"]);
+        assert_eq!(frames[0][PARAMS]["placement"]["state"], "needs_load");
+    }
+
+    #[tokio::test]
+    async fn session_unknown_to_the_hub_is_announced() {
+        let rt = TestRuntime::new("unseeded", Client::idle());
+        let mut watcher = PlacementWatcher::new(&rt.deps);
+        let mut a = Client::new(&rt);
+        // Created behind the server's back: nothing seeded, so the first signal announces it.
+        rt.deps
+            .sessions
+            .create(TestRuntime::TEMPLATE_ID, &rt.template())
+            .unwrap();
+        assert!(watcher.publish());
+        assert_eq!(
+            Client::methods(&a.drain()),
+            [RuntimeServer::PLACEMENT_CHANGED]
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_on_a_session_deleted_underneath_broadcasts_no_busy() {
+        let rt = TestRuntime::new("delreset", Client::idle());
+        let mut a = Client::new(&rt);
+        let mut b = Client::new(&rt);
+        let id = a.open_session().await;
+        // Deleted in the store only, so this connection still names it as attached.
+        rt.deps.sessions.delete(&id).unwrap();
+        b.drain();
+        for method in [C::M_RESET, C::M_SEND_TURN] {
+            let err = a
+                .call(method, json!({ "content": CONTENT }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.message, C::ERR_NO_SESSION, "{method}");
+        }
+        assert!(b.drain().is_empty());
+        assert!(!rt.deps.hub.is_busy(&id));
     }
 
     #[tokio::test]

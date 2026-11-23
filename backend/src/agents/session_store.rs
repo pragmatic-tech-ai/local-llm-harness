@@ -168,6 +168,10 @@ impl SessionStore {
         b.updated.cmp(&a.updated).then_with(|| b.id.cmp(&a.id))
     }
 
+    pub fn contains(&self, id: &str) -> bool {
+        self.lock().contains_key(id)
+    }
+
     pub fn get(&self, id: &str) -> Option<SessionRecord> {
         self.lock().get(id).cloned()
     }

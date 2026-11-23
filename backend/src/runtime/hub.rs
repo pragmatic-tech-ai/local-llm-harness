@@ -11,7 +11,11 @@
 //! `busy` is runtime-only state (never persisted): a session id is in it while a turn (or a
 //! reset) runs. Callers take it through [`Hub::hold_busy`], which broadcasts
 //! `session_busy {id, busy: true}`; its guard clears it and broadcasts `busy: false` on every
-//! exit path, panics included.
+//! exit path, panics included. Each flag change and its broadcast happen under one lock.
+//!
+//! The hub also records the last announced placement per session: `create_session` seeds it,
+//! and the placement watcher replaces it (under one lock) on every dispatcher signal and
+//! announces the differences.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -19,6 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::agents::dispatcher::Placement;
 use crate::rpc::Frames;
 
 /// Identifies one registered connection.
@@ -40,6 +45,8 @@ struct HubState {
 #[derive(Default)]
 pub struct Hub {
     state: Mutex<HubState>,
+    /// The last placement announced (or seeded) per session; see [`Hub::update_placements`].
+    placements: Mutex<HashMap<String, Placement>>,
 }
 
 impl Hub {
@@ -102,8 +109,12 @@ impl Hub {
 
     /// Sends a notification to every connection.
     pub fn broadcast(&self, method: &str, params: Value) {
+        Self::broadcast_in(&mut self.lock(), method, params);
+    }
+
+    /// `broadcast` with the state already locked.
+    fn broadcast_in(state: &mut HubState, method: &str, params: Value) {
         let frame = Frames::notification(method, params);
-        let mut state = self.lock();
         state.conns.retain(|_, c| c.tx.send(frame.clone()).is_ok());
     }
 
@@ -139,19 +150,63 @@ impl Hub {
 
     /// Marks `session` busy for the guard's lifetime; `None` when it already is. Taking and
     /// releasing are broadcast as `session_busy`.
+    /// The flag change and its broadcast happen under one lock, so the `session_busy` frames
+    /// every connection sees are in the same order as the flag changes.
     pub fn hold_busy(self: &Arc<Self>, session: &str) -> Option<BusyGuard> {
-        if !self.try_busy(session) {
+        let mut state = self.lock();
+        if !state.busy.insert(session.to_string()) {
             return None;
         }
-        self.broadcast_busy(session, true);
+        Self::broadcast_busy(&mut state, session, true);
         Some(BusyGuard {
             hub: Arc::clone(self),
             session: session.to_string(),
         })
     }
 
-    fn broadcast_busy(&self, session: &str, busy: bool) {
-        self.broadcast(Self::SESSION_BUSY, json!({ "id": session, "busy": busy }));
+    /// Clears the flag and broadcasts `busy: false` under one lock.
+    fn release_busy(&self, session: &str) {
+        let mut state = self.lock();
+        state.busy.remove(session);
+        Self::broadcast_busy(&mut state, session, false);
+    }
+
+    fn broadcast_busy(state: &mut HubState, session: &str, busy: bool) {
+        Self::broadcast_in(
+            state,
+            Self::SESSION_BUSY,
+            json!({ "id": session, "busy": busy }),
+        );
+    }
+
+    /// Records `placement` as announced for a new session unless one is already recorded
+    /// (a placement watcher update that ran first wins).
+    pub fn seed_placement(&self, session: &str, placement: Placement) {
+        self.lock_placements()
+            .entry(session.to_string())
+            .or_insert(placement);
+    }
+
+    /// Replaces the recorded placements with `compute()`'s, under one lock so a concurrent
+    /// seed is never lost, and returns those that differ from what was recorded (including
+    /// sessions with nothing recorded). Sessions missing from `compute()` are forgotten.
+    pub fn update_placements(
+        &self,
+        compute: impl FnOnce() -> Vec<(String, Placement)>,
+    ) -> Vec<(String, Placement)> {
+        let mut recorded = self.lock_placements();
+        let now = compute();
+        let changed = now
+            .iter()
+            .filter(|(id, p)| recorded.get(id) != Some(p))
+            .cloned()
+            .collect();
+        *recorded = now.into_iter().collect();
+        changed
+    }
+
+    fn lock_placements(&self) -> MutexGuard<'_, HashMap<String, Placement>> {
+        self.placements.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Locks the state, recovering it if a panicking thread poisoned the mutex.
@@ -168,8 +223,7 @@ pub struct BusyGuard {
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        self.hub.clear_busy(&self.session);
-        self.hub.broadcast_busy(&self.session, false);
+        self.hub.release_busy(&self.session);
     }
 }
 
@@ -250,6 +304,42 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert!(!hub.is_busy(SESSION));
+    }
+
+    struct Fixture;
+
+    impl Fixture {
+        fn ready() -> Placement {
+            Placement::Ready { host: OTHER.into() }
+        }
+    }
+
+    #[test]
+    fn seeded_placement_survives_and_only_changes_are_returned() {
+        let hub = Hub::new();
+        hub.seed_placement(SESSION, Fixture::ready());
+        // A watcher update computed elsewhere keeps the seed when it agrees...
+        assert!(hub
+            .update_placements(|| vec![(SESSION.into(), Fixture::ready())])
+            .is_empty());
+        // ...and an update that ran first is not overwritten by a later seed.
+        let gone = Placement::Unavailable {
+            reason: NOTE.into(),
+        };
+        assert_eq!(
+            hub.update_placements(|| vec![(SESSION.into(), gone.clone())]),
+            vec![(SESSION.to_string(), gone.clone())]
+        );
+        hub.seed_placement(SESSION, Fixture::ready());
+        assert!(hub
+            .update_placements(|| vec![(SESSION.into(), gone.clone())])
+            .is_empty());
+        // Nothing recorded counts as a change.
+        assert_eq!(
+            hub.update_placements(|| vec![(OTHER.into(), Fixture::ready())])
+                .len(),
+            1
+        );
     }
 
     #[test]

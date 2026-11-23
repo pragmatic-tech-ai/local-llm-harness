@@ -1200,7 +1200,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_records_n_ctx_in_info() {
-        let m = manager("nctx", FakeLauncher::default(), FakeProbe::new(Mode::Ready));
+        let m = manager("nctxreq", FakeLauncher::default(), FakeProbe::new(Mode::Ready));
         let info = m.start("llamacpp", "lla", Some(4096)).await.unwrap();
         assert_eq!(info.n_ctx, Some(4096));
         assert_eq!(m.current().unwrap().n_ctx, Some(4096));
