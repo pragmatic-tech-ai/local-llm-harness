@@ -78,8 +78,8 @@ pub struct TurnConfig {
 /// Where the loop gets the worker link for each step.
 #[async_trait]
 pub trait TurnLinks: Send + Sync {
-    /// The link to use for zero-based `step`. The `Err` text is reported as `turn_error`
-    /// (except at step 0, where it ends the loop `NoHarness`).
+    /// The link to use for zero-based `step`. The `Err` text is reported as `turn_error`; at
+    /// step 0 the loop then ends `NoHarness`, at later steps `Error`.
     async fn link(&self, step: usize) -> Result<Arc<dyn WorkerLink>, String>;
 }
 
@@ -126,8 +126,8 @@ impl ToolLoop {
     ///
     /// Every step asks `links` for the current link and re-reads its `model_props`, so a
     /// harness swapped between steps is used (with its own tool support). No link at the first
-    /// step ends `NoHarness`; one that disappears mid-loop ends `Error` with a `turn_error`
-    /// carrying the link's text, since the user message was already in flight. Only the tools
+    /// step sends a `turn_error` with the link's text and ends `NoHarness`; one that disappears
+    /// mid-loop ends `Error` with a `turn_error` carrying the link's text. Only the tools
     /// named in `config.tools` are offered to the model and executed.
     ///
     /// A failing `model_props` ends the loop with `Error` and a `turn_error` carrying the
@@ -150,7 +150,7 @@ impl ToolLoop {
                 Ok(link) => link,
                 Err(message) => {
                     if steps == 0 {
-                        return Self::ended(Self::finish(sink, 0, EndReason::NoHarness).await);
+                        return Self::ended(Self::no_harness(sink, &message).await);
                     }
                     return Self::ended(Self::fail(sink, steps, &message).await);
                 }
@@ -375,6 +375,13 @@ impl ToolLoop {
         message.tool_call_id = Some(call_id.to_string());
         message.tool_result = Some(result);
         message
+    }
+
+    /// Reports why no link was available for the first step, then ends the loop `NoHarness`.
+    async fn no_harness(sink: &mut dyn LoopSink, message: &str) -> Result<LoopEnd, SinkClosed> {
+        sink.notify(Self::M_TURN_ERROR, json!({ "message": message }))
+            .await?;
+        Self::finish(sink, 0, EndReason::NoHarness).await
     }
 
     /// Reports a loop-level failure, then ends the loop with `Error`.
@@ -710,7 +717,11 @@ mod tests {
                 reason: EndReason::NoHarness
             }
         );
-        assert_eq!(f.sink.notes.len(), 1);
+        assert_eq!(f.sink.methods(), ["turn_error", "loop_done"]);
+        assert_eq!(
+            f.sink.notes[0].params,
+            json!({"message": "no model running"})
+        );
         assert_eq!(f.last().params, json!({"steps": 0, "reason": "no_harness"}));
         assert!(f.transcript.is_empty());
     }

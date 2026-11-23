@@ -10,8 +10,13 @@
 //! channel in the [`Hub`], drained by a writer task, so frames never interleave and a
 //! notification caused by another connection never blocks. Requests on one connection still run
 //! strictly one after another. List-level notifications (`sessions_changed`,
-//! `templates_changed`, `placement_changed`) reach every connection; a turn's notifications and
-//! `session_loading` reach only the connections attached to its session.
+//! `templates_changed`, `placement_changed`, `session_busy`) reach every connection; a turn's
+//! notifications and `session_loading` reach only the connections attached to its session. A
+//! committed turn broadcasts `sessions_changed` (its `updated` time and list order changed).
+//!
+//! A turn and a `reset` each hold the session's busy flag, so they exclude each other.
+//! `unload_session_model` is allowed while a turn runs: the turn's next step finds no model and
+//! ends `Error` with `no model running`.
 //!
 //! A turn keeps running while at least one connection attached to its session is still there,
 //! even if the connection that sent it went away (the others keep receiving its notifications
@@ -38,13 +43,12 @@ use super::worker::WorkerLink;
 use crate::agents::dispatcher::{Dispatcher, Placement};
 use crate::agents::host::ModelRequirement;
 use crate::agents::session::{SessionRecord, SessionSummary};
-use crate::agents::session_store::SessionStore;
+use crate::agents::session_store::{SessionError, SessionStore};
 use crate::agents::template::AgentTemplate;
 use crate::agents::template_store::TemplateStore;
 use crate::engine::SamplingConfig;
 use crate::rpc::{
-    BoxError, Frames, Request, RpcError, SetSamplingParams, TokenizeParams, Ws,
-    ERR_METHOD_NOT_FOUND, ERR_PARSE,
+    BoxError, Frames, RpcError, SetSamplingParams, TokenizeParams, Ws, ERR_METHOD_NOT_FOUND,
 };
 
 /// What `list_catalog` returns: the runtimes, models (with the runtimes able to load each) and
@@ -177,34 +181,32 @@ impl SessionView {
         rec.enable_thinking.unwrap_or(rec.snapshot.enable_thinking)
     }
 
-    fn placement(dispatcher: &Dispatcher, rec: &SessionRecord) -> Placement {
-        dispatcher.status(&Dispatcher::requirement(rec))
-    }
-
-    fn row(deps: &RuntimeDeps, rec: &SessionRecord) -> SessionRow {
+    fn row(deps: &RuntimeDeps, summary: SessionSummary, req: &ModelRequirement) -> SessionRow {
         SessionRow {
-            summary: rec.summary(),
-            placement: Self::placement(&deps.dispatcher, rec),
-            busy: deps.hub.is_busy(&rec.id),
+            placement: deps.dispatcher.status(req),
+            busy: deps.hub.is_busy(&summary.id),
+            summary,
         }
     }
 
-    /// Every session's placement, in list order.
+    fn row_of(deps: &RuntimeDeps, rec: &SessionRecord) -> SessionRow {
+        Self::row(deps, rec.summary(), &Dispatcher::requirement(rec))
+    }
+
+    /// Every session's placement, in list order (no transcript is cloned).
     fn placements(sessions: &SessionStore, dispatcher: &Dispatcher) -> Vec<(String, Placement)> {
         sessions
-            .list()
+            .list_with_requirements()
             .into_iter()
-            .filter_map(|s| sessions.get(&s.id))
-            .map(|rec| {
-                let placement = Self::placement(dispatcher, &rec);
-                (rec.id, placement)
-            })
+            .map(|(summary, req)| (summary.id, dispatcher.status(&req)))
             .collect()
     }
 }
 
 /// Watches the dispatcher's signal and broadcasts `placement_changed` for every session whose
-/// placement differs from the last one seen (including sessions created since). Stops when the
+/// placement differs from the last one seen. A session first seen at a signal (created since
+/// the previous one) is recorded silently: its creator got the placement in the
+/// `create_session` row and every client re-lists on `sessions_changed`. Stops when the
 /// dispatcher is dropped.
 pub struct PlacementWatcher {
     sessions: Arc<SessionStore>,
@@ -218,15 +220,7 @@ impl PlacementWatcher {
     /// call is missed. Must be called inside a tokio runtime.
     pub fn spawn(deps: &RuntimeDeps) -> tokio::task::JoinHandle<()> {
         let mut events = deps.dispatcher.subscribe();
-        let last = SessionView::placements(&deps.sessions, &deps.dispatcher)
-            .into_iter()
-            .collect();
-        let mut watcher = PlacementWatcher {
-            sessions: Arc::clone(&deps.sessions),
-            dispatcher: Arc::downgrade(&deps.dispatcher),
-            hub: Arc::clone(&deps.hub),
-            last,
-        };
+        let mut watcher = Self::new(deps);
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
@@ -241,6 +235,18 @@ impl PlacementWatcher {
         })
     }
 
+    /// A watcher that has recorded the current placements.
+    fn new(deps: &RuntimeDeps) -> Self {
+        PlacementWatcher {
+            sessions: Arc::clone(&deps.sessions),
+            dispatcher: Arc::downgrade(&deps.dispatcher),
+            hub: Arc::clone(&deps.hub),
+            last: SessionView::placements(&deps.sessions, &deps.dispatcher)
+                .into_iter()
+                .collect(),
+        }
+    }
+
     /// Broadcasts the changes since the last call; `false` once the dispatcher is gone.
     fn publish(&mut self) -> bool {
         let Some(dispatcher) = self.dispatcher.upgrade() else {
@@ -248,7 +254,7 @@ impl PlacementWatcher {
         };
         let now = SessionView::placements(&self.sessions, &dispatcher);
         for (id, placement) in &now {
-            if self.last.get(id) != Some(placement) {
+            if self.last.get(id).is_some_and(|seen| seen != placement) {
                 self.hub.broadcast(
                     RuntimeServer::PLACEMENT_CHANGED,
                     json!({ "id": id, "placement": placement }),
@@ -346,7 +352,6 @@ impl RuntimeConnection {
     const M_RESET: &'static str = "reset";
     const ERR_NO_SESSION: &'static str = "no session attached";
     const ERR_BUSY: &'static str = "session is busy";
-    const ERR_UNKNOWN_SESSION: &'static str = "unknown session: ";
     const ERR_UNKNOWN_METHOD: &'static str = "unknown method: ";
     const CLIENT_GONE: &'static str = "client connection closed";
 
@@ -394,14 +399,12 @@ impl RuntimeConnection {
 
     /// The response frame for one text frame.
     async fn respond(&mut self, text: &str) -> Value {
-        let request: Request = match serde_json::from_str(text) {
+        let request = match Frames::decode(text) {
             Ok(r) => r,
-            Err(e) => return Frames::error(Value::Null, &RpcError::new(ERR_PARSE, e)),
+            Err(frame) => return frame,
         };
-        match self.dispatch(&request.method, request.params).await {
-            Ok(result) => Frames::result(request.id, result),
-            Err(err) => Frames::error(request.id, &err),
-        }
+        let outcome = self.dispatch(&request.method, request.params).await;
+        Frames::reply(request.id, outcome)
     }
 
     /// Handles one request; notifications go through the hub while it runs and the returned
@@ -458,6 +461,8 @@ impl RuntimeConnection {
                 self.sessions_changed()
             }
             Self::M_LOAD_SESSION_MODEL => self.load_session_model(params).await,
+            // Allowed while the session is busy: the running turn keeps its current step, and
+            // its next step finds no model and ends `Error` with `no model running`.
             Self::M_UNLOAD_SESSION_MODEL => {
                 let p: IdParams = Frames::params(params)?;
                 let rec = self.record(&p.id)?;
@@ -504,10 +509,14 @@ impl RuntimeConnection {
                 Self::to_value(tools)
             }
             Self::M_RESET => {
-                let rec = self.attached()?;
-                if self.deps.hub.is_busy(&rec.id) {
-                    return Err(RpcError::internal(Self::ERR_BUSY));
-                }
+                let id = self.attached_id()?;
+                // Held for the reset, so a reset and a turn exclude each other.
+                let _busy = self
+                    .deps
+                    .hub
+                    .hold_busy(&id)
+                    .ok_or_else(|| RpcError::internal(Self::ERR_BUSY))?;
+                let rec = self.record(&id).map_err(|_| Self::no_session())?;
                 self.deps
                     .sessions
                     .reset(&rec.id)
@@ -563,10 +572,9 @@ impl RuntimeConnection {
         let rows: Vec<SessionRow> = self
             .deps
             .sessions
-            .list()
+            .list_with_requirements()
             .into_iter()
-            .filter_map(|s| self.deps.sessions.get(&s.id))
-            .map(|rec| SessionView::row(&self.deps, &rec))
+            .map(|(summary, req)| SessionView::row(&self.deps, summary, &req))
             .collect();
         Self::to_value(rows)
     }
@@ -584,14 +592,14 @@ impl RuntimeConnection {
             .create(&p.template_id, &template)
             .map_err(RpcError::internal)?;
         self.sessions_changed()?;
-        Self::to_value(SessionView::row(&self.deps, &rec))
+        Self::to_value(SessionView::row_of(&self.deps, &rec))
     }
 
     fn attach_session(&self, params: Value) -> Result<Value, RpcError> {
         let p: IdParams = Frames::params(params)?;
         let rec = self.record(&p.id)?;
         self.deps.hub.attach(self.conn, Some(rec.id.clone()));
-        let row = SessionView::row(&self.deps, &rec);
+        let row = SessionView::row_of(&self.deps, &rec);
         Ok(json!({
             "placement": row.placement.clone(),
             "summary": row,
@@ -653,7 +661,8 @@ impl RuntimeConnection {
                     .sessions
                     .commit(&id, transcript)
                     .map_err(RpcError::internal)?;
-                Ok(Value::Null)
+                // The commit bumped `updated`, so the list order changed.
+                self.sessions_changed()
             }
             Ok((_, None)) => Ok(Value::Null),
             Err(SinkClosed) => Err(RpcError::internal(Self::CLIENT_GONE)),
@@ -677,7 +686,7 @@ impl RuntimeConnection {
         self.deps
             .sessions
             .get(id)
-            .ok_or_else(|| RpcError::internal(format!("{}{id}", Self::ERR_UNKNOWN_SESSION)))
+            .ok_or_else(|| RpcError::internal(SessionError::unknown(id)))
     }
 
     fn attached_id(&self) -> Result<String, RpcError> {
@@ -724,12 +733,22 @@ mod tests {
     use crate::rpc::test_support::TestClient;
     use crate::rpc::{ERR_INVALID_PARAMS, ERR_PARSE};
     use crate::runtime::test_support::{FakeLink, Notes, Scripted, TestRuntime};
-    use serde_json::json;
     use std::time::Duration;
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    const NO_ATTACH: &str = "no session attached";
+    type C = RuntimeConnection;
+
     const WAIT: Duration = Duration::from_secs(5);
+    const GROUP: &str = "Examples";
+    const CONTENT: &str = "q";
+    const ANSWER: &str = "hi";
+    const TURN_STARTED: &str = "turn_started";
+    const TURN_DONE: &str = "turn_done";
+    const TURN_ERROR: &str = "turn_error";
+    const LOOP_DONE: &str = "loop_done";
+    const METHOD: &str = "method";
+    const PARAMS: &str = "params";
+    const RESULT: &str = "result";
 
     /// One in-process connection and the frames queued for it.
     struct Client {
@@ -747,102 +766,153 @@ mod tests {
             self.conn.dispatch(method, params).await
         }
 
+        async fn send(&mut self) -> Result<Value, RpcError> {
+            self.call(C::M_SEND_TURN, json!({ "content": CONTENT }))
+                .await
+        }
+
         /// Every frame queued so far.
         fn drain(&mut self) -> Vec<Value> {
-            let mut frames = Vec::new();
-            while let Ok(f) = self.rx.try_recv() {
-                frames.push(f);
-            }
-            frames
+            std::iter::from_fn(|| self.rx.try_recv().ok()).collect()
         }
 
         fn methods(frames: &[Value]) -> Vec<String> {
             TestClient::methods(frames)
         }
 
-        /// Creates a session from the seeded template and attaches to it; returns its id.
-        async fn open_session(&mut self) -> String {
+        fn position(methods: &[String], method: &str) -> usize {
+            methods
+                .iter()
+                .position(|m| m == method)
+                .unwrap_or_else(|| panic!("{method} missing from {methods:?}"))
+        }
+
+        /// Closes this connection's channel as a gone client would.
+        fn hang_up(&mut self) {
+            self.rx = mpsc::unbounded_channel().1;
+        }
+
+        /// Creates a session from the seeded template; returns its id.
+        async fn create(&mut self) -> String {
             let row = self
                 .call(
-                    "create_session",
-                    json!({"template_id": TestRuntime::TEMPLATE_ID}),
+                    C::M_CREATE_SESSION,
+                    json!({ "template_id": TestRuntime::TEMPLATE_ID }),
                 )
                 .await
                 .unwrap();
-            let id = row["id"].as_str().unwrap().to_string();
-            self.call("attach_session", json!({"id": id}))
+            row["id"].as_str().unwrap().to_string()
+        }
+
+        async fn attach(&mut self, id: &str) -> Value {
+            self.call(C::M_ATTACH_SESSION, json!({ "id": id }))
                 .await
-                .unwrap();
+                .unwrap()
+        }
+
+        /// Creates a session from the seeded template and attaches to it; returns its id.
+        async fn open_session(&mut self) -> String {
+            let id = self.create().await;
+            self.attach(&id).await;
             id
         }
 
         fn answer(text: &str) -> Scripted {
             Notes::script(vec![Notes::started(), Notes::done(text, vec![])])
         }
+
+        fn answering() -> Arc<FakeLink> {
+            FakeLink::new(true, vec![Self::answer(ANSWER)])
+        }
+
+        fn idle() -> Arc<FakeLink> {
+            FakeLink::new(true, vec![])
+        }
+
+        /// A real server over `rt` on an ephemeral loopback port.
+        async fn serve(rt: &TestRuntime) -> std::net::SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(RuntimeServer::serve(listener, rt.deps.clone()));
+            addr
+        }
+
+        /// The links one turn of `rec` would use.
+        fn links<'a>(rt: &'a TestRuntime, rec: &'a SessionRecord) -> SessionLinks<'a> {
+            SessionLinks {
+                dispatcher: &rt.deps.dispatcher,
+                hub: &rt.deps.hub,
+                session: &rec.id,
+                req: Dispatcher::requirement(rec),
+            }
+        }
     }
 
     #[tokio::test]
     async fn chat_without_attach_fails() {
-        let rt = TestRuntime::new("noattach", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("noattach", Client::idle());
         let mut a = Client::new(&rt);
         let calls = [
-            ("send_turn", json!({"content": "q"})),
-            ("set_sampling", json!({"config": SamplingConfig::default()})),
-            ("set_thinking", json!({"enable": true})),
-            ("model_props", Value::Null),
-            ("tokenize", json!({"text": "x"})),
-            ("list_tools", Value::Null),
-            ("reset", Value::Null),
+            (C::M_SEND_TURN, json!({ "content": CONTENT })),
+            (
+                C::M_SET_SAMPLING,
+                json!({ "config": SamplingConfig::default() }),
+            ),
+            (C::M_SET_THINKING, json!({ "enable": true })),
+            (C::M_MODEL_PROPS, Value::Null),
+            (C::M_TOKENIZE, json!({ "text": CONTENT })),
+            (C::M_LIST_TOOLS, Value::Null),
+            (C::M_RESET, Value::Null),
         ];
         for (method, params) in calls {
             let err = a.call(method, params).await.unwrap_err();
-            assert_eq!(err.message, NO_ATTACH, "{method}");
+            assert_eq!(err.message, C::ERR_NO_SESSION, "{method}");
         }
     }
 
     #[tokio::test]
     async fn create_attach_send_commits() {
-        let rt = TestRuntime::new("commit", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("commit", Client::answering());
         rt.load();
         let mut a = Client::new(&rt);
         let id = a.open_session().await;
         a.drain();
-        let v = a.call("send_turn", json!({"content": "q"})).await.unwrap();
+        let v = a.send().await.unwrap();
         assert_eq!(v, Value::Null);
-        let frames = a.drain();
+        let methods = Client::methods(&a.drain());
+        // Committed after loop_done; the commit is announced, then busy ends.
+        let done = Client::position(&methods, LOOP_DONE);
         assert_eq!(
-            Client::methods(&frames).last().map(String::as_str),
-            Some("loop_done")
+            &methods[done + 1..],
+            [RuntimeServer::SESSIONS_CHANGED, Hub::SESSION_BUSY]
         );
         // Persisted: a fresh store over the same directory sees the committed transcript.
         let reopened = SessionStore::open(&rt.dir.0.join("sessions")).unwrap();
         let transcript = reopened.get(&id).unwrap().transcript;
         assert_eq!(transcript.len(), 2);
-        assert_eq!(transcript[1].content, "hi");
-        let attached = a.call("attach_session", json!({"id": id})).await.unwrap();
+        assert_eq!(transcript[1].content, ANSWER);
+        let attached = a.attach(&id).await;
         assert_eq!(attached["transcript"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn send_turn_result_comes_after_loop_done_on_the_wire() {
-        let rt = TestRuntime::new("wire", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("wire", Client::answering());
         rt.load();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(RuntimeServer::serve(listener, rt.deps.clone()));
-        let mut a = TestClient::connect_to(addr).await;
+        let mut a = TestClient::connect_to(Client::serve(&rt).await).await;
         let (_, row) = a
             .request(
-                "create_session",
-                json!({"template_id": TestRuntime::TEMPLATE_ID}),
+                C::M_CREATE_SESSION,
+                json!({ "template_id": TestRuntime::TEMPLATE_ID }),
             )
             .await;
-        let id = row["result"]["id"].clone();
-        a.request("attach_session", json!({"id": id})).await;
-        let (notes, resp) = a.request("send_turn", json!({"content": "q"})).await;
-        assert_eq!(resp["result"], Value::Null);
-        let methods = TestClient::methods(&notes);
-        assert_eq!(methods.last().map(String::as_str), Some("loop_done"));
+        let id = row[RESULT]["id"].clone();
+        a.request(C::M_ATTACH_SESSION, json!({ "id": id })).await;
+        let (notes, resp) = a
+            .request(C::M_SEND_TURN, json!({ "content": CONTENT }))
+            .await;
+        assert_eq!(resp[RESULT], Value::Null);
+        assert!(TestClient::methods(&notes).contains(&LOOP_DONE.to_string()));
         let reply = a.send_raw("not json").await;
         assert_eq!(reply["id"], Value::Null);
         assert_eq!(reply["error"]["code"], ERR_PARSE);
@@ -850,191 +920,240 @@ mod tests {
 
     #[tokio::test]
     async fn busy_session_rejects_second_turn() {
-        let rt = TestRuntime::new("busy", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("busy", Client::idle());
         rt.load();
         let mut a = Client::new(&rt);
         let id = a.open_session().await;
         assert!(rt.deps.hub.try_busy(&id));
-        let err = a
-            .call("send_turn", json!({"content": "q"}))
-            .await
-            .unwrap_err();
-        assert_eq!(err.message, "session is busy");
-        let err = a.call("reset", Value::Null).await.unwrap_err();
-        assert_eq!(err.message, "session is busy");
-        let sessions = a.call("list_sessions", Value::Null).await.unwrap();
+        let err = a.send().await.unwrap_err();
+        assert_eq!(err.message, C::ERR_BUSY);
+        let sessions = a.call(C::M_LIST_SESSIONS, Value::Null).await.unwrap();
         assert_eq!(sessions[0]["busy"], true);
         rt.deps.hub.clear_busy(&id);
         assert!(rt.host.link().requests().is_empty());
     }
 
     #[tokio::test]
-    async fn busy_clears_after_a_turn() {
-        let rt = TestRuntime::new("busyclear", FakeLink::new(true, vec![Client::answer("a")]));
+    async fn reset_and_turn_exclude_each_other() {
+        let rt = TestRuntime::new("resetbusy", Client::idle());
+        let mut a = Client::new(&rt);
+        let mut b = Client::new(&rt);
+        let id = a.open_session().await;
+        // A running turn holds the session: reset is refused.
+        let turn = rt.deps.hub.hold_busy(&id).unwrap();
+        let err = a.call(C::M_RESET, Value::Null).await.unwrap_err();
+        assert_eq!(err.message, C::ERR_BUSY);
+        drop(turn);
+        b.drain();
+        // The reset itself takes (and releases) busy, so no turn can start under it.
+        a.call(C::M_RESET, Value::Null).await.unwrap();
+        let frames = b.drain();
+        assert_eq!(
+            Client::methods(&frames),
+            [Hub::SESSION_BUSY, Hub::SESSION_BUSY]
+        );
+        assert_eq!(frames[0][PARAMS], json!({ "id": id, "busy": true }));
+        assert!(!rt.deps.hub.is_busy(&id));
+    }
+
+    #[tokio::test]
+    async fn busy_and_commit_are_broadcast() {
+        let rt = TestRuntime::new("busycast", Client::answering());
         rt.load();
         let mut a = Client::new(&rt);
+        let mut b = Client::new(&rt);
         let id = a.open_session().await;
-        a.call("send_turn", json!({"content": "q"})).await.unwrap();
+        b.drain();
+        a.send().await.unwrap();
+        let frames = b.drain();
+        assert_eq!(
+            Client::methods(&frames),
+            [
+                Hub::SESSION_BUSY,
+                RuntimeServer::SESSIONS_CHANGED,
+                Hub::SESSION_BUSY
+            ]
+        );
+        assert_eq!(frames[0][PARAMS], json!({ "id": id, "busy": true }));
+        assert_eq!(frames[2][PARAMS], json!({ "id": id, "busy": false }));
         assert!(!rt.deps.hub.is_busy(&id));
     }
 
     #[tokio::test]
     async fn send_turn_on_needs_load_notifies_loading() {
-        let rt = TestRuntime::new("loading", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("loading", Client::answering());
         let mut a = Client::new(&rt);
         let id = a.open_session().await;
         a.drain();
-        a.call("send_turn", json!({"content": "q"})).await.unwrap();
+        a.send().await.unwrap();
         let frames = a.drain();
         let methods = Client::methods(&frames);
-        let loading = methods.iter().position(|m| m == "session_loading");
-        let started = methods.iter().position(|m| m == "turn_started");
-        assert!(loading.is_some() && loading < started, "{methods:?}");
+        let loading = Client::position(&methods, RuntimeServer::SESSION_LOADING);
+        assert!(loading < Client::position(&methods, TURN_STARTED));
         assert_eq!(
-            TestClient::params_of(&frames, "session_loading")[0],
-            json!({"id": id})
+            TestClient::params_of(&frames, RuntimeServer::SESSION_LOADING)[0],
+            json!({ "id": id })
         );
         assert_eq!(rt.host.ensure_ready_calls(), 1);
     }
 
     #[tokio::test]
     async fn send_turn_on_loaded_model_does_not_notify_loading() {
-        let rt = TestRuntime::new("loaded", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("loaded", Client::answering());
         rt.load();
         let mut a = Client::new(&rt);
         a.open_session().await;
-        a.call("send_turn", json!({"content": "q"})).await.unwrap();
+        a.send().await.unwrap();
         let methods = Client::methods(&a.drain());
-        assert!(!methods.contains(&"session_loading".to_string()));
+        assert!(!methods.contains(&RuntimeServer::SESSION_LOADING.to_string()));
         assert_eq!(rt.host.ensure_ready_calls(), 0);
     }
 
     #[tokio::test]
+    async fn failed_load_reports_turn_error_then_no_harness() {
+        let rt = TestRuntime::new("loadfail", Client::idle());
+        rt.host.fail_ensure(Some("boom"));
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        a.drain();
+        assert_eq!(a.send().await.unwrap(), Value::Null);
+        let frames = a.drain();
+        let methods = Client::methods(&frames);
+        let error = Client::position(&methods, TURN_ERROR);
+        assert!(Client::position(&methods, RuntimeServer::SESSION_LOADING) < error);
+        assert_eq!(methods[error + 1], LOOP_DONE);
+        assert_eq!(frames[error][PARAMS], json!({ "message": "boom" }));
+        assert_eq!(
+            frames[error + 1][PARAMS],
+            json!({ "steps": 0, "reason": "no_harness" })
+        );
+        assert!(rt.deps.sessions.get(&id).unwrap().transcript.is_empty());
+    }
+
+    #[tokio::test]
     async fn two_connections_attached_both_receive_notes() {
-        let rt = TestRuntime::new("twoconn", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("twoconn", Client::answering());
         rt.load();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(RuntimeServer::serve(listener, rt.deps.clone()));
+        let addr = Client::serve(&rt).await;
         let mut a = TestClient::connect_to(addr).await;
         let mut b = TestClient::connect_to(addr).await;
         let (_, row) = a
             .request(
-                "create_session",
-                json!({"template_id": TestRuntime::TEMPLATE_ID}),
+                C::M_CREATE_SESSION,
+                json!({ "template_id": TestRuntime::TEMPLATE_ID }),
             )
             .await;
-        let id = row["result"]["id"].clone();
-        a.request("attach_session", json!({"id": id})).await;
-        let (_, attached) = b.request("attach_session", json!({"id": id})).await;
-        assert_eq!(attached["result"]["summary"]["id"], id);
-        let (notes, resp) = a.request("send_turn", json!({"content": "q"})).await;
-        assert_eq!(resp["result"], Value::Null);
-        assert!(TestClient::methods(&notes).contains(&"turn_done".to_string()));
-        let seen = TestClient::methods(&b.notes_until("loop_done").await);
-        assert!(seen.contains(&"turn_started".to_string()), "{seen:?}");
-        assert!(seen.contains(&"turn_done".to_string()), "{seen:?}");
+        let id = row[RESULT]["id"].clone();
+        a.request(C::M_ATTACH_SESSION, json!({ "id": id })).await;
+        let (_, attached) = b.request(C::M_ATTACH_SESSION, json!({ "id": id })).await;
+        assert_eq!(attached[RESULT]["summary"]["id"], id);
+        let (notes, resp) = a
+            .request(C::M_SEND_TURN, json!({ "content": CONTENT }))
+            .await;
+        assert_eq!(resp[RESULT], Value::Null);
+        assert!(TestClient::methods(&notes).contains(&TURN_DONE.to_string()));
+        let seen = TestClient::methods(&b.notes_until(LOOP_DONE).await);
+        assert!(seen.contains(&TURN_STARTED.to_string()), "{seen:?}");
+        assert!(seen.contains(&TURN_DONE.to_string()), "{seen:?}");
     }
 
     #[tokio::test]
     async fn turn_finishes_for_others_when_its_connection_is_gone() {
-        let rt = TestRuntime::new("gone", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("gone", Client::answering());
         rt.load();
         let mut a = Client::new(&rt);
         let mut b = Client::new(&rt);
         let id = a.open_session().await;
-        b.call("attach_session", json!({"id": id})).await.unwrap();
-        drop(a.rx);
-        a.rx = tokio::sync::mpsc::unbounded_channel().1;
-        a.call("send_turn", json!({"content": "q"})).await.unwrap();
-        assert!(Client::methods(&b.drain()).contains(&"loop_done".to_string()));
+        b.attach(&id).await;
+        a.hang_up();
+        a.send().await.unwrap();
+        assert!(Client::methods(&b.drain()).contains(&LOOP_DONE.to_string()));
         assert_eq!(rt.deps.sessions.get(&id).unwrap().transcript.len(), 2);
     }
 
     #[tokio::test]
     async fn turn_aborts_when_no_attached_connection_remains() {
-        let rt = TestRuntime::new("abort", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("abort", Client::answering());
         rt.load();
         let mut a = Client::new(&rt);
         let id = a.open_session().await;
-        drop(a.rx);
-        a.rx = tokio::sync::mpsc::unbounded_channel().1;
-        let err = a
-            .call("send_turn", json!({"content": "q"}))
-            .await
-            .unwrap_err();
-        assert_eq!(err.message, "client connection closed");
+        a.hang_up();
+        let err = a.send().await.unwrap_err();
+        assert_eq!(err.message, C::CLIENT_GONE);
         assert!(rt.deps.sessions.get(&id).unwrap().transcript.is_empty());
         assert!(!rt.deps.hub.is_busy(&id));
     }
 
     #[tokio::test]
     async fn list_level_changes_broadcast_to_all() {
-        let rt = TestRuntime::new("broadcast", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("broadcast", Client::idle());
         let mut a = Client::new(&rt);
         let mut b = Client::new(&rt);
-        let row = a
-            .call(
-                "create_session",
-                json!({"template_id": TestRuntime::TEMPLATE_ID}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(Client::methods(&b.drain()), ["sessions_changed"]);
-        a.call(
-            "rename_session",
-            json!({"id": row["id"], "title": "Renamed"}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(Client::methods(&b.drain()), ["sessions_changed"]);
-        let mut template = rt.template();
-        template.name = "Second".into();
-        a.call(
-            "save_template",
-            json!({"path": "Examples", "template": template}),
-        )
-        .await
-        .unwrap();
-        a.call("create_group", json!({"path": "Team"}))
+        let id = a.create().await;
+        assert_eq!(
+            Client::methods(&b.drain()),
+            [RuntimeServer::SESSIONS_CHANGED]
+        );
+        let title = "Renamed";
+        a.call(C::M_RENAME_SESSION, json!({ "id": id, "title": title }))
             .await
             .unwrap();
         assert_eq!(
             Client::methods(&b.drain()),
-            ["templates_changed", "templates_changed"]
+            [RuntimeServer::SESSIONS_CHANGED]
         );
-        let sessions = b.call("list_sessions", Value::Null).await.unwrap();
-        assert_eq!(sessions[0]["title"], "Renamed");
+        let mut template = rt.template();
+        template.name = "Second".into();
+        a.call(
+            C::M_SAVE_TEMPLATE,
+            json!({ "path": GROUP, "template": template }),
+        )
+        .await
+        .unwrap();
+        a.call(C::M_CREATE_GROUP, json!({ "path": "Team" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            Client::methods(&b.drain()),
+            [
+                RuntimeServer::TEMPLATES_CHANGED,
+                RuntimeServer::TEMPLATES_CHANGED
+            ]
+        );
+        let sessions = b.call(C::M_LIST_SESSIONS, Value::Null).await.unwrap();
+        assert_eq!(sessions[0]["title"], title);
         assert_eq!(sessions[0]["placement"]["state"], "needs_load");
     }
 
     #[tokio::test]
     async fn deleted_session_detaches_connections() {
-        let rt = TestRuntime::new("delete", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("delete", Client::idle());
         let mut a = Client::new(&rt);
         let mut b = Client::new(&rt);
         let id = a.open_session().await;
-        b.call("attach_session", json!({"id": id})).await.unwrap();
+        b.attach(&id).await;
         b.drain();
-        a.call("delete_session", json!({"id": id})).await.unwrap();
-        assert_eq!(Client::methods(&b.drain()), ["sessions_changed"]);
-        let err = b
-            .call("send_turn", json!({"content": "q"}))
+        a.call(C::M_DELETE_SESSION, json!({ "id": id }))
             .await
-            .unwrap_err();
-        assert_eq!(err.message, NO_ATTACH);
-        let err = a.call("list_tools", Value::Null).await.unwrap_err();
-        assert_eq!(err.message, NO_ATTACH);
+            .unwrap();
+        assert_eq!(
+            Client::methods(&b.drain()),
+            [RuntimeServer::SESSIONS_CHANGED]
+        );
+        let err = b.send().await.unwrap_err();
+        assert_eq!(err.message, C::ERR_NO_SESSION);
+        let err = a.call(C::M_LIST_TOOLS, Value::Null).await.unwrap_err();
+        assert_eq!(err.message, C::ERR_NO_SESSION);
     }
 
     #[tokio::test]
     async fn placement_changed_on_eviction() {
-        let rt = TestRuntime::new("evict", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("evict", Client::idle());
         rt.load();
         let mut a = Client::new(&rt);
         let mut b = Client::new(&rt);
         let id = a.open_session().await;
-        let sessions = b.call("list_sessions", Value::Null).await.unwrap();
+        let sessions = b.call(C::M_LIST_SESSIONS, Value::Null).await.unwrap();
         assert_eq!(sessions[0]["placement"]["state"], "ready");
         let _watcher = PlacementWatcher::spawn(&rt.deps);
         b.drain();
@@ -1043,73 +1162,88 @@ mod tests {
             .await
             .expect("placement_changed")
             .unwrap();
-        assert_eq!(frame["method"], "placement_changed");
+        assert_eq!(frame[METHOD], RuntimeServer::PLACEMENT_CHANGED);
         assert_eq!(
-            frame["params"],
-            json!({"id": id, "placement": {"state": "needs_load", "host": TestRuntime::HOST, "evicts": null}})
+            frame[PARAMS],
+            json!({ "id": id, "placement": { "state": "needs_load", "host": TestRuntime::HOST, "evicts": null } })
         );
     }
 
     #[tokio::test]
     async fn placement_watcher_reports_only_changes() {
-        let rt = TestRuntime::new("diff", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("diff", Client::idle());
         let mut a = Client::new(&rt);
-        a.open_session().await;
-        let _watcher = PlacementWatcher::spawn(&rt.deps);
+        let id = a.open_session().await;
+        let mut watcher = PlacementWatcher::new(&rt.deps);
         a.drain();
-        rt.host.fire();
+        assert!(watcher.publish());
+        assert!(a.drain().is_empty());
         rt.load();
-        let frame = tokio::time::timeout(WAIT, a.rx.recv())
-            .await
-            .expect("placement_changed")
-            .unwrap();
-        assert_eq!(frame["params"]["placement"]["state"], "ready");
-        // The bare signal (no change) produced nothing before it.
-        assert!(a.rx.try_recv().is_err());
+        assert!(watcher.publish());
+        let frames = a.drain();
+        assert_eq!(Client::methods(&frames), [RuntimeServer::PLACEMENT_CHANGED]);
+        assert_eq!(frames[0][PARAMS]["id"], id.as_str());
+        assert_eq!(frames[0][PARAMS]["placement"]["state"], "ready");
+    }
+
+    #[tokio::test]
+    async fn placement_watcher_records_new_sessions_silently() {
+        let rt = TestRuntime::new("newsess", Client::idle());
+        let mut watcher = PlacementWatcher::new(&rt.deps);
+        let mut a = Client::new(&rt);
+        let id = a.create().await;
+        a.drain();
+        assert!(watcher.publish());
+        assert!(a.drain().is_empty());
+        rt.load();
+        assert!(watcher.publish());
+        let frames = a.drain();
+        assert_eq!(Client::methods(&frames), [RuntimeServer::PLACEMENT_CHANGED]);
+        assert_eq!(frames[0][PARAMS]["id"], id.as_str());
     }
 
     #[tokio::test]
     async fn list_all_tools_and_catalog() {
-        let rt = TestRuntime::new("catalog", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("catalog", Client::idle());
         let mut a = Client::new(&rt);
-        let tools = a.call("list_all_tools", Value::Null).await.unwrap();
+        let tools = a.call(C::M_LIST_ALL_TOOLS, Value::Null).await.unwrap();
         assert_eq!(tools.as_array().unwrap().len(), 1);
         assert_eq!(tools[0]["name"], "echo");
-        let catalog = a.call("list_catalog", Value::Null).await.unwrap();
+        let catalog = a.call(C::M_LIST_CATALOG, Value::Null).await.unwrap();
         assert_eq!(
             catalog,
             serde_json::to_value(TestRuntime::catalog()).unwrap()
         );
         a.open_session().await;
-        let session_tools = a.call("list_tools", Value::Null).await.unwrap();
-        assert_eq!(session_tools[0]["name"], "echo");
+        let session_tools = a.call(C::M_LIST_TOOLS, Value::Null).await.unwrap();
+        assert_eq!(session_tools, tools);
     }
 
     #[tokio::test]
     async fn list_tools_is_the_sessions_tools() {
-        let rt = TestRuntime::new("sesstools", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("sesstools", Client::idle());
         let mut template = rt.template();
         template.tools.clear();
         rt.deps
             .templates
-            .save(Some(TestRuntime::TEMPLATE_ID), "Examples", &template)
+            .save(Some(TestRuntime::TEMPLATE_ID), GROUP, &template)
             .unwrap();
         let mut a = Client::new(&rt);
         a.open_session().await;
-        let tools = a.call("list_tools", Value::Null).await.unwrap();
+        let tools = a.call(C::M_LIST_TOOLS, Value::Null).await.unwrap();
         assert_eq!(tools, json!([]));
     }
 
     #[tokio::test]
     async fn save_template_validation_error_is_rpc_error() {
-        let rt = TestRuntime::new("invalid", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("invalid", Client::idle());
         let mut a = Client::new(&rt);
         let mut template = rt.template();
         template.tools = vec!["nope".into()];
         let err = a
             .call(
-                "save_template",
-                json!({"path": "Examples", "template": template}),
+                C::M_SAVE_TEMPLATE,
+                json!({ "path": GROUP, "template": template }),
             )
             .await
             .unwrap_err();
@@ -1119,69 +1253,75 @@ mod tests {
 
     #[tokio::test]
     async fn template_methods_round_trip() {
-        let rt = TestRuntime::new("templates", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("templates", Client::idle());
         let mut a = Client::new(&rt);
+        let (team, crew) = ("Team", "Crew");
         let got = a
-            .call("get_template", json!({"id": TestRuntime::TEMPLATE_ID}))
+            .call(C::M_GET_TEMPLATE, json!({ "id": TestRuntime::TEMPLATE_ID }))
             .await
             .unwrap();
         assert_eq!(got["id"], TestRuntime::TEMPLATE_ID);
-        assert_eq!(got["path"], "Examples");
+        assert_eq!(got["path"], GROUP);
         assert_eq!(got["template"]["model"], TestRuntime::MODEL);
         let mut template = rt.template();
         template.name = "Helper".into();
         let saved = a
             .call(
-                "save_template",
-                json!({"path": "Examples", "template": template}),
+                C::M_SAVE_TEMPLATE,
+                json!({ "path": GROUP, "template": template }),
             )
             .await
             .unwrap();
         let id = saved["id"].as_str().unwrap().to_string();
-        a.call("create_group", json!({"path": "Team"}))
+        a.call(C::M_CREATE_GROUP, json!({ "path": team }))
             .await
             .unwrap();
-        a.call("move_template", json!({"id": id, "path": "Team"}))
+        a.call(C::M_MOVE_TEMPLATE, json!({ "id": id, "path": team }))
             .await
             .unwrap();
-        a.call("rename_group", json!({"path": "Team", "new_name": "Crew"}))
+        a.call(C::M_RENAME_GROUP, json!({ "path": team, "new_name": crew }))
             .await
             .unwrap();
-        let tree = a.call("list_templates", Value::Null).await.unwrap();
-        let crew = tree
+        let tree = a.call(C::M_LIST_TEMPLATES, Value::Null).await.unwrap();
+        let group = tree
             .as_array()
             .unwrap()
             .iter()
-            .find(|n| n["name"] == "Crew")
+            .find(|n| n["name"] == crew)
             .expect("renamed group");
-        assert_eq!(crew["children"][0]["id"], id.as_str());
+        assert_eq!(group["children"][0]["id"], id.as_str());
         let err = a
-            .call("delete_group", json!({"path": "Crew"}))
+            .call(C::M_DELETE_GROUP, json!({ "path": crew }))
             .await
             .unwrap_err();
         assert_eq!(err.message, "group is not empty");
-        a.call("delete_template", json!({"id": id})).await.unwrap();
-        a.call("delete_group", json!({"path": "Crew"}))
+        a.call(C::M_DELETE_TEMPLATE, json!({ "id": id }))
+            .await
+            .unwrap();
+        a.call(C::M_DELETE_GROUP, json!({ "path": crew }))
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn deleting_a_template_leaves_its_sessions_running() {
-        let rt = TestRuntime::new("deltpl", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("deltpl", Client::answering());
         rt.load();
         let mut a = Client::new(&rt);
         let id = a.open_session().await;
-        a.call("delete_template", json!({"id": TestRuntime::TEMPLATE_ID}))
-            .await
-            .unwrap();
-        a.call("send_turn", json!({"content": "q"})).await.unwrap();
+        a.call(
+            C::M_DELETE_TEMPLATE,
+            json!({ "id": TestRuntime::TEMPLATE_ID }),
+        )
+        .await
+        .unwrap();
+        a.send().await.unwrap();
         assert_eq!(rt.deps.sessions.get(&id).unwrap().transcript.len(), 2);
     }
 
     #[tokio::test]
     async fn overrides_persist_and_drive_the_turn() {
-        let rt = TestRuntime::new("overrides", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("overrides", Client::answering());
         rt.load();
         let mut a = Client::new(&rt);
         let id = a.open_session().await;
@@ -1189,19 +1329,19 @@ mod tests {
             temperature: 0.25,
             ..SamplingConfig::default()
         };
-        a.call("set_sampling", json!({"config": config}))
+        a.call(C::M_SET_SAMPLING, json!({ "config": config }))
             .await
             .unwrap();
-        a.call("set_thinking", json!({"enable": true}))
+        a.call(C::M_SET_THINKING, json!({ "enable": true }))
             .await
             .unwrap();
         let rec = rt.deps.sessions.get(&id).unwrap();
         assert_eq!(rec.sampling.as_ref(), Some(&config));
         assert_eq!(rec.enable_thinking, Some(true));
-        let attached = a.call("attach_session", json!({"id": id})).await.unwrap();
+        let attached = a.attach(&id).await;
         assert_eq!(attached["enable_thinking"], true);
         assert_eq!(attached["sampling"], serde_json::to_value(&config).unwrap());
-        a.call("send_turn", json!({"content": "q"})).await.unwrap();
+        a.send().await.unwrap();
         let request = &rt.host.link().requests()[0];
         assert_eq!(request.sampling, config);
         assert!(request.enable_thinking);
@@ -1210,7 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_uses_snapshot_thinking_and_sampling_without_overrides() {
-        let rt = TestRuntime::new("snapshot", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("snapshot", Client::answering());
         let mut template = rt.template();
         template.enable_thinking = true;
         template.sampling = Some(SamplingConfig {
@@ -1220,12 +1360,12 @@ mod tests {
         template.system_prompt = "be brief".into();
         rt.deps
             .templates
-            .save(Some(TestRuntime::TEMPLATE_ID), "Examples", &template)
+            .save(Some(TestRuntime::TEMPLATE_ID), GROUP, &template)
             .unwrap();
         rt.load();
         let mut a = Client::new(&rt);
         a.open_session().await;
-        a.call("send_turn", json!({"content": "q"})).await.unwrap();
+        a.send().await.unwrap();
         let request = &rt.host.link().requests()[0];
         assert!(request.enable_thinking);
         assert_eq!(request.sampling.temperature, 0.5);
@@ -1234,92 +1374,102 @@ mod tests {
 
     #[tokio::test]
     async fn reset_restores_the_initial_transcript() {
-        let rt = TestRuntime::new("reset", FakeLink::new(true, vec![Client::answer("hi")]));
+        let rt = TestRuntime::new("reset", Client::answering());
         rt.load();
         let mut a = Client::new(&rt);
         let id = a.open_session().await;
-        a.call("send_turn", json!({"content": "q"})).await.unwrap();
-        a.call("reset", Value::Null).await.unwrap();
+        a.send().await.unwrap();
+        a.call(C::M_RESET, Value::Null).await.unwrap();
         assert!(rt.deps.sessions.get(&id).unwrap().transcript.is_empty());
     }
 
     #[tokio::test]
     async fn model_props_and_tokenize_need_the_sessions_model() {
-        let rt = TestRuntime::new("props", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("props", Client::idle());
         let mut a = Client::new(&rt);
         a.open_session().await;
-        let err = a.call("model_props", Value::Null).await.unwrap_err();
-        assert_eq!(err.message, "no model running");
-        let err = a.call("tokenize", json!({"text": "x"})).await.unwrap_err();
-        assert_eq!(err.message, "no model running");
+        let text = json!({ "text": CONTENT });
+        let err = a.call(C::M_MODEL_PROPS, Value::Null).await.unwrap_err();
+        assert_eq!(err.message, ToolLoop::NO_MODEL);
+        let err = a.call(C::M_TOKENIZE, text.clone()).await.unwrap_err();
+        assert_eq!(err.message, ToolLoop::NO_MODEL);
         rt.load();
-        let v = a.call("model_props", Value::Null).await.unwrap();
-        assert_eq!(v, json!({"supports_tools": true}));
-        let v = a.call("tokenize", json!({"text": "x"})).await.unwrap();
-        assert_eq!(v, json!({"count": 0}));
+        let v = a.call(C::M_MODEL_PROPS, Value::Null).await.unwrap();
+        assert_eq!(v, json!({ "supports_tools": true }));
+        let v = a.call(C::M_TOKENIZE, text).await.unwrap();
+        assert_eq!(v, json!({ "count": 0 }));
     }
 
     #[tokio::test]
     async fn load_and_unload_session_model() {
-        let rt = TestRuntime::new("loadunload", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("loadunload", Client::idle());
         let mut a = Client::new(&rt);
-        let row = a
-            .call(
-                "create_session",
-                json!({"template_id": TestRuntime::TEMPLATE_ID}),
-            )
-            .await
-            .unwrap();
+        let id = a.create().await;
         let placement = a
-            .call("load_session_model", json!({"id": row["id"]}))
+            .call(C::M_LOAD_SESSION_MODEL, json!({ "id": id }))
             .await
             .unwrap();
         assert_eq!(placement["state"], "ready");
         assert_eq!(rt.host.ensure_ready_calls(), 1);
-        a.call("unload_session_model", json!({"id": row["id"]}))
+        a.call(C::M_UNLOAD_SESSION_MODEL, json!({ "id": id }))
             .await
             .unwrap();
         assert_eq!(rt.host.unload_calls(), 1);
+        let missing = "nope";
         let err = a
-            .call("load_session_model", json!({"id": "nope"}))
+            .call(C::M_LOAD_SESSION_MODEL, json!({ "id": missing }))
             .await
             .unwrap_err();
-        assert_eq!(err.message, "unknown session: nope");
+        assert_eq!(err.message, SessionError::unknown(missing).0);
     }
 
     #[tokio::test]
     async fn later_steps_without_a_model_end_with_no_model_running() {
-        let rt = TestRuntime::new("links", FakeLink::new(true, vec![]));
-        let rec = {
-            let (t, _) = rt.deps.templates.get(TestRuntime::TEMPLATE_ID).unwrap();
-            rt.deps
-                .sessions
-                .create(TestRuntime::TEMPLATE_ID, &t)
-                .unwrap()
-        };
-        let links = SessionLinks {
-            dispatcher: &rt.deps.dispatcher,
-            hub: &rt.deps.hub,
-            session: &rec.id,
-            req: Dispatcher::requirement(&rec),
-        };
+        let rt = TestRuntime::new("links", Client::idle());
+        let rec = rt
+            .deps
+            .sessions
+            .create(TestRuntime::TEMPLATE_ID, &rt.template())
+            .unwrap();
+        let links = Client::links(&rt, &rec);
         let err = links.link(1).await.err().unwrap();
-        assert_eq!(err, "no model running");
+        assert_eq!(err, ToolLoop::NO_MODEL);
         assert_eq!(rt.host.ensure_ready_calls(), 0);
         rt.load();
         assert!(links.link(1).await.is_ok());
     }
 
     #[tokio::test]
+    async fn unload_during_a_turn_ends_its_next_step() {
+        let rt = TestRuntime::new("unloadbusy", Client::idle());
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        let rec = rt.deps.sessions.get(&id).unwrap();
+        let links = Client::links(&rt, &rec);
+        // The turn holds busy and has its first link...
+        let _turn = rt.deps.hub.hold_busy(&id).unwrap();
+        assert!(links.link(0).await.is_ok());
+        // ...when another client unloads the session's model: allowed while busy.
+        let mut b = Client::new(&rt);
+        b.call(C::M_UNLOAD_SESSION_MODEL, json!({ "id": id }))
+            .await
+            .unwrap();
+        assert_eq!(rt.host.unload_calls(), 1);
+        // The turn's next step finds no model, which the loop reports as `turn_error`.
+        assert_eq!(links.link(1).await.err().unwrap(), ToolLoop::NO_MODEL);
+    }
+
+    #[tokio::test]
     async fn unknown_method_and_bad_params_use_rpc_codes() {
-        let rt = TestRuntime::new("codes", FakeLink::new(true, vec![]));
+        let rt = TestRuntime::new("codes", Client::idle());
         let mut a = Client::new(&rt);
         let err = a.call("nope", Value::Null).await.unwrap_err();
         assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
-        let err = a.call("create_session", json!({})).await.unwrap_err();
+        let err = a.call(C::M_CREATE_SESSION, json!({})).await.unwrap_err();
         assert_eq!(err.code, ERR_INVALID_PARAMS);
         a.open_session().await;
-        let err = a.call("send_turn", json!({})).await.unwrap_err();
+        let err = a.call(C::M_SEND_TURN, json!({})).await.unwrap_err();
         assert_eq!(err.code, ERR_INVALID_PARAMS);
     }
 }

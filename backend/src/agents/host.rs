@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use tokio::sync::{broadcast, Mutex};
 
+use crate::agents::template::AgentTemplate;
 use crate::runtime::worker::{WorkerLink, WsWorkerLink};
 use crate::supervisor::catalog::Catalog;
 use crate::supervisor::discovery::{discover, DiscoveredModel};
@@ -29,6 +30,18 @@ pub struct ModelRequirement {
     pub model: String,
     pub n_ctx: u32,
     pub host: Option<String>,
+}
+
+impl ModelRequirement {
+    /// What a template snapshot asks for.
+    pub fn of(snapshot: &AgentTemplate) -> Self {
+        ModelRequirement {
+            runtime: snapshot.runtime.clone(),
+            model: snapshot.model.clone(),
+            n_ctx: snapshot.n_ctx,
+            host: snapshot.host.clone(),
+        }
+    }
 }
 
 /// What a host has loaded right now. `loaded` is `(runtime, model, n_ctx)` and is only set while

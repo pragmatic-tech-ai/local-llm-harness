@@ -108,6 +108,21 @@ impl Frames {
         json!({"method": method, "params": params})
     }
 
+    /// Decodes one request envelope; a malformed one yields the parse-error frame to send back
+    /// (with a null id).
+    pub(crate) fn decode(text: &str) -> Result<Request, Value> {
+        serde_json::from_str(text)
+            .map_err(|e| Self::error(Value::Null, &RpcError::new(ERR_PARSE, e)))
+    }
+
+    /// The response frame for request `id`.
+    pub(crate) fn reply(id: Value, outcome: Result<Value, RpcError>) -> Value {
+        match outcome {
+            Ok(result) => Self::result(id, result),
+            Err(err) => Self::error(id, &err),
+        }
+    }
+
     /// Decodes request params, mapping a mismatch to an invalid-params error.
     pub(crate) fn params<T: DeserializeOwned>(params: Value) -> Result<T, RpcError> {
         serde_json::from_value(params).map_err(|e| RpcError::new(ERR_INVALID_PARAMS, e))
@@ -166,16 +181,13 @@ impl FrameLoop {
         ws: &mut Ws,
         text: &str,
     ) -> Result<(), BoxError> {
-        let request: Request = match serde_json::from_str(text) {
+        let request = match Frames::decode(text) {
             Ok(r) => r,
-            Err(e) => {
-                let err = RpcError::new(ERR_PARSE, e);
-                return Frames::send(ws, Frames::error(Value::Null, &err)).await;
-            }
+            Err(frame) => return Frames::send(ws, frame).await,
         };
         let frame = match dispatcher.dispatch(ws, &request).await {
-            Ok(result) => Frames::result(request.id, result),
-            Err(Failure::Rpc(err)) => Frames::error(request.id, &err),
+            Ok(result) => Frames::reply(request.id, Ok(result)),
+            Err(Failure::Rpc(err)) => Frames::reply(request.id, Err(err)),
             Err(Failure::Transport(e)) => return Err(e),
         };
         Frames::send(ws, frame).await

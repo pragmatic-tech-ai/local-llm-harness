@@ -9,6 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::atomic_file::AtomicFile;
+use super::host::ModelRequirement;
 use super::session::{SessionRecord, SessionSummary};
 use super::template::AgentTemplate;
 use crate::engine::types::ChatMessage;
@@ -27,7 +28,8 @@ const ERR_NO_NAME: &str = "no file name";
 pub struct SessionError(pub String);
 
 impl SessionError {
-    fn unknown(id: &str) -> Self {
+    /// `unknown session: {id}`.
+    pub fn unknown(id: &str) -> Self {
         Self(format!("{ERR_UNKNOWN}{id}"))
     }
 }
@@ -145,8 +147,25 @@ impl SessionStore {
     pub fn list(&self) -> Vec<SessionSummary> {
         let map = self.lock();
         let mut out: Vec<SessionSummary> = map.values().map(SessionRecord::summary).collect();
-        out.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| b.id.cmp(&a.id)));
+        out.sort_by(Self::list_order);
         out
+    }
+
+    /// Every session's summary with the model requirement of its snapshot, in [`list`](Self::list)
+    /// order. Built under the lock without cloning any transcript.
+    pub fn list_with_requirements(&self) -> Vec<(SessionSummary, ModelRequirement)> {
+        let map = self.lock();
+        let mut out: Vec<(SessionSummary, ModelRequirement)> = map
+            .values()
+            .map(|r| (r.summary(), ModelRequirement::of(&r.snapshot)))
+            .collect();
+        out.sort_by(|(a, _), (b, _)| Self::list_order(a, b));
+        out
+    }
+
+    /// Newest `updated` first, ties by id descending.
+    fn list_order(a: &SessionSummary, b: &SessionSummary) -> std::cmp::Ordering {
+        b.updated.cmp(&a.updated).then_with(|| b.id.cmp(&a.id))
     }
 
     pub fn get(&self, id: &str) -> Option<SessionRecord> {
@@ -493,6 +512,22 @@ mod tests {
         s.rename(&b.id, "Custom #9").unwrap();
         assert_eq!(s.create("r", &t).unwrap().title, "R #4");
         assert_eq!(s.create("other", &t).unwrap().title, "R #1");
+    }
+
+    #[test]
+    fn list_with_requirements_matches_list_order_and_snapshots() {
+        let d = TempDir::new("reqs");
+        let ms = Arc::new(AtomicU64::new(10_000));
+        let s = d.clocked(&ms);
+        let t = TempDir::sample("R", "p");
+        s.create("r", &t).unwrap();
+        ms.store(11_000, Ordering::SeqCst);
+        s.create("r", &t).unwrap();
+        let pairs = s.list_with_requirements();
+        let ids: Vec<String> = pairs.iter().map(|(x, _)| x.id.clone()).collect();
+        let listed: Vec<String> = s.list().into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, listed);
+        assert_eq!(pairs[0].1, ModelRequirement::of(&t));
     }
 
     #[test]

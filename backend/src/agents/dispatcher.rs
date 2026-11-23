@@ -103,12 +103,7 @@ impl Dispatcher {
 
     /// The requirement a session's template snapshot asks for.
     pub fn requirement(record: &SessionRecord) -> ModelRequirement {
-        ModelRequirement {
-            runtime: record.snapshot.runtime.clone(),
-            model: record.snapshot.model.clone(),
-            n_ctx: record.snapshot.n_ctx,
-            host: record.snapshot.host.clone(),
-        }
+        ModelRequirement::of(&record.snapshot)
     }
 
     fn unavailable_reason(req: &ModelRequirement) -> String {

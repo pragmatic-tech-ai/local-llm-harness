@@ -8,14 +8,15 @@
 //! through its one channel, so frames never interleave and a notification caused by another
 //! connection never blocks the sender.
 //!
-//! `busy` is runtime-only state (never persisted): a session id is in it while a turn runs.
-//! Callers take it through [`Hub::hold_busy`], whose guard clears it on every exit path,
-//! panics included.
+//! `busy` is runtime-only state (never persisted): a session id is in it while a turn (or a
+//! reset) runs. Callers take it through [`Hub::hold_busy`], which broadcasts
+//! `session_busy {id, busy: true}`; its guard clears it and broadcasts `busy: false` on every
+//! exit path, panics included.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::rpc::Frames;
@@ -42,6 +43,9 @@ pub struct Hub {
 }
 
 impl Hub {
+    /// Broadcast `{id, busy}` when a session's busy flag is taken or released by a guard.
+    pub const SESSION_BUSY: &'static str = "session_busy";
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -133,12 +137,21 @@ impl Hub {
         self.lock().busy.contains(session)
     }
 
-    /// Marks `session` busy for the guard's lifetime; `None` when it already is.
+    /// Marks `session` busy for the guard's lifetime; `None` when it already is. Taking and
+    /// releasing are broadcast as `session_busy`.
     pub fn hold_busy(self: &Arc<Self>, session: &str) -> Option<BusyGuard> {
-        self.try_busy(session).then(|| BusyGuard {
+        if !self.try_busy(session) {
+            return None;
+        }
+        self.broadcast_busy(session, true);
+        Some(BusyGuard {
             hub: Arc::clone(self),
             session: session.to_string(),
         })
+    }
+
+    fn broadcast_busy(&self, session: &str, busy: bool) {
+        self.broadcast(Self::SESSION_BUSY, json!({ "id": session, "busy": busy }));
     }
 
     /// Locks the state, recovering it if a panicking thread poisoned the mutex.
@@ -156,26 +169,29 @@ pub struct BusyGuard {
 impl Drop for BusyGuard {
     fn drop(&mut self) {
         self.hub.clear_busy(&self.session);
+        self.hub.broadcast_busy(&self.session, false);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     const SESSION: &str = "s-1";
     const OTHER: &str = "s-2";
     const NOTE: &str = "turn_started";
+    const LIST_NOTE: &str = "sessions_changed";
+    const METHOD: &str = "method";
+    const PARAMS: &str = "params";
 
     #[test]
     fn broadcast_reaches_every_connection() {
         let hub = Hub::new();
         let (_, mut a) = hub.register();
         let (_, mut b) = hub.register();
-        hub.broadcast("sessions_changed", json!({}));
-        assert_eq!(a.try_recv().unwrap()["method"], "sessions_changed");
-        assert_eq!(b.try_recv().unwrap()["method"], "sessions_changed");
+        hub.broadcast(LIST_NOTE, json!({}));
+        assert_eq!(a.try_recv().unwrap()[METHOD], LIST_NOTE);
+        assert_eq!(b.try_recv().unwrap()[METHOD], LIST_NOTE);
     }
 
     #[test]
@@ -187,7 +203,7 @@ mod tests {
         hub.attach(a_id, Some(SESSION.into()));
         hub.attach(b_id, Some(OTHER.into()));
         assert_eq!(hub.to_session(SESSION, NOTE, json!({})), 1);
-        assert_eq!(a.try_recv().unwrap()["method"], NOTE);
+        assert_eq!(a.try_recv().unwrap()[METHOD], NOTE);
         assert!(b.try_recv().is_err());
         assert!(c.try_recv().is_err());
     }
@@ -228,11 +244,25 @@ mod tests {
         drop(guard);
         assert!(!hub.is_busy(SESSION));
         let shared = Arc::clone(&hub);
-        let panicked = std::panic::catch_unwind(move || {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _guard = shared.hold_busy(SESSION).expect("free");
             panic!("turn panicked");
-        });
+        }));
         assert!(panicked.is_err());
         assert!(!hub.is_busy(SESSION));
+    }
+
+    #[test]
+    fn busy_guard_broadcasts_taking_and_releasing() {
+        let hub = Arc::new(Hub::new());
+        let (_, mut other) = hub.register();
+        let guard = hub.hold_busy(SESSION).expect("free");
+        assert!(hub.hold_busy(SESSION).is_none());
+        drop(guard);
+        let frames: Vec<Value> = std::iter::from_fn(|| other.try_recv().ok()).collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0][METHOD], Hub::SESSION_BUSY);
+        assert_eq!(frames[0][PARAMS], json!({"id": SESSION, "busy": true}));
+        assert_eq!(frames[1][PARAMS], json!({"id": SESSION, "busy": false}));
     }
 }
