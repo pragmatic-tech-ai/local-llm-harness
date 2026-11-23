@@ -108,8 +108,6 @@ impl WsWorkerLink {
     const CALL_TIMEOUT: Duration = Duration::from_secs(30);
     const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
     const ERR_CONNECT_TIMEOUT: &'static str = "worker connect timed out";
-    const ERR_CALL_TIMEOUT: &'static str = "worker did not answer within 30s";
-    const ERR_IDLE_TIMEOUT: &'static str = "worker idle for 120s";
 
     pub fn new(url: String) -> Self {
         Self {
@@ -118,6 +116,14 @@ impl WsWorkerLink {
             call_timeout: Self::CALL_TIMEOUT,
             idle_timeout: Self::STREAM_IDLE_TIMEOUT,
         }
+    }
+
+    fn call_timeout_message(timeout: Duration) -> String {
+        format!("worker did not answer within {}s", timeout.as_secs_f64())
+    }
+
+    fn idle_timeout_message(timeout: Duration) -> String {
+        format!("worker idle for {}s", timeout.as_secs_f64())
     }
 
     /// Overrides the connect, whole-call and per-frame idle timeouts (tests use milliseconds).
@@ -170,7 +176,7 @@ impl WsWorkerLink {
     async fn call(&self, method: &str, params: Value) -> Result<Value, LinkError> {
         tokio::time::timeout(self.call_timeout, self.exchange(method, params))
             .await
-            .map_err(|_| LinkError(Self::ERR_CALL_TIMEOUT.into()))?
+            .map_err(|_| LinkError(Self::call_timeout_message(self.call_timeout)))?
     }
 
     async fn exchange(&self, method: &str, params: Value) -> Result<Value, LinkError> {
@@ -200,7 +206,10 @@ impl WsWorkerLink {
             let next = tokio::time::timeout(state.idle_timeout, state.ws.next()).await;
             let Ok(next) = next else {
                 state.finished = true;
-                return Some((Err(LinkError(Self::ERR_IDLE_TIMEOUT.into())), state));
+                return Some((
+                    Err(LinkError(Self::idle_timeout_message(state.idle_timeout))),
+                    state,
+                ));
             };
             let frame = next?;
             let frame = match frame {
@@ -283,6 +292,7 @@ mod tests {
     }
 
     const MS: Duration = Duration::from_millis(100);
+    const GENEROUS: Duration = Duration::from_secs(5);
 
     /// What a raw scripted server does after accepting a websocket.
     enum Script {
@@ -325,7 +335,8 @@ mod tests {
                 let _ = closed_tx.send(());
             });
             (
-                WsWorkerLink::new(format!("ws://{addr}")).with_timeouts(MS, MS, MS),
+                WsWorkerLink::new(format!("ws://{addr}"))
+                    .with_timeouts(GENEROUS, GENEROUS, GENEROUS),
                 closed_rx,
             )
         }
@@ -385,18 +396,23 @@ mod tests {
     #[tokio::test]
     async fn call_times_out_when_worker_never_answers() {
         let (link, _closed) = Fixture::raw_server(Script::Silent).await;
+        let link = link.with_timeouts(GENEROUS, MS, GENEROUS);
         let err = link.model_props().await.unwrap_err();
-        assert_eq!(err.0, WsWorkerLink::ERR_CALL_TIMEOUT);
+        assert_eq!(err.0, WsWorkerLink::call_timeout_message(MS));
+        assert_eq!(err.0, "worker did not answer within 0.1s");
     }
 
     #[tokio::test]
     async fn stream_errors_when_worker_goes_idle() {
         let note = r#"{"method":"turn_started","params":{}}"#;
         let (link, _closed) = Fixture::raw_server(Script::FramesThenSilent(vec![note])).await;
+        let idle = MS * 3;
+        let link = link.with_timeouts(GENEROUS, GENEROUS, idle);
         let mut stream = link.generate(&Fixture::request()).await.expect("generate");
         assert_eq!(stream.next().await.unwrap().unwrap().method, "turn_started");
         let err = stream.next().await.unwrap().unwrap_err();
-        assert_eq!(err.0, WsWorkerLink::ERR_IDLE_TIMEOUT);
+        assert_eq!(err.0, WsWorkerLink::idle_timeout_message(idle));
+        assert_eq!(err.0, "worker idle for 0.3s");
         assert!(stream.next().await.is_none());
     }
 
@@ -423,7 +439,7 @@ mod tests {
     async fn dropping_stream_closes_socket() {
         let note = r#"{"method":"turn_started","params":{}}"#;
         let (link, closed) = Fixture::raw_server(Script::FramesThenSilent(vec![note])).await;
-        let link = link.with_timeouts(MS * 50, MS * 50, MS * 50);
+        let link = link.with_timeouts(GENEROUS, GENEROUS, GENEROUS);
         let mut stream = link.generate(&Fixture::request()).await.expect("generate");
         assert!(stream.next().await.unwrap().is_ok());
         drop(stream);
