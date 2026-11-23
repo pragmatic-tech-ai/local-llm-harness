@@ -57,7 +57,8 @@ impl ToolRegistry {
     }
 
     /// The `openai_tools` entries for the tools named in `names`, in registry order. Names the
-    /// registry does not know are ignored.
+    /// registry does not know are ignored on purpose: `TemplateRules::validate` rejects unknown
+    /// tool names when a template is saved, so none reach here.
     pub fn openai_tools_for(&self, names: &[String]) -> Vec<Value> {
         let specs = self
             .specs()

@@ -113,7 +113,8 @@ impl ToolLoop {
     /// Runs one user message to completion on top of `transcript`. The new transcript (the
     /// user message and every step's messages) is returned only when the loop ends `Answered`,
     /// after `loop_done` was delivered; the caller commits it. Any other end (including a
-    /// closed sink) returns `None`, so the caller's transcript stays as it was. A closed sink aborts at once with
+    /// closed sink) returns `None`, so the caller's transcript stays as it was. A closed sink
+    /// aborts at once with
     /// `Err(SinkClosed)`; dropping the in-flight stream makes the worker stop generating.
     ///
     /// The runtime is the authority on call ids. The worker numbers calls from `call_1` on
@@ -413,6 +414,20 @@ mod tests {
 
     const CAP: usize = 8;
     const GEMMA4: &str = include_str!("../../tests/fixtures/gemma4-chat-template.jinja");
+
+    /// A `TurnLinks` that records the step index of every `link` call.
+    struct StepRecorder {
+        link: Arc<FakeLink>,
+        steps: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl TurnLinks for StepRecorder {
+        async fn link(&self, step: usize) -> Result<Arc<dyn WorkerLink>, String> {
+            self.steps.lock().unwrap().push(step);
+            Ok(self.link.clone())
+        }
+    }
 
     struct Fixture {
         tool_loop: ToolLoop,
@@ -1218,5 +1233,30 @@ You are terse.<|tool>declaration:echo{";
             .unwrap();
         assert_eq!(end.reason, EndReason::NoHarness);
         assert!(committed.is_none());
+    }
+
+    #[tokio::test]
+    async fn link_is_asked_with_each_step_index() {
+        let f = Fixture::new();
+        let link = FakeLink::new(
+            true,
+            vec![
+                Fixture::step("", vec![Fixture::echo_call("c")]),
+                Fixture::step("", vec![Fixture::echo_call("c")]),
+                Fixture::step("done", vec![]),
+            ],
+        );
+        let links = StepRecorder {
+            link,
+            steps: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut sink = RecordingSink::new();
+        let (end, _) = f
+            .tool_loop
+            .run(&[], "q", &f.config, &links, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(end.steps, 3);
+        assert_eq!(*links.steps.lock().unwrap(), [0, 1, 2]);
     }
 }

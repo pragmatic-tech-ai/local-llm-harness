@@ -145,12 +145,9 @@ mod tests {
             ToolExecutor::new(Arc::new(reg), Box::new(ReadOnlyPolicy), timeout)
         }
 
-        /// Every tool name the fixtures use, all enabled.
-        fn all() -> Vec<String> {
-            ["echo", "writer", "slow", "panic", "flag", "nope"]
-                .iter()
-                .map(|n| n.to_string())
-                .collect()
+        /// Every tool name `ex`'s registry holds, all enabled.
+        fn all(ex: &ToolExecutor) -> Vec<String> {
+            ex.registry.specs().into_iter().map(|s| s.name).collect()
         }
 
         fn call(name: &str, arguments: Value) -> ToolCallRequest {
@@ -181,7 +178,7 @@ mod tests {
     async fn executor_reports_unknown_tool() {
         let ex = Fixture::executor(TestSource::echo_boxed(), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("nope", json!({})), &Fixture::all())
+            .execute(&Fixture::call("nope", json!({})), &Fixture::all(&ex))
             .await;
         assert_eq!(out, ToolOutcome::Err("unknown tool: nope".into()));
     }
@@ -210,7 +207,7 @@ mod tests {
         let mut call = Fixture::call("echo", json!({}));
         call.parse_error = Some("bad".into());
         assert_eq!(
-            ex.execute(&call, &Fixture::all()).await,
+            ex.execute(&call, &Fixture::all(&ex)).await,
             ToolOutcome::Err("could not parse tool call: bad".into())
         );
     }
@@ -219,7 +216,7 @@ mod tests {
     async fn executor_denies_side_effects_under_read_only() {
         let ex = Fixture::executor(TestSource::writer_boxed(), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("writer", json!({})), &Fixture::all())
+            .execute(&Fixture::call("writer", json!({})), &Fixture::all(&ex))
             .await;
         assert_eq!(
             out,
@@ -231,7 +228,7 @@ mod tests {
     async fn executor_times_out() {
         let ex = Fixture::executor(TestSource::slow_boxed(), Duration::from_millis(50));
         let out = ex
-            .execute(&Fixture::call("slow", json!({})), &Fixture::all())
+            .execute(&Fixture::call("slow", json!({})), &Fixture::all(&ex))
             .await;
         assert_eq!(out, ToolOutcome::Err("tool timed out after 0.05s".into()));
     }
@@ -249,7 +246,10 @@ mod tests {
         let reg = ToolRegistry::new(vec![TestSource::echo_boxed()]).unwrap();
         let ex = ToolExecutor::new(Arc::new(reg), Box::new(AskPolicy), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("echo", json!({"text":"x"})), &Fixture::all())
+            .execute(
+                &Fixture::call("echo", json!({"text":"x"})),
+                &Fixture::all(&ex),
+            )
             .await;
         assert_eq!(
             out,
@@ -261,7 +261,7 @@ mod tests {
     async fn executor_reports_panicking_tool_as_error() {
         let ex = Fixture::executor(TestSource::panic_boxed(), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("panic", json!({})), &Fixture::all())
+            .execute(&Fixture::call("panic", json!({})), &Fixture::all(&ex))
             .await;
         match out {
             ToolOutcome::Err(m) => assert!(m.starts_with("tool panicked")),
@@ -277,7 +277,7 @@ mod tests {
             Duration::from_millis(50),
         );
         let out = ex
-            .execute(&Fixture::call("flag", json!({})), &Fixture::all())
+            .execute(&Fixture::call("flag", json!({})), &Fixture::all(&ex))
             .await;
         assert!(!out.is_ok());
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -295,7 +295,10 @@ mod tests {
     async fn executor_runs_valid_call() {
         let ex = Fixture::executor(TestSource::echo_boxed(), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("echo", json!({"text":"x"})), &Fixture::all())
+            .execute(
+                &Fixture::call("echo", json!({"text":"x"})),
+                &Fixture::all(&ex),
+            )
             .await;
         assert_eq!(out, ToolOutcome::Ok(json!({"text":"x"})));
     }
@@ -304,7 +307,7 @@ mod tests {
     async fn executor_rejects_invalid_arguments() {
         let ex = Fixture::executor(TestSource::echo_boxed(), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("echo", json!({})), &Fixture::all())
+            .execute(&Fixture::call("echo", json!({})), &Fixture::all(&ex))
             .await;
         match out {
             ToolOutcome::Err(m) => assert!(m.starts_with("invalid arguments: ")),

@@ -287,6 +287,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_keeps_sampling() {
+        let link = FakeLink::new(true, vec![Fixture::answer("a"), Fixture::answer("b")]);
+        let mut f = Fixture::new(Some(link.clone()));
+        let config = SamplingConfig {
+            temperature: 0.1,
+            ..SamplingConfig::default()
+        };
+        f.call("set_sampling", json!({"config": config}))
+            .await
+            .unwrap();
+        f.call("send_turn", json!({"content": "q1"})).await.unwrap();
+        f.call("reset", Value::Null).await.unwrap();
+        f.call("send_turn", json!({"content": "q2"})).await.unwrap();
+        let requests = link.requests();
+        assert_eq!(requests[1].messages.len(), 1);
+        assert_eq!(requests[1].sampling.temperature, 0.1);
+    }
+
+    #[tokio::test]
     async fn model_props_without_harness_errors() {
         let mut f = Fixture::new(None);
         let err = f.call("model_props", Value::Null).await.unwrap_err();
