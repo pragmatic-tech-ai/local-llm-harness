@@ -277,11 +277,16 @@ impl TemplateStore {
         Ok(id)
     }
 
-    /// Path equality as the (case-insensitive) filesystem sees it; ASCII folding, matching
-    /// `find`, `count_ids` and `collect_ids`.
+    /// File identity: compares canonicalized paths (the filesystem's own casing, so non-ASCII
+    /// case differences are handled); falls back to ASCII-insensitive name equality if either
+    /// path cannot be canonicalized. Call only after the new file has been written.
     fn same_file(a: &Path, b: &Path) -> bool {
-        a.to_string_lossy()
-            .eq_ignore_ascii_case(&b.to_string_lossy())
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&b.to_string_lossy()),
+        }
     }
 
     pub fn delete(&self, id: &str) -> Result<(), TemplateError> {
@@ -1016,5 +1021,17 @@ mod tests {
             }
         }
         assert_eq!(seen, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_into_non_ascii_case_variant_group_keeps_file() {
+        let d = TempDir::new("nonascii");
+        d.hand_file("\u{c9}", "a");
+        let s = d.store();
+        let mut t = TempDir::sample("a");
+        t.system_prompt = "new content".into();
+        s.save(Some("a"), "\u{e9}", &t).unwrap();
+        assert_eq!(s.get("a").unwrap().0.system_prompt, "new content");
     }
 }
