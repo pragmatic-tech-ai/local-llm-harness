@@ -56,6 +56,10 @@ pub trait ModelHost: Send + Sync {
     /// A link to a model matching `req`, loading it (and evicting what is loaded) if needed.
     async fn ensure_ready(&self, req: &ModelRequirement) -> Result<Arc<dyn WorkerLink>, HostError>;
     async fn unload(&self) -> Result<(), HostError>;
+    /// Unload only if the loaded model is `req`'s runtime and model (any n_ctx). The check and the
+    /// stop happen atomically under the host's loading lock, so a concurrent load cannot slip in
+    /// between. Returns whether anything was unloaded.
+    async fn unload_if(&self, req: &ModelRequirement) -> Result<bool, HostError>;
     /// Fires on any state change. Must be called inside a tokio runtime.
     fn subscribe(&self) -> broadcast::Receiver<()>;
 }
@@ -218,6 +222,22 @@ impl ModelHost for LocalSupervisorHost {
             .map_err(|e| HostError(e.to_string()))
     }
 
+    async fn unload_if(&self, req: &ModelRequirement) -> Result<bool, HostError> {
+        let _serial = self.loading.lock().await;
+        let holds_it = self
+            .harness
+            .current()
+            .is_some_and(|i| i.runtime == req.runtime && i.model == req.model);
+        if !holds_it {
+            return Ok(false);
+        }
+        self.harness
+            .stop()
+            .await
+            .map_err(|e| HostError(e.to_string()))?;
+        Ok(true)
+    }
+
     /// Signals on every harness change. `tokio::sync::broadcast::Sender` has no `closed()`, so
     /// instead of one task per subscription (which could only notice a dropped receiver on the
     /// next event) a single forwarder task serves all subscribers; it ends when the harness's
@@ -273,6 +293,13 @@ pub(crate) struct FakeHost {
     ensure_calls: std::sync::atomic::AtomicUsize,
     unload_calls: std::sync::atomic::AtomicUsize,
     tx: broadcast::Sender<()>,
+    /// Serialises loads and unloads like the real host's loading lock.
+    loading: Mutex<()>,
+    /// When set, each `ensure_ready` waits for a permit (while holding the loading lock).
+    gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// (model, model evicted, requirement matched the host state when the load returned).
+    loads: StdMutex<Vec<(String, Option<String>, bool)>>,
+    started: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -325,7 +352,26 @@ impl FakeHost {
             ensure_calls: std::sync::atomic::AtomicUsize::new(0),
             unload_calls: std::sync::atomic::AtomicUsize::new(0),
             tx: broadcast::channel(16).0,
+            loading: Mutex::new(()),
+            gate: StdMutex::new(None),
+            loads: StdMutex::new(Vec::new()),
+            started: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Make every later `ensure_ready` wait for a permit on `gate` once it holds the lock.
+    pub(crate) fn set_gate(&self, gate: Arc<tokio::sync::Semaphore>) {
+        *self.gate.lock().unwrap() = Some(gate);
+    }
+
+    /// `(model, evicted model, matched at return)` for each load that reached the end.
+    pub(crate) fn loads(&self) -> Vec<(String, Option<String>, bool)> {
+        self.loads.lock().unwrap().clone()
+    }
+
+    /// How many loads have taken the loading lock (before any gate).
+    pub(crate) fn load_started(&self) -> usize {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The link every call hands out (use `.requests()` to inspect traffic).
@@ -395,20 +441,55 @@ impl ModelHost for FakeHost {
         if let Some(message) = self.ensure_error.lock().unwrap().clone() {
             return Err(HostError(message));
         }
-        if !self.loaded_matches(req) {
+        let _serial = self.loading.lock().await;
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let evicted = if self.loaded_matches(req) {
+            None
+        } else {
+            let previous = self.state.lock().unwrap().loaded.clone().map(|l| l.1);
             self.set_state(HostState {
                 loaded: Some((req.runtime.clone(), req.model.clone(), Some(req.n_ctx))),
                 loading: false,
             });
+            previous
+        };
+        let gate = self.gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
         }
+        let matched = self.loaded_matches(req);
+        self.loads
+            .lock()
+            .unwrap()
+            .push((req.model.clone(), evicted, matched));
         Ok(Arc::clone(&self.link) as Arc<dyn WorkerLink>)
     }
 
     async fn unload(&self) -> Result<(), HostError> {
+        let _serial = self.loading.lock().await;
         self.unload_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.set_state(HostState::default());
         Ok(())
+    }
+
+    async fn unload_if(&self, req: &ModelRequirement) -> Result<bool, HostError> {
+        let _serial = self.loading.lock().await;
+        let holds_it = self
+            .state
+            .lock()
+            .unwrap()
+            .loaded
+            .as_ref()
+            .is_some_and(|l| l.0 == req.runtime && l.1 == req.model);
+        if !holds_it {
+            return Ok(false);
+        }
+        self.unload_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.set_state(HostState::default());
+        Ok(true)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<()> {
@@ -691,6 +772,47 @@ mod tests {
             .await
             .expect("unload signals a change")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unload_if_only_stops_the_matching_model() {
+        let (host, harness) = Fixtures::host("unloadif");
+        host.ensure_ready(&Fixtures::req("gemma", 8192))
+            .await
+            .unwrap();
+        assert!(!host.unload_if(&Fixtures::req("other", 8192)).await.unwrap());
+        assert_eq!(harness.stops.load(Ordering::SeqCst), 0);
+        // n_ctx is ignored: the same model at another context is still its model.
+        assert!(host.unload_if(&Fixtures::req("gemma", 4096)).await.unwrap());
+        assert_eq!(harness.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(host.state(), HostState::default());
+        assert!(!host.unload_if(&Fixtures::req("gemma", 4096)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn unload_if_waits_for_an_in_flight_load() {
+        let (host, harness) = Fixtures::host("unloadif-serial");
+        let host = Arc::new(host);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *harness.gate.lock().unwrap() = Some(Arc::clone(&gate));
+        let loader = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.ensure_ready(&Fixtures::req("gemma", 8192)).await })
+        };
+        while harness.starts().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let unloader = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.unload_if(&Fixtures::req("gemma", 8192)).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(harness.stops.load(Ordering::SeqCst), 0, "must wait");
+        gate.add_permits(1);
+        loader.await.unwrap().unwrap();
+        // The load finished first, so the check now sees the model and stops it.
+        assert!(unloader.await.unwrap().unwrap());
+        assert_eq!(harness.stops.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

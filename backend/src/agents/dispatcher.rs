@@ -61,6 +61,7 @@ impl PlacementPolicy for ExplicitLoadPolicy {
         req: &ModelRequirement,
         hosts: &'a [Arc<dyn ModelHost>],
     ) -> Option<&'a Arc<dyn ModelHost>> {
+        // The final search also covers the preferred host; this pass only makes it win.
         if let Some(preferred) = req.host.as_deref() {
             if let Some(host) = hosts
                 .iter()
@@ -120,7 +121,9 @@ impl Dispatcher {
             .ok_or_else(|| DispatchError(Self::unavailable_reason(req)))
     }
 
-    /// Where `req` stands. Never loads anything.
+    /// Where `req` stands. Never loads anything. While the host is mid-load (even of `req`
+    /// itself) the answer is `NeedsLoad` with `evicts: None`, because nothing is loaded yet; the
+    /// three states are kept and callers learn about progress through `subscribe`.
     pub fn status(&self, req: &ModelRequirement) -> Placement {
         let Some(host) = self.policy.choose_host(req, &self.hosts) else {
             return Placement::Unavailable {
@@ -170,17 +173,14 @@ impl Dispatcher {
     }
 
     /// Unload `req`'s model from its host. Does nothing if that host has some other model
-    /// (runtime or model name differs) loaded, so one session cannot evict another's model.
+    /// (runtime or model name differs) loaded, so one session cannot evict another's model; the
+    /// check and the stop are atomic on the host (`ModelHost::unload_if`).
     pub async fn unload(&self, req: &ModelRequirement) -> Result<(), DispatchError> {
         let host = self.host_for(req)?;
-        let holds_it = host
-            .state()
-            .loaded
-            .is_some_and(|(runtime, model, _)| runtime == req.runtime && model == req.model);
-        if !holds_it {
-            return Ok(());
-        }
-        host.unload().await.map_err(|e| DispatchError(e.0))
+        host.unload_if(req)
+            .await
+            .map(|_| ())
+            .map_err(|e| DispatchError(e.0))
     }
 
     /// Fires whenever any host's state changes. Must be called inside a tokio runtime.
@@ -471,6 +471,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hive.unload_calls(), 1);
+        // Nothing left to unload: a repeat is a no-op.
+        d.unload(&Fixtures::req("gemma-4", 4096, None))
+            .await
+            .unwrap();
+        assert_eq!(hive.unload_calls(), 1);
+    }
+
+    #[test]
+    fn status_while_loading_reports_needs_load_without_eviction() {
+        let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-3")]);
+        hive.set_state(HostState {
+            loaded: None,
+            loading: true,
+        });
+        let d = Fixtures::dispatcher(&[&hive]);
+        assert_eq!(
+            d.status(&Fixtures::req("gemma-3", 4096, None)),
+            Placement::NeedsLoad {
+                host: "hive".into(),
+                evicts: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_turns_for_different_models_serialise_and_evict() {
+        let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-3"), ("llamacpp", "gemma-4")]);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        hive.set_gate(Arc::clone(&gate));
+        let d = Arc::new(Fixtures::dispatcher(&[&hive]));
+        let mut turns = Vec::new();
+        for model in ["gemma-3", "gemma-4"] {
+            let d = Arc::clone(&d);
+            turns.push(tokio::spawn(async move {
+                d.link_for_turn(&Fixtures::req(model, 4096, None), || {})
+                    .await
+                    .map(|_| ())
+            }));
+        }
+        // One load holds the lock at the gate; the other is queued behind it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hive.load_started(), 1);
+        gate.add_permits(2);
+        for turn in turns {
+            turn.await.unwrap().unwrap();
+        }
+        let loads = hive.loads();
+        assert_eq!(loads.len(), 2);
+        assert_eq!(loads[0].1, None);
+        assert_eq!(loads[1].1, Some(loads[0].0.clone()));
+        assert_ne!(loads[0].0, loads[1].0);
+        assert!(loads.iter().all(|l| l.2), "each load matched its own req");
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_no_hosts_returns_a_receiver() {
+        let d = Dispatcher::new(Vec::new(), Box::new(ExplicitLoadPolicy));
+        let mut rx = d.subscribe();
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -480,7 +539,6 @@ mod tests {
         let d = Fixtures::dispatcher(&[&a, &b]);
         let mut rx1 = d.subscribe();
         let mut rx2 = d.subscribe();
-        tokio::task::yield_now().await;
         b.fire();
         for rx in [&mut rx1, &mut rx2] {
             tokio::time::timeout(Duration::from_secs(1), rx.recv())
