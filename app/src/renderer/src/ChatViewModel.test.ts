@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { ChatViewModel } from './ChatViewModel'
-import { HarnessClient } from './HarnessClient'
+import { RuntimeClient } from './RuntimeClient'
 import { FakeSocket } from './FakeSocket'
 import type { AssistantMessage, ToolCallMessage, ToolResultMessage } from './messages'
 
 class Rig
 {
     public readonly socket = new FakeSocket()
-    public readonly client = new HarnessClient(() => this.socket)
+    public readonly client = new RuntimeClient(() => this.socket)
     public readonly vm = new ChatViewModel(this.client)
 
     constructor(open: boolean)
@@ -159,7 +159,7 @@ describe('ChatViewModel', () =>
     it('composer_placeholder_tracks_binding', () =>
     {
         const socket = new FakeSocket()
-        const client = new HarnessClient(() => socket)
+        const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
         const vm = new ChatViewModel()
@@ -176,7 +176,7 @@ describe('ChatViewModel', () =>
     it('bind_enables_chat_and_routes_chunks', () =>
     {
         const socket = new FakeSocket()
-        const client = new HarnessClient(() => socket)
+        const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
         const vm = new ChatViewModel()
@@ -192,7 +192,7 @@ describe('ChatViewModel', () =>
     {
         const a = new Rig(true)
         a.Send('hi')
-        const clientB = new HarnessClient(() => new FakeSocket())
+        const clientB = new RuntimeClient(() => new FakeSocket())
         a.vm.Bind(clientB)
         a.Notify('turn_chunk', { text: 'zzz', tokens: [], stop: false })
         expect(a.Reply(1).Text).not.toContain('zzz')
@@ -208,7 +208,7 @@ describe('ChatViewModel', () =>
         const rig = new Rig(true)
         rig.Send('one')
         const socketB = new FakeSocket()
-        const clientB = new HarnessClient(() => socketB)
+        const clientB = new RuntimeClient(() => socketB)
         clientB.Connect('ws://y')
         socketB.Open()
         rig.vm.Bind(clientB)
@@ -336,7 +336,7 @@ describe('ChatViewModel', () =>
         rig.Send('one')
         rig.Notify('turn_chunk', { text: 'a', tokens: [], stop: false })
         const socketB = new FakeSocket()
-        const clientB = new HarnessClient(() => socketB)
+        const clientB = new RuntimeClient(() => socketB)
         clientB.Connect('ws://y')
         socketB.Open()
         rig.vm.Bind(clientB)

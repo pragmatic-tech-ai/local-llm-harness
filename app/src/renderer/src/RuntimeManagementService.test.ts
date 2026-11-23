@@ -3,7 +3,7 @@ import type { IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/services/content-host-service.js'
 import { RuntimeManagementService } from './RuntimeManagementService'
 import { ChatViewModel } from './ChatViewModel'
-import { HarnessClient } from './HarnessClient'
+import { RuntimeClient } from './RuntimeClient'
 import { HarnessPickerViewModel } from './HarnessPickerViewModel'
 import { SupervisorClient } from './SupervisorClient'
 import { FakeSocket } from './FakeSocket'
@@ -68,7 +68,7 @@ class FakeSettings
     }
 }
 
-class SpyClient extends HarnessClient
+class SpyClient extends RuntimeClient
 {
     constructor(public readonly Id: number, private readonly log: string[])
     {

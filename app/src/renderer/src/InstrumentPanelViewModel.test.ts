@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { ChatViewModel } from './ChatViewModel'
-import { HarnessClient } from './HarnessClient'
+import { RuntimeClient } from './RuntimeClient'
 import { FakeSocket } from './FakeSocket'
 import { LogprobVM } from './LogprobVM'
 
 class Rig
 {
     public readonly socket = new FakeSocket()
-    public readonly client = new HarnessClient(() => this.socket)
+    public readonly client = new RuntimeClient(() => this.socket)
     public readonly vm: ChatViewModel
 
     constructor()
@@ -211,7 +211,7 @@ describe('LogprobVM', () =>
     {
         const rig = new Rig()
         const socketB = new FakeSocket()
-        const clientB = new HarnessClient(() => socketB)
+        const clientB = new RuntimeClient(() => socketB)
         clientB.Connect('ws://y')
         socketB.Open()
         rig.vm.Panel.Bind(clientB)

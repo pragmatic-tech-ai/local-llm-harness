@@ -1,5 +1,5 @@
 import { Key, Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { HarnessClient, type IDisposable, type ModelProps, type ToolCallNote } from './HarnessClient'
+import { RuntimeClient, type IDisposable, type ModelProps, type ToolCallNote } from './RuntimeClient'
 import { AssistantMessage, ToolCallMessage, ToolResultMessage, UserMessage } from './messages'
 import { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
 
@@ -38,10 +38,10 @@ export class ChatViewModel extends Observable
     private _toolsText = ChatViewModel.ToolsOff
     private readonly _sendCommand: RelayCommand
     private readonly _submitCommand: RelayCommand
-    private client: HarnessClient | null = null
+    private client: RuntimeClient | null = null
     private subscriptions: IDisposable[] = []
 
-    constructor(client?: HarnessClient)
+    constructor(client?: RuntimeClient)
     {
         super()
         this.Panel = new InstrumentPanelViewModel()
@@ -68,7 +68,7 @@ export class ChatViewModel extends Observable
     }
 
     /** Rebinds to a (new) harness client, or unbinds with null. Stale subscriptions are disposed first. */
-    public Bind(client: HarnessClient | null): void
+    public Bind(client: RuntimeClient | null): void
     {
         for (const s of this.subscriptions)
         {

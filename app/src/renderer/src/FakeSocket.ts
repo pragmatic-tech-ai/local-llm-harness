@@ -1,4 +1,4 @@
-import type { IHarnessSocket } from './HarnessClient'
+import type { IHarnessSocket } from './RuntimeClient'
 
 /** Test double for the WebSocket: records sent frames and lets tests drive its lifecycle. */
 export class FakeSocket implements IHarnessSocket

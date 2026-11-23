@@ -1,5 +1,5 @@
 import { Observable } from '@pragmatic-tech-ai/mural/runtime'
-import type { TokenInfo } from './HarnessClient'
+import type { TokenInfo } from './RuntimeClient'
 
 /** One generated token with its log-probability, for the logprobs list. */
 export class LogprobVM extends Observable

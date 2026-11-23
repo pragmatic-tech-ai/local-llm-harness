@@ -3,7 +3,7 @@ import type { IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
 import type { IDisposable } from './JsonRpcConnection'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/services/content-host-service.js'
 import { ChatViewModel } from './ChatViewModel'
-import { HarnessClient } from './HarnessClient'
+import { RuntimeClient } from './RuntimeClient'
 import { HarnessPickerViewModel } from './HarnessPickerViewModel'
 import { SupervisorClient } from './SupervisorClient'
 import { SupervisorUrlSettingKey } from './SettingsKeys'
@@ -23,14 +23,14 @@ export class RuntimeManagementService extends ServiceBase
     private readonly chat: ChatViewModel
     private readonly picker: HarnessPickerViewModel
     private readonly subscriptions: IDisposable[]
-    private chatClient: HarnessClient | null = null
+    private chatClient: RuntimeClient | null = null
     private supervisor: SupervisorClient | null = null
 
     constructor(
         provider: IServiceProvider,
         chatFactory: () => ChatViewModel = () => new ChatViewModel(),
         pickerFactory: () => HarnessPickerViewModel = () => new HarnessPickerViewModel(),
-        private readonly harnessFactory: () => HarnessClient = () => new HarnessClient(),
+        private readonly harnessFactory: () => RuntimeClient = () => new RuntimeClient(),
         private readonly supervisorFactory: () => SupervisorClient = () => new SupervisorClient())
     {
         super(provider)
@@ -61,7 +61,7 @@ export class RuntimeManagementService extends ServiceBase
     }
 
     /** Bind the chat to a directly-connected backend (no supervisor); used by the direct-backend fallback. */
-    public BindBackend(client: HarnessClient): void
+    public BindBackend(client: RuntimeClient): void
     {
         this.chatClient?.Disconnect()
         this.chatClient = client

@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
-import { HarnessClient, TypedSignal, type ModelProps, type TurnChunk } from './HarnessClient'
+import { RuntimeClient, TypedSignal, type ModelProps, type TurnChunk } from './RuntimeClient'
+import type { AgentTemplate } from './agents'
 import { FakeSocket } from './FakeSocket'
 
-describe('HarnessClient', () =>
+describe('RuntimeClient', () =>
 {
     it('MapsTurnChunkNotificationsToText', () =>
     {
-        const client = new HarnessClient()
+        const client = new RuntimeClient()
         const chunks: TurnChunk[] = []
         const order: string[] = []
         client.OnTurnChunk.Subscribe(p =>
@@ -28,7 +29,7 @@ describe('HarnessClient', () =>
     it('ResolvesModelPropsById', async () =>
     {
         const socket = new FakeSocket()
-        const client = new HarnessClient(() => socket)
+        const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
         const pending = client.ModelProps()
@@ -40,7 +41,7 @@ describe('HarnessClient', () =>
     it('RejectsOnErrorResponse', async () =>
     {
         const socket = new FakeSocket()
-        const client = new HarnessClient(() => socket)
+        const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
         const pending = client.Tokenize('x')
@@ -50,7 +51,7 @@ describe('HarnessClient', () =>
 
     it('RaisesTurnErrorAndRejected', () =>
     {
-        const client = new HarnessClient()
+        const client = new RuntimeClient()
         const errors: string[] = []
         const rejected: number[] = []
         client.OnTurnError.Subscribe(p => errors.push(p.message))
@@ -63,7 +64,7 @@ describe('HarnessClient', () =>
 
     it('IgnoresUnknownAndMalformedFrames', () =>
     {
-        const client = new HarnessClient()
+        const client = new RuntimeClient()
         const raws = ['not json', 'null', '42', '"str"', '[]', '{}', '{"method":"mystery","params":{}}', '{"id":99,"result":1}']
         for (const raw of raws)
         {
@@ -74,7 +75,7 @@ describe('HarnessClient', () =>
     it('TreatsNullErrorAsResultWithoutThrowing', async () =>
     {
         const socket = new FakeSocket()
-        const client = new HarnessClient(() => socket)
+        const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
         const pending = client.ModelProps()
@@ -84,14 +85,14 @@ describe('HarnessClient', () =>
 
     it('RejectsImmediatelyWhenNeverConnected', async () =>
     {
-        const client = new HarnessClient()
+        const client = new RuntimeClient()
         await expect(client.SendTurn('hi', false)).rejects.toThrow('not connected')
     })
 
     it('QueuesWhileConnectingThenFlushesOnOpen', () =>
     {
         const socket = new FakeSocket()
-        const client = new HarnessClient(() => socket)
+        const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         void client.ModelProps()
         expect(socket.sent).toEqual([])
@@ -104,7 +105,7 @@ describe('HarnessClient', () =>
     it('RejectsPendingAndLaterRequestsAfterClose', async () =>
     {
         const socket = new FakeSocket()
-        const client = new HarnessClient(() => socket)
+        const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
         const inFlight = client.SendTurn('hi', false)
@@ -143,7 +144,7 @@ describe('HarnessClient', () =>
     it('disconnect_rejects_pending_and_closes', async () =>
     {
         const socket = new FakeSocket()
-        const client = new HarnessClient(() => socket)
+        const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
         const inFlight = client.SendTurn('hi', false)
@@ -158,7 +159,7 @@ describe('HarnessClient', () =>
     {
         const sockets = [new FakeSocket(), new FakeSocket()]
         let next = 0
-        const client = new HarnessClient(() => sockets[next++])
+        const client = new RuntimeClient(() => sockets[next++])
         client.Connect('ws://a')
         sockets[0].Open()
         client.Connect('ws://b')
@@ -184,7 +185,7 @@ describe('HarnessClient', () =>
     {
         const sockets = [new FakeSocket(), new FakeSocket()]
         let next = 0
-        const client = new HarnessClient(() => sockets[next++])
+        const client = new RuntimeClient(() => sockets[next++])
         client.Connect('ws://a')
         void client.ModelProps().catch(() => undefined)
         client.Connect('ws://b')
@@ -194,7 +195,7 @@ describe('HarnessClient', () =>
 
     it('tool_notifications_raise_signals', () =>
     {
-        const client = new HarnessClient()
+        const client = new RuntimeClient()
         const seen: unknown[] = []
         client.OnToolCall.Subscribe(p => seen.push(p))
         client.OnToolResult.Subscribe(p => seen.push(p))
@@ -211,12 +212,72 @@ describe('HarnessClient', () =>
     it('list_tools_sends_method', async () =>
     {
         const socket = new FakeSocket()
-        const client = new HarnessClient(() => socket)
+        const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
         const pending = client.ListTools()
         expect(JSON.parse(socket.sent[0]).method).toBe('list_tools')
         client.HandleFrame(JSON.stringify({ id: 1, result: [{ name: 'get_time', description: 'd', side_effects: false }] }))
         await expect(pending).resolves.toEqual([{ name: 'get_time', description: 'd', side_effects: false }])
+    })
+
+    it('each_method_sends_its_wire_name_and_params', async () =>
+    {
+        const template = { name: 'T' } as AgentTemplate
+        const sampling = { temperature: 1, top_p: 1, top_k: 1, repeat_penalty: 1, seed: 1, max_tokens: 1 }
+        const table: { call: (c: RuntimeClient) => Promise<unknown>, method: string, params: unknown }[] = [
+            { call: c => c.ListTemplates(), method: 'list_templates', params: {} },
+            { call: c => c.GetTemplate('a'), method: 'get_template', params: { id: 'a' } },
+            { call: c => c.SaveTemplate('a', 'g', template), method: 'save_template', params: { id: 'a', path: 'g', template } },
+            { call: c => c.SaveTemplate(undefined, undefined, template), method: 'save_template', params: { template } },
+            { call: c => c.DeleteTemplate('a'), method: 'delete_template', params: { id: 'a' } },
+            { call: c => c.CreateGroup('g'), method: 'create_group', params: { path: 'g' } },
+            { call: c => c.RenameGroup('g', 'h'), method: 'rename_group', params: { path: 'g', new_name: 'h' } },
+            { call: c => c.DeleteGroup('g'), method: 'delete_group', params: { path: 'g' } },
+            { call: c => c.MoveTemplate('a', 'g'), method: 'move_template', params: { id: 'a', path: 'g' } },
+            { call: c => c.ListCatalog(), method: 'list_catalog', params: {} },
+            { call: c => c.ListAllTools(), method: 'list_all_tools', params: {} },
+            { call: c => c.ListSessions(), method: 'list_sessions', params: {} },
+            { call: c => c.CreateSession('t'), method: 'create_session', params: { template_id: 't' } },
+            { call: c => c.AttachSession('s'), method: 'attach_session', params: { id: 's' } },
+            { call: c => c.RenameSession('s', 'x'), method: 'rename_session', params: { id: 's', title: 'x' } },
+            { call: c => c.DeleteSession('s'), method: 'delete_session', params: { id: 's' } },
+            { call: c => c.LoadSessionModel('s'), method: 'load_session_model', params: { id: 's' } },
+            { call: c => c.UnloadSessionModel('s'), method: 'unload_session_model', params: { id: 's' } },
+            { call: c => c.SetThinking(true), method: 'set_thinking', params: { enable: true } },
+            { call: c => c.SetSampling(sampling), method: 'set_sampling', params: { config: sampling } },
+            { call: c => c.Reset(), method: 'reset', params: {} }
+        ]
+        for (const row of table)
+        {
+            const socket = new FakeSocket()
+            const client = new RuntimeClient(() => socket)
+            client.Connect('ws://x')
+            socket.Open()
+            const pending = row.call(client)
+            const frame = JSON.parse(socket.sent[0])
+            expect(frame.method).toBe(row.method)
+            expect(frame.params).toEqual(row.params)
+            client.HandleFrame(JSON.stringify({ id: frame.id, result: row.method === 'save_template' ? { id: 'a' } : null }))
+            await pending
+        }
+    })
+
+    it('list_level_notifications_raise_signals', () =>
+    {
+        const client = new RuntimeClient()
+        const seen: unknown[] = []
+        client.OnSessionsChanged.Subscribe(() => seen.push('sessions'))
+        client.OnTemplatesChanged.Subscribe(() => seen.push('templates'))
+        client.OnPlacementChanged.Subscribe(p => seen.push(p))
+        client.OnSessionLoading.Subscribe(p => seen.push(p))
+        client.OnSessionBusy.Subscribe(p => seen.push(p))
+        const placement = { id: 's', placement: { state: 'ready', host: 'h' } }
+        client.HandleFrame(JSON.stringify({ method: 'sessions_changed', params: {} }))
+        client.HandleFrame(JSON.stringify({ method: 'templates_changed', params: {} }))
+        client.HandleFrame(JSON.stringify({ method: 'placement_changed', params: placement }))
+        client.HandleFrame(JSON.stringify({ method: 'session_loading', params: { id: 's' } }))
+        client.HandleFrame(JSON.stringify({ method: 'session_busy', params: { id: 's', busy: true } }))
+        expect(seen).toEqual(['sessions', 'templates', placement, { id: 's' }, { id: 's', busy: true }])
     })
 })

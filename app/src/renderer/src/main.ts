@@ -1,6 +1,6 @@
 import './fonts.css'
 import { app } from './app.mu.js'
-import { HarnessClient } from './HarnessClient'
+import { RuntimeClient } from './RuntimeClient'
 import { SupervisorUrlSeed } from './SupervisorUrlSeed'
 import { SupervisorUrlSettingKey } from './SettingsKeys'
 import { RuntimeManagementService } from './RuntimeManagementService'
@@ -42,7 +42,7 @@ class RendererBootstrap
             const url = await window.harness.BackendUrl()
             if (url !== null)
             {
-                const client = new HarnessClient()
+                const client = new RuntimeClient()
                 client.Connect(url)
                 runtime.BindBackend(client)
             }
