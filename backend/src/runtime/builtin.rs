@@ -37,8 +37,24 @@ impl Sandbox {
         if rel_path.is_absolute() || anchored {
             return Err("path must be relative to the sandbox".to_string());
         }
-        let resolved = fs::canonicalize(self.root.join(rel_path))
-            .map_err(|_| format!("no such path: {rel}"))?;
+        // Normalise lexically first so `..` escapes are rejected identically whether or
+        // not the target exists (no existence probing outside the sandbox).
+        let mut stack: Vec<&std::ffi::OsStr> = Vec::new();
+        for component in rel_path.components() {
+            match component {
+                Component::Normal(part) => stack.push(part),
+                Component::ParentDir => {
+                    if stack.pop().is_none() {
+                        return Err("path escapes the sandbox".to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut joined = self.root.clone();
+        joined.extend(stack);
+        // Canonicalising still catches symlinks and junctions that point outside.
+        let resolved = fs::canonicalize(joined).map_err(|_| format!("no such path: {rel}"))?;
         if !resolved.starts_with(&self.root) {
             return Err("path escapes the sandbox".to_string());
         }
@@ -102,10 +118,10 @@ impl Tool for GetTimeTool {
     }
 
     async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => return ToolOutcome::Err("system clock is before the Unix epoch".to_string()),
+        };
         ToolOutcome::Ok(json!({"utc": CivilTime::utc_iso8601(secs), "unix": secs}))
     }
 }
@@ -122,21 +138,32 @@ impl ListDirTool {
             Err(e) => return ToolOutcome::Err(e),
         };
         if !dir.is_dir() {
-            return ToolOutcome::Err("path is a file, not a directory".to_string());
+            return ToolOutcome::Err("path is not a directory".to_string());
         }
         let reader = match fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) => return ToolOutcome::Err(format!("cannot read directory: {e}")),
         };
-        let mut entries: Vec<(String, &'static str, u64)> = reader
-            .filter_map(|e| e.ok())
+        // The directory is read in full before sorting and capping on purpose: that makes
+        // the 500-entry window deterministic (first 500 by name), not OS enumeration order.
+        // Entries that cannot be enumerated at all (no name available) are counted in
+        // `errors`; entries whose metadata is unreadable are listed with `size: null`.
+        let mut errors = 0usize;
+        let mut entries: Vec<(String, &'static str, Option<u64>)> = reader
+            .filter_map(|e| match e {
+                Ok(entry) => Some(entry),
+                Err(_) => {
+                    errors += 1;
+                    None
+                }
+            })
             .map(|e| {
                 let kind = match e.file_type() {
                     Ok(t) if t.is_dir() => "dir",
                     Ok(t) if t.is_file() => "file",
                     _ => "other",
                 };
-                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                let size = e.metadata().ok().map(|m| m.len());
                 (e.file_name().to_string_lossy().into_owned(), kind, size)
             })
             .collect();
@@ -151,6 +178,7 @@ impl ListDirTool {
             "path": sandbox.display(&dir),
             "entries": listed,
             "truncated": truncated,
+            "errors": errors,
         }))
     }
 }
@@ -172,11 +200,11 @@ impl Tool for ListDirTool {
     }
 
     async fn call(&self, args: Value, _ctx: &ToolContext) -> ToolOutcome {
-        let rel = args
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or(".")
-            .to_string();
+        let rel = match args.get("path") {
+            None | Some(Value::Null) => ".".to_string(),
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => return ToolOutcome::Err("path must be a string".to_string()),
+        };
         let sandbox = self.sandbox.clone();
         tokio::task::spawn_blocking(move || Self::list(&sandbox, &rel))
             .await
@@ -357,10 +385,28 @@ mod tests {
         let ToolOutcome::Ok(v) = dir.run("get_time", json!({})).await else {
             panic!("expected Ok");
         };
-        assert!(v["unix"].as_u64().unwrap() > 1_700_000_000);
+        let unix = v["unix"].as_u64().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now.abs_diff(unix) <= 5, "unix {unix} vs now {now}");
         let utc = v["utc"].as_str().unwrap();
+        assert_eq!(utc, CivilTime::utc_iso8601(unix));
         assert_eq!(utc.len(), 20);
-        assert!(utc.ends_with('Z'));
+        for (i, c) in utc.bytes().enumerate() {
+            match i {
+                4 | 7 => assert_eq!(c, b'-'),
+                10 => assert_eq!(c, b'T'),
+                13 | 16 => assert_eq!(c, b':'),
+                19 => assert_eq!(c, b'Z'),
+                _ => assert!(c.is_ascii_digit(), "{utc}"),
+            }
+        }
+        let num = |r: std::ops::Range<usize>| utc[r].parse::<u32>().unwrap();
+        assert!((1..=12).contains(&num(5..7)));
+        assert!((1..=31).contains(&num(8..10)));
+        assert!(num(11..13) < 24 && num(14..16) < 60 && num(17..19) < 60);
     }
 
     #[tokio::test]
@@ -393,10 +439,7 @@ mod tests {
         let dir = TestDir::new();
         fs::write(dir.path.join("a.txt"), "a").unwrap();
         let out = dir.run("list_dir", json!({"path": "a.txt"})).await;
-        assert_eq!(
-            out,
-            ToolOutcome::Err("path is a file, not a directory".into())
-        );
+        assert_eq!(out, ToolOutcome::Err("path is not a directory".into()));
     }
 
     #[tokio::test]
@@ -470,6 +513,141 @@ mod tests {
             dir.sandbox().resolve("/etc"),
             Err("path must be relative to the sandbox".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_rejects_nonexistent_parent_escape() {
+        let dir = TestDir::new();
+        assert_eq!(
+            dir.sandbox().resolve("../nope"),
+            Err("path escapes the sandbox".to_string())
+        );
+        assert_eq!(
+            dir.sandbox().resolve("a/../../nope"),
+            Err("path escapes the sandbox".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_allows_inner_dotdot() {
+        let dir = TestDir::new();
+        fs::create_dir(dir.path.join("sub")).unwrap();
+        let resolved = dir.sandbox().resolve("sub/../sub/.").unwrap();
+        assert_eq!(dir.sandbox().display(&resolved), "sub");
+    }
+
+    #[test]
+    fn resolve_rejects_sibling_prefix() {
+        let outer = TestDir::new();
+        fs::create_dir(outer.path.join("sandbox2")).unwrap();
+        fs::create_dir(outer.path.join("sandbox2_x")).unwrap();
+        fs::write(outer.path.join("sandbox2_x").join("f"), "f").unwrap();
+        let sandbox = Sandbox::new(&outer.path.join("sandbox2")).unwrap();
+        assert_eq!(
+            sandbox.resolve("../sandbox2_x/f"),
+            Err("path escapes the sandbox".to_string())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_rejects_windows_anchored_paths() {
+        let dir = TestDir::new();
+        for rel in ["C:foo", r"\\server\share", r"\x"] {
+            assert_eq!(
+                dir.sandbox().resolve(rel),
+                Err("path must be relative to the sandbox".to_string()),
+                "{rel}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_dir_caps_at_500_entries() {
+        let dir = TestDir::new();
+        for i in 0..501 {
+            fs::write(dir.path.join(format!("f{i:04}")), "").unwrap();
+        }
+        let ToolOutcome::Ok(v) = dir.run("list_dir", json!({})).await else {
+            panic!("expected Ok");
+        };
+        assert_eq!(v["entries"].as_array().unwrap().len(), 500);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["errors"], 0);
+        assert_eq!(v["entries"][499]["name"], "f0499");
+    }
+
+    #[tokio::test]
+    async fn list_dir_rejects_non_string_path() {
+        let dir = TestDir::new();
+        let out = dir.run("list_dir", json!({"path": 5})).await;
+        assert_eq!(out, ToolOutcome::Err("path must be a string".into()));
+    }
+
+    #[tokio::test]
+    async fn read_file_clamps_to_65536() {
+        let dir = TestDir::new();
+        fs::write(dir.path.join("big"), vec![b'x'; 70000]).unwrap();
+        for args in [
+            json!({"path": "big"}),
+            json!({"path": "big", "max_bytes": 1_000_000}),
+        ] {
+            let ToolOutcome::Ok(v) = dir.run("read_file", args).await else {
+                panic!("expected Ok");
+            };
+            assert_eq!(v["bytes"], 65536);
+            assert_eq!(v["truncated"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_max_bytes_zero_returns_empty_truncated() {
+        let dir = TestDir::new();
+        fs::write(dir.path.join("a"), "abc").unwrap();
+        let out = dir
+            .run("read_file", json!({"path": "a", "max_bytes": 0}))
+            .await;
+        assert_eq!(
+            out,
+            ToolOutcome::Ok(json!({"path": "a", "content": "", "bytes": 0, "truncated": true}))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_invalid_max_bytes() {
+        let dir = TestDir::new();
+        fs::write(dir.path.join("a"), "abc").unwrap();
+        for bad in [json!(-1), json!("5"), json!(1.5)] {
+            let out = dir
+                .run("read_file", json!({"path": "a", "max_bytes": bad}))
+                .await;
+            assert_eq!(
+                out,
+                ToolOutcome::Err("max_bytes must be a non-negative integer".into())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outputs_never_contain_absolute_sandbox_path() {
+        let dir = TestDir::new();
+        fs::create_dir(dir.path.join("sub")).unwrap();
+        fs::write(dir.path.join("sub").join("n.txt"), "hi").unwrap();
+        let root = dir.path.to_string_lossy().into_owned();
+        let canonical = fs::canonicalize(&dir.path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let outputs = [
+            dir.run("list_dir", json!({"path": "sub"})).await,
+            dir.run("list_dir", json!({})).await,
+            dir.run("read_file", json!({"path": "sub/n.txt"})).await,
+        ];
+        for out in outputs {
+            let text = out.result_value().to_string();
+            assert!(!text.contains(&root), "{text}");
+            assert!(!text.contains(&canonical), "{text}");
+        }
     }
 
     #[test]
