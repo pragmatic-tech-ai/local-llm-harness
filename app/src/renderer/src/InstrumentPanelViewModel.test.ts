@@ -75,8 +75,8 @@ describe('InstrumentPanelViewModel', () =>
 
         const sent = rig.SamplingSent()
         expect(sent.map(c => c.temperature)).toEqual([0.8, 1.5])
-        // set_sampling lands before each send_turn
-        expect(rig.Methods().filter(m => m !== 'model_props')).toEqual(['set_sampling', 'set_thinking', 'send_turn', 'set_sampling', 'set_thinking', 'send_turn'])
+        // Changed knobs go out before the send_turn they apply to; an unchanged thinking flag is not re-sent.
+        expect(rig.Methods().filter(m => m !== 'model_props')).toEqual(['set_sampling', 'set_thinking', 'send_turn', 'set_sampling', 'send_turn'])
     })
 
     it('ForwardsThinkingToggleOnSend', () =>
@@ -191,6 +191,27 @@ describe('InstrumentPanelViewModel', () =>
         const rig = new Rig()
         expect(rig.vm.Panel.Config.max_tokens).toBe(256)
     })
+
+    it('session_values_seed_knobs_and_are_not_resent', () =>
+    {
+        const rig = new Rig()
+        rig.vm.Panel.ApplySession({ temperature: 0.2, top_p: 0.9, top_k: 20, repeat_penalty: 1, seed: 7, max_tokens: 64 }, true)
+        expect([rig.vm.Panel.Temperature, rig.vm.Panel.TopK, rig.vm.Panel.MaxTokens, rig.vm.Panel.EnableThinking]).toEqual([0.2, 20, 64, true])
+        rig.Send('one')
+        expect(rig.Methods().filter(m => m !== 'model_props')).toEqual(['send_turn'])
+    })
+
+    it('failed_set_sampling_reapplies_next_send', async () =>
+    {
+        const rig = new Rig()
+        rig.vm.Panel.ApplySession({ temperature: 0.2, top_p: 0.9, top_k: 20, repeat_penalty: 1, seed: 7, max_tokens: 64 }, false)
+        rig.vm.Panel.Temperature = 1
+        rig.Send('one')
+        rig.client.HandleFrame(JSON.stringify({ id: rig.IdOf('set_sampling'), error: { code: 1, message: 'nope' } }))
+        await rig.FinishTurn()
+        rig.Send('two')
+        expect(rig.SamplingSent().map(c => c.temperature)).toEqual([1, 1])
+    })
 })
 
 describe('LogprobVM', () =>
@@ -227,4 +248,6 @@ describe('LogprobVM', () =>
         expect(rig.vm.Panel.ModelName).toBe('B.gguf')
         expect(rig.vm.Panel.ContextTotal).toBe(222)
     })
+
 })
+

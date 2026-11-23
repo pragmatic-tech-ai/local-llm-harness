@@ -1,18 +1,4 @@
-import { JsonRpcConnection, TypedSignal } from './JsonRpcConnection'
-
-export interface RuntimeInfo
-{
-    name: string
-    kind: string
-    available: boolean
-}
-
-export interface ModelInfo
-{
-    name: string
-    runtimes: string[]
-    size_hint: string
-}
+import { JsonRpcConnection } from './JsonRpcConnection'
 
 export interface HarnessInfo
 {
@@ -24,54 +10,46 @@ export interface HarnessInfo
     chat_url?: string
 }
 
-/** JSON-RPC client for the supervisor control server: list/start/stop harnesses. */
+/**
+ * JSON-RPC client for the supervisor control server, used only to discover the agent runtime endpoint:
+ * the supervisor advertises the runtime as `chat_url` on its harnesses.
+ */
 export class SupervisorClient extends JsonRpcConnection
 {
-    private static readonly MethodListRuntimes = 'list_runtimes'
-    private static readonly MethodListModels = 'list_models'
     private static readonly MethodListHarnesses = 'list_harnesses'
-    private static readonly MethodStart = 'start'
-    private static readonly MethodStop = 'stop'
-    private static readonly NoteHarnessChanged = 'harness_changed'
-    private static readonly ParamNCtx = 'n_ctx'
-
-    public readonly OnHarnessChanged = new TypedSignal<HarnessInfo>()
-
-    public ListRuntimes(): Promise<RuntimeInfo[]>
-    {
-        return this.Request<RuntimeInfo[]>(SupervisorClient.MethodListRuntimes, {})
-    }
-
-    public ListModels(): Promise<ModelInfo[]>
-    {
-        return this.Request<ModelInfo[]>(SupervisorClient.MethodListModels, {})
-    }
+    /** The runtime's port when no harness advertises a `chat_url`. */
+    private static readonly DefaultRuntimePort = '8779'
 
     public ListHarnesses(): Promise<HarnessInfo[]>
     {
         return this.Request<HarnessInfo[]>(SupervisorClient.MethodListHarnesses, {})
     }
 
-    public Start(runtime: string, model: string, nCtx?: number): Promise<HarnessInfo>
+    /**
+     * The runtime url: the supervisor url (scheme and host kept, so a tunnel or LAN name still works) with its port
+     * replaced by the port of the first advertised `chat_url`, else by the default runtime port.
+     */
+    public static RuntimeUrl(supervisorUrl: string, harnesses: readonly HarnessInfo[]): string
     {
-        const params: Record<string, unknown> = { runtime, model }
-        if (nCtx !== undefined)
+        const supervisor = new URL(supervisorUrl)
+        let port = SupervisorClient.DefaultRuntimePort
+        for (const harness of harnesses)
         {
-            params[SupervisorClient.ParamNCtx] = nCtx
+            if (harness.chat_url)
+            {
+                const advertised = new URL(harness.chat_url).port
+                if (advertised.length > 0)
+                {
+                    port = advertised
+                    break
+                }
+            }
         }
-        return this.Request<HarnessInfo>(SupervisorClient.MethodStart, params)
+        return `${supervisor.protocol}//${supervisor.hostname}:${port}`
     }
 
-    public async Stop(id: string): Promise<void>
+    protected Dispatch(): void
     {
-        await this.Request<unknown>(SupervisorClient.MethodStop, { id })
-    }
-
-    protected Dispatch(method: string, params: unknown): void
-    {
-        if (method === SupervisorClient.NoteHarnessChanged)
-        {
-            this.OnHarnessChanged.Raise(params as HarnessInfo)
-        }
+        // The supervisor's harness notifications served the removed picker; nothing listens now.
     }
 }

@@ -1,29 +1,33 @@
 import { Key, Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { RuntimeClient, type IDisposable, type ModelProps, type ToolCallNote } from './RuntimeClient'
+import { RuntimeClient, type IDisposable, type ToolCallNote } from './RuntimeClient'
+import type { ChatMessage } from './agents'
 import { AssistantMessage, ToolCallMessage, ToolResultMessage, UserMessage } from './messages'
 import { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
 
-/** Owns the transcript, the composer draft, and the send flow. */
+export type TranscriptItem = UserMessage | AssistantMessage | ToolCallMessage | ToolResultMessage
+
+/** Owns the transcript, the composer draft, and the send flow of the attached session. */
 export class ChatViewModel extends Observable
 {
     private static readonly DraftProperty = 'Draft'
     private static readonly CanChatProperty = 'CanChat'
     private static readonly ComposerPlaceholderProperty = 'ComposerPlaceholder'
-    private static readonly NoHarnessHint = 'Start a harness to chat'
+    private static readonly NoSessionHint = 'Select a session to chat'
     private static readonly ComposerHint = 'Message the model…'
     private static readonly ErrorFormat = '\n[error: {0}]'
     private static readonly RejectedFormat = '\n[context window full: needed {0} of {1} tokens]'
     private static readonly DisconnectedNote = '\n[disconnected]'
     private static readonly SendFailedFormat = '\n[send failed: {0}]'
-    private static readonly ToolsProperty = 'ToolsText'
-    private static readonly ToolsOff = 'tools: off'
-    private static readonly ToolsPrefix = 'tools: '
-    private static readonly ToolsSeparator = ', '
+    private static readonly LoadingNote = '[loading model…]'
+    private static readonly ErrorKey = 'error'
     private static readonly NotKeptFormat = '[not kept: {0}]'
     private static readonly ParseErrorFormat = '{0}  [parse error: {1}]'
     private static readonly AnsweredReason = 'answered'
+    private static readonly RoleUser = 'user'
+    private static readonly RoleAssistant = 'assistant'
+    private static readonly RoleTool = 'tool'
 
-    public readonly Transcript = new ObservableCollection<UserMessage | AssistantMessage | ToolCallMessage | ToolResultMessage>()
+    public readonly Transcript = new ObservableCollection<TranscriptItem>()
     public readonly Panel: InstrumentPanelViewModel
 
     private _draft = ''
@@ -35,7 +39,6 @@ export class ChatViewModel extends Observable
     private turnToken = 0
     /** Set once turn_error/turn_rejected has reported, so a following send_turn failure adds no duplicate note. */
     private reported = false
-    private _toolsText = ChatViewModel.ToolsOff
     private readonly _sendCommand: RelayCommand
     private readonly _submitCommand: RelayCommand
     private client: RuntimeClient | null = null
@@ -45,7 +48,6 @@ export class ChatViewModel extends Observable
     {
         super()
         this.Panel = new InstrumentPanelViewModel()
-        this.Panel.OnModelProps.Subscribe(p => this.RefreshTools(p))
         this._sendCommand = new RelayCommand(() => this.Send(), () => this.CanChat)
         // Enter-to-send: the TextBox (SubmitsOnEnter) leaves Return unhandled so
         // KeyDown bubbles to a DockPanel trigger; this command sends only on Return.
@@ -67,7 +69,7 @@ export class ChatViewModel extends Observable
         return this.client !== null
     }
 
-    /** Rebinds to a (new) harness client, or unbinds with null. Stale subscriptions are disposed first. */
+    /** Binds to the client once a session is attached on it, or unbinds with null. Stale subscriptions are disposed first. */
     public Bind(client: RuntimeClient | null): void
     {
         for (const s of this.subscriptions)
@@ -89,26 +91,42 @@ export class ChatViewModel extends Observable
                 client.OnTurnRejected.Subscribe(p => this.ReportFailure(ChatViewModel.Format(ChatViewModel.RejectedFormat, p.needed, p.total))),
                 client.OnToolCall.Subscribe(p => this.OnToolCall(p)),
                 client.OnToolResult.Subscribe(p => this.Transcript.Add(new ToolResultMessage(p.name, p.ok, ChatViewModel.Stringify(p.content)))),
-                client.OnLoopDone.Subscribe(p => this.OnLoopDone(p.reason)))
+                client.OnLoopDone.Subscribe(p => this.OnLoopDone(p.reason)),
+                client.OnSessionLoading.Subscribe(() => this.OnSessionLoading()))
         }
-        this.SetToolsText(ChatViewModel.ToolsOff)
         this.Panel.Bind(client)
         this._sendCommand.RaiseCanExecuteChanged()
         this._submitCommand.RaiseCanExecuteChanged()
         this.RaisePropertyChanged(ChatViewModel.CanChatProperty, old, this.CanChat)
-        this.RaisePropertyChanged(ChatViewModel.ComposerPlaceholderProperty, old ? ChatViewModel.ComposerHint : ChatViewModel.NoHarnessHint, this.ComposerPlaceholder)
+        this.RaisePropertyChanged(ChatViewModel.ComposerPlaceholderProperty, old ? ChatViewModel.ComposerHint : ChatViewModel.NoSessionHint, this.ComposerPlaceholder)
     }
 
-    /** Composer hint: explains why the box is disabled when no harness is bound. */
+    /** Composer hint: explains why the box is disabled when no session is attached. */
     public get ComposerPlaceholder(): string
     {
-        return this.CanChat ? ChatViewModel.ComposerHint : ChatViewModel.NoHarnessHint
+        return this.CanChat ? ChatViewModel.ComposerHint : ChatViewModel.NoSessionHint
     }
 
-    /** Header indicator: the tools the runtime exposes, or 'tools: off'. */
-    public get ToolsText(): string
+    /** Replaces the transcript with a session's committed history (system messages hidden); drops any turn in flight. */
+    public LoadHistory(messages: readonly ChatMessage[]): void
     {
-        return this._toolsText
+        this.AbandonTurn('')
+        const items = ChatViewModel.HistoryItems(messages)
+        this.Transcript.Batch(() =>
+        {
+            this.Transcript.Clear()
+            for (const item of items)
+            {
+                this.Transcript.Add(item)
+            }
+        })
+    }
+
+    /** Empties the transcript (no session shown). */
+    public Clear(): void
+    {
+        this.AbandonTurn('')
+        this.Transcript.Clear()
     }
 
     public get Draft(): string
@@ -151,9 +169,18 @@ export class ChatViewModel extends Observable
         this.reported = false
         const token = ++this.turnToken
         this.Panel.ClearWarning()
-        // Apply the knobs to THIS turn (set_sampling lands before send_turn on the single ws stream).
-        client.SetSampling(this.Panel.Config).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
-        client.SetThinking(this.Panel.EnableThinking).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
+        // Knobs changed since the session's values were applied go out before THIS turn (set_sampling /
+        // set_thinking land before send_turn on the single ws stream; the runtime persists them per session).
+        const sampling = this.Panel.TakeSamplingChange()
+        if (sampling !== null)
+        {
+            client.SetSampling(sampling).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
+        }
+        const thinking = this.Panel.TakeThinkingChange()
+        if (thinking !== null)
+        {
+            client.SetThinking(thinking).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
+        }
         client.SendTurn(draft).then(
             () => this.Settle(token),
             (e: Error) =>
@@ -201,6 +228,25 @@ export class ChatViewModel extends Observable
         this.segment.Append(text)
     }
 
+    /** The runtime loads the session's model before this turn: say so where the reply will appear. */
+    private OnSessionLoading(): void
+    {
+        if (!this.busy)
+        {
+            return
+        }
+        if (this.segment === null || this.segment.Text.length > 0)
+        {
+            this.Transcript.Add(new AssistantMessage(ChatViewModel.LoadingNote))
+        }
+        else
+        {
+            this.segment.Append(ChatViewModel.LoadingNote)
+        }
+        // The first pass then opens its own reply below the note.
+        this.segment = null
+    }
+
     /** A call block closes the live segment so later text of the same pass renders below it. */
     private OnToolCall(p: ToolCallNote): void
     {
@@ -235,10 +281,10 @@ export class ChatViewModel extends Observable
         }
     }
 
-    /** Drops any turn waiting on a previous client, noting the abandoned reply. */
+    /** Drops any turn waiting on a previous client, noting the abandoned reply (an empty note adds nothing). */
     private AbandonTurn(note: string): void
     {
-        if (this.busy)
+        if (this.busy && note.length > 0)
         {
             this.AppendNote(note)
         }
@@ -247,33 +293,50 @@ export class ChatViewModel extends Observable
         this.turnToken++
     }
 
-    /** Panel-fetched props for the bound client: list the runtime's tools when the model supports them. */
-    private RefreshTools(props: ModelProps): void
+    /** Committed messages as transcript items: tool calls become call blocks, tool messages result blocks; system is hidden. */
+    private static HistoryItems(messages: readonly ChatMessage[]): TranscriptItem[]
     {
-        const client = this.client
-        if (client === null || props.supports_tools !== true)
+        const items: TranscriptItem[] = []
+        const callNames = new Map<string, string>()
+        for (const message of messages)
         {
-            return
-        }
-        client.ListTools().then(
-            tools =>
+            switch (message.role)
             {
-                if (this.client === client && tools.length > 0)
+                case ChatViewModel.RoleUser:
+                    items.push(new UserMessage(message.content))
+                    break
+                case ChatViewModel.RoleAssistant:
+                    if (message.content.length > 0)
+                    {
+                        items.push(new AssistantMessage(message.content))
+                    }
+                    for (const call of message.tool_calls ?? [])
+                    {
+                        callNames.set(call.id, call.function.name)
+                        items.push(new ToolCallMessage(call.function.name, ChatViewModel.Stringify(call.function.arguments)))
+                    }
+                    break
+                case ChatViewModel.RoleTool:
                 {
-                    this.SetToolsText(ChatViewModel.ToolsPrefix + tools.map(t => t.name).join(ChatViewModel.ToolsSeparator))
+                    const result = message.tool_result ?? message.content
+                    const name = callNames.get(message.tool_call_id ?? '') ?? ''
+                    items.push(new ToolResultMessage(name, !ChatViewModel.IsErrorResult(result), ChatViewModel.Stringify(result)))
+                    break
                 }
-            },
-            () => undefined)
+            }
+        }
+        return items
     }
 
-    private SetToolsText(value: string): void
+    /** A failed tool's committed result is the runtime's `{error: msg}` object. */
+    private static IsErrorResult(result: unknown): boolean
     {
-        const old = this._toolsText
-        this._toolsText = value
-        if (old !== value)
+        if (typeof result !== 'object' || result === null || Array.isArray(result))
         {
-            this.RaisePropertyChanged(ChatViewModel.ToolsProperty, old, value)
+            return false
         }
+        const keys = Object.keys(result)
+        return keys.length === 1 && keys[0] === ChatViewModel.ErrorKey
     }
 
     /** A call whose arguments did not parse shows the raw text plus the parse error. */

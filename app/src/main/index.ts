@@ -1,19 +1,15 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'node:path'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
-import { Sidecar } from './sidecar'
-import { BackendUrl } from './backend-url'
 import { SupervisorUrl } from './supervisor-url'
 import { SettingsFile } from './settings'
 
-/** Owns the BrowserWindow and the Rust backend sidecar for the app's lifetime. */
+/** Owns the BrowserWindow for the app's lifetime; the renderer reaches the agent runtime through the supervisor. */
 export class MainApplication
 {
     private static readonly AppUserModelId = 'com.local-llm-harness.app'
     private static readonly BackgroundColor = '#0A0A0B'
-    private static readonly BackendUrlChannel = 'backend-url'
     private static readonly SupervisorUrlChannel = 'supervisor-url'
-    private static readonly BeforeQuitEvent = 'before-quit'
     private static readonly BrowserWindowCreatedEvent = 'browser-window-created'
     private static readonly ActivateEvent = 'activate'
     private static readonly WindowAllClosedEvent = 'window-all-closed'
@@ -22,61 +18,15 @@ export class MainApplication
     private static readonly PreloadFile = '../preload/index.js'
     private static readonly RendererFile = '../renderer/index.html'
     private static readonly RendererUrlEnv = 'ELECTRON_RENDERER_URL'
-    private static readonly ServerUrlEnv = 'HARNESS_SERVER_URL'
-    private static readonly ModelEnv = 'HARNESS_MODEL'
-    private static readonly BindEnv = 'HARNESS_BIND'
-    private static readonly ExitMessage = 'sidecar exited unexpectedly: '
-    private static readonly StartFailedMessage = 'sidecar failed to start: '
     private static readonly WindowWidth = 1280
     private static readonly WindowHeight = 800
 
-    // Unset env vars fall back to the Sidecar defaults.
-    private readonly sidecar = new Sidecar({
-        serverUrl: process.env[MainApplication.ServerUrlEnv],
-        model: process.env[MainApplication.ModelEnv],
-        bind: process.env[MainApplication.BindEnv],
-    })
-    private readonly remoteUrl: string | null = MainApplication.ResolveBackendUrl(process.env)
     private readonly supervisorUrl: string | null = SupervisorUrl.Resolve(process.env)
-    private quitting = false
-    private startPromise: Promise<unknown> | null = null
-
-    /** The remote backend url from HARNESS_BACKEND_URL, or null to spawn the local sidecar. */
-    public static ResolveBackendUrl(env: NodeJS.ProcessEnv): string | null
-    {
-        return BackendUrl.Resolve(env)
-    }
 
     public Run(): void
     {
-        this.sidecar.OnExit.Subscribe((code, expected) =>
-        {
-            if (!expected)
-            {
-                console.error(MainApplication.ExitMessage + code)
-            }
-        })
         SettingsFile.Register(ipcMain, app.getPath('userData'))
         ipcMain.handle(MainApplication.SupervisorUrlChannel, () => this.supervisorUrl)
-        ipcMain.handle(MainApplication.BackendUrlChannel, async () =>
-        {
-            if (this.remoteUrl)
-            {
-                return this.remoteUrl
-            }
-            // Wait for the sidecar to finish starting so the renderer gets the
-            // real url, not the null it holds before Start() resolves.
-            try
-            {
-                await this.startPromise
-            }
-            catch
-            {
-                // start failed; return the current (likely null) url
-            }
-            return this.sidecar.Url
-        })
-        app.on(MainApplication.BeforeQuitEvent, (event) => void this.OnBeforeQuit(event))
         app.on(MainApplication.WindowAllClosedEvent, () =>
         {
             if (process.platform !== MainApplication.DarwinPlatform)
@@ -87,7 +37,7 @@ export class MainApplication
         void app.whenReady().then(() => this.OnReady())
     }
 
-    private async OnReady(): Promise<void>
+    private OnReady(): void
     {
         electronApp.setAppUserModelId(MainApplication.AppUserModelId)
         app.on(MainApplication.BrowserWindowCreatedEvent, (_event, window) => optimizer.watchWindowShortcuts(window))
@@ -98,21 +48,7 @@ export class MainApplication
                 this.CreateWindow()
             }
         })
-        if (this.supervisorUrl || this.remoteUrl)
-        {
-            this.CreateWindow()
-            return
-        }
-        this.startPromise = this.sidecar.Start()
         this.CreateWindow()
-        try
-        {
-            await this.startPromise
-        }
-        catch (err)
-        {
-            console.error(MainApplication.StartFailedMessage + (err instanceof Error ? err.message : String(err)))
-        }
     }
 
     private CreateWindow(): void
@@ -134,21 +70,6 @@ export class MainApplication
         {
             void window.loadFile(join(__dirname, MainApplication.RendererFile))
         }
-    }
-
-    private async OnBeforeQuit(event: { preventDefault(): void }): Promise<void>
-    {
-        if (this.quitting)
-        {
-            return
-        }
-        this.quitting = true
-        event.preventDefault()
-        if (this.startPromise)
-        {
-            await this.sidecar.Stop()
-        }
-        app.quit()
     }
 }
 

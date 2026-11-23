@@ -165,12 +165,12 @@ describe('ChatViewModel', () =>
         const vm = new ChatViewModel()
         let raised = 0
         vm.PropertyChanged('ComposerPlaceholder').subscribe(() => { raised++ })
-        expect(vm.ComposerPlaceholder).toBe('Start a harness to chat')
+        expect(vm.ComposerPlaceholder).toBe('Select a session to chat')
         vm.Bind(client)
         expect(vm.ComposerPlaceholder).toBe('Message the model…')
         expect(raised).toBe(1)
         vm.Bind(null)
-        expect(vm.ComposerPlaceholder).toBe('Start a harness to chat')
+        expect(vm.ComposerPlaceholder).toBe('Select a session to chat')
     })
 
     it('bind_enables_chat_and_routes_chunks', () =>
@@ -286,29 +286,6 @@ describe('ChatViewModel', () =>
         expect((items[items.length - 1] as AssistantMessage).Text).toBe('[not kept: step_limit]')
     })
 
-    it('tools_text_reflects_runtime', async () =>
-    {
-        const rig = new Rig(false)
-        expect(rig.vm.ToolsText).toBe('tools: off')
-        rig.client.Connect('ws://x')
-        rig.socket.Open()
-        rig.vm.Bind(rig.client)
-        rig.Respond('model_props', { n_ctx: 8, model_name: 'm', supports_tools: true })
-        await rig.Flush()
-        rig.Respond('list_tools', [{ name: 'get_time', description: '', side_effects: false }])
-        await rig.Flush()
-        expect(rig.vm.ToolsText).toBe('tools: get_time')
-
-        const off = new Rig(false)
-        off.client.Connect('ws://x')
-        off.socket.Open()
-        off.vm.Bind(off.client)
-        off.Respond('model_props', { n_ctx: 8, model_name: 'm', supports_tools: false })
-        await off.Flush()
-        expect(off.vm.ToolsText).toBe('tools: off')
-        expect(off.IdOf('list_tools')).toBe(-1)
-    })
-
     it('model_props_is_fetched_once_per_bind', () =>
     {
         const rig = new Rig(false)
@@ -394,5 +371,51 @@ describe('ChatViewModel', () =>
         expect((items[2] as ToolCallMessage).Arguments).toBe('')
         expect((items[3] as ToolCallMessage).Arguments).toBe('')
         expect((items[4] as ToolResultMessage).Content).toBe('')
+    })
+
+    it('session_loading_shows_note_then_reply_below', () =>
+    {
+        const rig = new Rig(true)
+        rig.Send('hi')
+        rig.Notify('session_loading', { id: 's1' })
+        rig.Notify('turn_started', { prompt: 'p', prompt_tokens: 1, n_ctx: 8 })
+        rig.Notify('turn_chunk', { text: 'hello', tokens: [], stop: true })
+        const items = rig.vm.Transcript.ToArray()
+        expect(items.map(i => i.constructor.name)).toEqual(['UserMessage', 'AssistantMessage', 'AssistantMessage'])
+        expect((items[1] as AssistantMessage).Text).toBe('[loading model…]')
+        expect((items[2] as AssistantMessage).Text).toBe('hello')
+    })
+
+    it('history_maps_calls_and_results_and_hides_system', () =>
+    {
+        const rig = new Rig(true)
+        rig.vm.LoadHistory([
+            { role: 'system', content: 'be brief' },
+            { role: 'user', content: 'read it' },
+            { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: { path: 'n.txt' } } }] },
+            { role: 'tool', content: '', tool_call_id: 'c1', tool_result: { content: 'hi' } },
+            { role: 'assistant', content: '', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'nope', arguments: {} } }] },
+            { role: 'tool', content: '', tool_call_id: 'c2', tool_result: { error: 'unknown tool: nope' } },
+            { role: 'assistant', content: 'It says hi.' },
+        ])
+        const items = rig.vm.Transcript.ToArray()
+        expect(items.map(i => i.constructor.name)).toEqual(['UserMessage', 'ToolCallMessage', 'ToolResultMessage', 'ToolCallMessage', 'ToolResultMessage', 'AssistantMessage'])
+        expect((items[1] as ToolCallMessage).Name).toBe('read_file')
+        expect((items[1] as ToolCallMessage).Arguments).toBe('{"path":"n.txt"}')
+        const ok = items[2] as ToolResultMessage
+        expect([ok.Name, ok.Ok, ok.Content]).toEqual(['read_file', true, '{"content":"hi"}'])
+        const failed = items[4] as ToolResultMessage
+        expect([failed.Name, failed.Ok]).toEqual(['nope', false])
+        expect((items[5] as AssistantMessage).Text).toBe('It says hi.')
+    })
+
+    it('history_replaces_the_transcript', () =>
+    {
+        const rig = new Rig(true)
+        rig.Send('old')
+        rig.vm.LoadHistory([{ role: 'user', content: 'new' }])
+        expect(rig.Count()).toBe(1)
+        rig.Notify('turn_chunk', { text: 'late', tokens: [], stop: false })
+        expect(rig.Count()).toBe(1)
     })
 })

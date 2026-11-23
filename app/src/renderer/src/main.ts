@@ -1,20 +1,17 @@
 import './fonts.css'
 import { app } from './app.mu.js'
-import { RuntimeClient } from './RuntimeClient'
 import { SupervisorUrlSeed } from './SupervisorUrlSeed'
-import { SupervisorUrlSettingKey } from './SettingsKeys'
-import { RuntimeManagementService } from './RuntimeManagementService'
+import { SessionsService } from './SessionsService'
 import { HtmlTarget } from '@pragmatic-tech-ai/mural/visual-engine'
 import { ApplicationSettings } from '@pragmatic-tech-ai/mural/framework'
 import { ThemeManager, Density } from '@pragmatic-tech-ai/mural/runtime'
 
-/** Renderer bootstrap: mounts the mural shell and wires the runtime-management capability to its data source. */
+/** Renderer bootstrap: seeds the supervisor url setting (the Sessions capability connects from it) and mounts the mural shell. */
 class RendererBootstrap
 {
     private static readonly IconFont = '24px "Material Symbols Outlined"'
     private static readonly AppElementId = 'app'
     private static readonly SplashElementId = 'splash'
-    private static readonly NoBackendWarning = 'No backend url; chat cannot send.'
 
     public static async Run(): Promise<void>
     {
@@ -31,26 +28,12 @@ class RendererBootstrap
             // non-fatal
         }
         const host = document.getElementById(RendererBootstrap.AppElementId) as HTMLElement
-        // The runtime service owns the supervisor connection, driven by the persisted
-        // supervisor.url setting; constructing it applies the saved value and subscribes.
+        // Construct the Sessions service up front: it shows the session view in the host area and
+        // follows the persisted supervisor.url setting. First run: seed that setting from the env
+        // default (the Set connects live).
         const settings = app.Services.getRequired(ApplicationSettings.Key)
-        const runtime = app.Services.getRequired(RuntimeManagementService.Key)
-        // First run: seed the setting from the env default (the Set connects live).
+        app.Services.getRequired(SessionsService.Key)
         SupervisorUrlSeed.Seed(settings, await window.harness.SupervisorUrl())
-        if (SupervisorUrlSeed.IsEmpty(settings.Get(SupervisorUrlSettingKey)))
-        {
-            const url = await window.harness.BackendUrl()
-            if (url !== null)
-            {
-                const client = new RuntimeClient()
-                client.Connect(url)
-                runtime.BindBackend(client)
-            }
-            else
-            {
-                console.warn(RendererBootstrap.NoBackendWarning)
-            }
-        }
         app.initialize(new HtmlTarget(host))
         RendererBootstrap.RemoveSplash()
     }

@@ -1,0 +1,397 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
+import { Signal } from '@pragmatic-tech-ai/mural/runtime'
+import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/services/content-host-service.js'
+import { ApplicationSettings, DialogService, type DialogOptions } from '@pragmatic-tech-ai/mural/framework'
+import { SessionsService } from './SessionsService'
+import { RuntimeClient } from './RuntimeClient'
+import { SupervisorClient } from './SupervisorClient'
+import { FakeSocket } from './FakeSocket'
+import { NewSessionDialogViewModel } from './NewSessionDialogViewModel'
+import type { AttachedSession, Placement, SessionSummary } from './agents'
+import type { AssistantMessage, ToolCallMessage, UserMessage } from './messages'
+
+class FakeSettings
+{
+    private readonly signals = new Map<string, Signal<unknown>>()
+
+    constructor(public Value: unknown)
+    {
+    }
+
+    public Get(): unknown
+    {
+        return this.Value
+    }
+
+    public Changed(key: string): Signal<unknown>
+    {
+        let signal = this.signals.get(key)
+        if (signal === undefined)
+        {
+            signal = new Signal<unknown>()
+            this.signals.set(key, signal)
+        }
+        return signal
+    }
+
+    public Change(value: unknown): void
+    {
+        this.Value = value
+        this.Changed('supervisor.url').emit(undefined)
+    }
+}
+
+class FakeContentHost
+{
+    public readonly viewed: unknown[] = []
+
+    public View(content: unknown): void
+    {
+        this.viewed.push(content)
+    }
+}
+
+class FakeDialogs
+{
+    public readonly shown: DialogOptions[] = []
+    public readonly closed: unknown[] = []
+    public ConfirmResult = true
+    private resolve: ((value: unknown) => void) | null = null
+
+    public Show<T>(options: DialogOptions): Promise<T | undefined>
+    {
+        this.shown.push(options)
+        return new Promise<T | undefined>(r => { this.resolve = r as (value: unknown) => void })
+    }
+
+    public Close(result?: unknown): void
+    {
+        this.closed.push(result)
+        this.resolve?.(result)
+        this.resolve = null
+    }
+
+    public Confirm(): Promise<boolean>
+    {
+        return Promise.resolve(this.ConfirmResult)
+    }
+}
+
+class StubProvider
+{
+    constructor(private readonly host: FakeContentHost, private readonly settings: FakeSettings, private readonly dialogs: FakeDialogs)
+    {
+    }
+
+    public getRequired<T>(token: unknown): T
+    {
+        const found = this.get<T>(token)
+        if (found === undefined)
+        {
+            throw new Error('unexpected token')
+        }
+        return found
+    }
+
+    public get<T>(token: unknown): T | undefined
+    {
+        if (token === ContentHostService.Key)
+        {
+            return this.host as unknown as T
+        }
+        if (token === ApplicationSettings.Key)
+        {
+            return this.settings as unknown as T
+        }
+        if (token === DialogService.Key)
+        {
+            return this.dialogs as unknown as T
+        }
+        return undefined
+    }
+}
+
+class Rig
+{
+    public readonly host = new FakeContentHost()
+    public readonly dialogs = new FakeDialogs()
+    public readonly settings: FakeSettings
+    public readonly sockets: FakeSocket[] = []
+    public readonly urls: string[] = []
+    public readonly supervisorSockets: FakeSocket[] = []
+    public readonly service: SessionsService
+
+    constructor(url: string = 'ws://hive:8778')
+    {
+        this.settings = new FakeSettings(url)
+        this.service = new SessionsService(
+            new StubProvider(this.host, this.settings, this.dialogs) as unknown as IServiceProvider,
+            () => new RuntimeClient(u =>
+            {
+                this.urls.push(u)
+                const socket = new FakeSocket()
+                this.sockets.push(socket)
+                return socket
+            }),
+            () => new SupervisorClient(() =>
+            {
+                const socket = new FakeSocket()
+                this.supervisorSockets.push(socket)
+                return socket
+            }))
+    }
+
+    public get Socket(): FakeSocket
+    {
+        return this.sockets[this.sockets.length - 1]
+    }
+
+    public static Summary(id: string, placement: Placement = { state: 'ready', host: 'local' }): SessionSummary
+    {
+        return { id, title: `Default #${id}`, template_id: 'tpl', template_name: 'Default', runtime: 'llamacpp', model: 'gemma', updated: 1, placement, busy: false }
+    }
+
+    public static Attached(id: string, transcript: AttachedSession['transcript'] = []): AttachedSession
+    {
+        const summary = Rig.Summary(id)
+        return {
+            summary,
+            snapshot: { name: 'Default', system_prompt: 'be brief', tools: [], step_budget: 8, runtime: 'llamacpp', model: 'gemma', n_ctx: 8192, enable_thinking: false },
+            transcript,
+            sampling: { temperature: 0.8, top_p: 0.95, top_k: 40, repeat_penalty: 1.1, seed: -1, max_tokens: 256 },
+            enable_thinking: false,
+            placement: summary.placement,
+        }
+    }
+
+    public static async Flush(): Promise<void>
+    {
+        for (let i = 0; i < 5; i++)
+        {
+            await Promise.resolve()
+        }
+    }
+
+    /** Lets the supervisor answer list_harnesses (no chat_url), then opens the runtime socket. */
+    public async Connect(): Promise<void>
+    {
+        const supervisor = this.supervisorSockets[this.supervisorSockets.length - 1]
+        supervisor.Open()
+        const request = JSON.parse(supervisor.sent[0]) as { id: number }
+        this.Supervisor().HandleFrame(JSON.stringify({ id: request.id, result: [] }))
+        await Rig.Flush()
+        this.Socket.Open()
+    }
+
+    public Supervisor(): SupervisorClient
+    {
+        // The service disconnects the supervisor after discovery; answer through the socket handler it installed.
+        const socket = this.supervisorSockets[this.supervisorSockets.length - 1]
+        return { HandleFrame: (raw: string) => socket.onmessage?.({ data: raw }) } as unknown as SupervisorClient
+    }
+
+    public Frames(socket: FakeSocket = this.Socket): { id: number, method: string, params: unknown }[]
+    {
+        return socket.sent.map(f => JSON.parse(f))
+    }
+
+    public Methods(socket: FakeSocket = this.Socket): string[]
+    {
+        return this.Frames(socket).map(f => f.method)
+    }
+
+    public async Respond(method: string, result: unknown): Promise<void>
+    {
+        const id = this.Frames().filter(f => f.method === method).pop()?.id ?? -1
+        this.service.Client.HandleFrame(JSON.stringify({ id, result }))
+        await Rig.Flush()
+    }
+
+    public Notify(method: string, params: unknown): void
+    {
+        this.service.Client.HandleFrame(JSON.stringify({ method, params }))
+    }
+
+    /** Connects, lists the given sessions and selects one, answering its attach. */
+    public async ShowSession(id: string, rows: SessionSummary[], transcript: AttachedSession['transcript'] = []): Promise<void>
+    {
+        await this.Connect()
+        await this.Respond('list_sessions', rows)
+        this.service.Panel.SelectedSession = this.service.Panel.Find(id)!
+        await this.Respond('attach_session', Rig.Attached(id, transcript))
+    }
+}
+
+describe('SessionsService', () =>
+{
+    afterEach(() =>
+    {
+        vi.useRealTimers()
+    })
+
+    it('views_the_session_view_and_finds_the_runtime_through_the_supervisor', async () =>
+    {
+        const rig = new Rig()
+        expect(rig.host.viewed).toEqual([rig.service.View])
+        await rig.Connect()
+        expect(JSON.parse(rig.supervisorSockets[0].sent[0]).method).toBe('list_harnesses')
+        expect(rig.urls).toEqual(['ws://hive:8779'])
+        expect(rig.supervisorSockets[0].closeCalls).toBe(1)
+        expect(rig.Methods()).toEqual(['list_sessions'])
+    })
+
+    it('empty_url_stays_inert', () =>
+    {
+        const rig = new Rig('')
+        expect(rig.supervisorSockets).toHaveLength(0)
+        expect(rig.sockets).toHaveLength(0)
+    })
+
+    it('selecting_row_attaches_and_shows_history', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1'), Rig.Summary('s2')], [
+            { role: 'system', content: 'be brief' },
+            { role: 'user', content: 'what time is it?' },
+            { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_time', arguments: {} } }] },
+            { role: 'tool', content: '', tool_call_id: 'c1', tool_result: { time: '12:00' } },
+            { role: 'assistant', content: 'It is noon.' },
+        ])
+        const attach = rig.Frames().find(f => f.method === 'attach_session')
+        expect(attach?.params).toEqual({ id: 's1' })
+        const items = rig.service.View.Chat.Transcript.ToArray()
+        expect(items.map(i => i.constructor.name)).toEqual(['UserMessage', 'ToolCallMessage', 'ToolResultMessage', 'AssistantMessage'])
+        expect((items[0] as UserMessage).Text).toBe('what time is it?')
+        expect((items[1] as ToolCallMessage).Name).toBe('get_time')
+        expect((items[3] as AssistantMessage).Text).toBe('It is noon.')
+        expect(rig.service.View.HasSession).toBe(true)
+        expect(rig.service.View.Chat.CanChat).toBe(true)
+    })
+
+    it('sessions_changed_after_a_turn_does_not_reattach', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1')])
+        rig.Notify('sessions_changed', {})
+        await rig.Respond('list_sessions', [Rig.Summary('s1')])
+        expect(rig.Methods().filter(m => m === 'attach_session')).toHaveLength(1)
+        expect(rig.service.Panel.SelectedSession?.Id).toBe('s1')
+    })
+
+    it('new_session_dialog_creates_and_opens', async () =>
+    {
+        const rig = new Rig()
+        await rig.Connect()
+        await rig.Respond('list_sessions', [])
+        rig.service.Panel.NewSessionCommand.Execute(undefined)
+        await Rig.Flush()
+        expect(rig.dialogs.shown).toHaveLength(1)
+        const body = rig.dialogs.shown[0].Content as NewSessionDialogViewModel
+        expect(body).toBeInstanceOf(NewSessionDialogViewModel)
+        await rig.Respond('list_templates', [
+            { kind: 'group', name: 'Examples', path: 'Examples', children: [
+                { kind: 'template', id: 't1', path: 'Examples', name: 'Default', runtime: 'llamacpp', model: 'gemma', error: null },
+            ] },
+        ])
+        body.SelectedNode = body.Roots.Get(0)!.Children!.Get(0)!
+        expect(body.CreateCommand.CanExecute(undefined)).toBe(true)
+        body.CreateCommand.Execute(undefined)
+        expect(rig.Frames().find(f => f.method === 'create_session')?.params).toEqual({ template_id: 't1' })
+        await rig.Respond('create_session', Rig.Summary('new', { state: 'needs_load', host: 'local', evicts: null }))
+        expect(rig.dialogs.closed).toHaveLength(1)
+        expect(rig.Frames().filter(f => f.method === 'attach_session').pop()?.params).toEqual({ id: 'new' })
+        expect(rig.service.Panel.SelectedSession?.Id).toBe('new')
+        expect(rig.service.View.ShownId).toBe('new')
+    })
+
+    it('reconnect_reattaches_shown_session', async () =>
+    {
+        vi.useFakeTimers()
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1')])
+        const first = rig.Socket
+        first.Close()
+        expect(rig.service.View.Chat.CanChat).toBe(false)
+        expect(rig.sockets).toHaveLength(1)
+        await vi.advanceTimersByTimeAsync(999)
+        expect(rig.sockets).toHaveLength(1)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(rig.sockets).toHaveLength(2)
+        // A failed retry backs off to 2 s.
+        rig.Socket.Close()
+        await vi.advanceTimersByTimeAsync(1999)
+        expect(rig.sockets).toHaveLength(2)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(rig.sockets).toHaveLength(3)
+        rig.Socket.Open()
+        expect(rig.Methods()).toEqual(['list_sessions', 'attach_session'])
+        expect(rig.Frames()[1].params).toEqual({ id: 's1' })
+        await rig.Respond('attach_session', Rig.Attached('s1', [{ role: 'user', content: 'still here' }]))
+        expect(rig.service.View.Chat.CanChat).toBe(true)
+        expect(rig.service.View.Chat.Transcript.Count).toBe(1)
+    })
+
+    it('backoff_caps_at_ten_seconds', async () =>
+    {
+        vi.useFakeTimers()
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1')])
+        const delays: number[] = []
+        for (let i = 0; i < 6; i++)
+        {
+            const before = rig.sockets.length
+            rig.Socket.Close()
+            let waited = 0
+            while (rig.sockets.length === before)
+            {
+                await vi.advanceTimersByTimeAsync(500)
+                waited += 500
+            }
+            delays.push(waited)
+        }
+        expect(delays).toEqual([1000, 2000, 4000, 8000, 10000, 10000])
+    })
+
+    it('deleted_shown_session_clears_view', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1'), Rig.Summary('s2')])
+        rig.service.Panel.Sessions.Get(0)!.DeleteCommand.Execute(undefined)
+        await Rig.Flush()
+        expect(rig.Frames().find(f => f.method === 'delete_session')?.params).toEqual({ id: 's1' })
+        await rig.Respond('delete_session', null)
+        rig.Notify('sessions_changed', {})
+        await rig.Respond('list_sessions', [Rig.Summary('s2')])
+        expect(rig.service.View.HasSession).toBe(false)
+        expect(rig.service.View.ShownId).toBeNull()
+        expect(rig.service.View.Chat.Transcript.Count).toBe(0)
+        expect(rig.service.View.Chat.CanChat).toBe(false)
+        expect(rig.service.Panel.SelectedSession).toBeNull()
+    })
+
+    it('rename_prompts_and_renames', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1')])
+        rig.service.Panel.RenameCommand.Execute(undefined)
+        await Rig.Flush()
+        expect(rig.dialogs.shown).toHaveLength(1)
+        rig.dialogs.Close('  Notes reader ')
+        await Rig.Flush()
+        expect(rig.Frames().find(f => f.method === 'rename_session')?.params).toEqual({ id: 's1', title: 'Notes reader' })
+    })
+
+    it('settings_change_reconnects_and_clears', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1')])
+        const first = rig.Socket
+        rig.settings.Change('ws://other:8778')
+        expect(first.closeCalls).toBe(1)
+        expect(rig.service.View.HasSession).toBe(false)
+        expect(rig.service.Panel.Sessions.Count).toBe(0)
+        await rig.Connect()
+        expect(rig.urls).toEqual(['ws://hive:8779', 'ws://other:8779'])
+    })
+})

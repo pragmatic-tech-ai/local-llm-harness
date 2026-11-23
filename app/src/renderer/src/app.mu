@@ -1,9 +1,12 @@
 import ChatResources from "./views/Chat.mu.js"
 import InstrumentPanelResources from "./views/InstrumentPanel.mu.js"
-import HarnessPanelResources from "./views/HarnessPanel.mu.js"
+import SessionsPanelResources from "./views/SessionsPanel.mu.js"
+import SessionViewResources from "./views/SessionView.mu.js"
+import NewSessionDialogResources from "./views/NewSessionDialog.mu.js"
+import TextPromptResources from "./views/TextPrompt.mu.js"
 import RuntimeIcons from "./views/RuntimeIcons.mu.js"
-import RuntimeModule from "./views/RuntimeModule.mu.js"
-import RuntimeManagementService from "./RuntimeManagementService.js"
+import SessionsModule from "./views/SessionsModule.mu.js"
+import SessionsService from "./SessionsService.js"
 import HarnessSettingsStore from "./HarnessSettingsStore.js"
 import SettingsResources from "./views/SettingsResources.mu.js"
 import HarnessSettingsContribution from "./settings/HarnessSettingsContribution.js"
@@ -22,16 +25,19 @@ Application [ Theme = Pragmatic, Scheme = PragmaticDark ] {
         HarnessSettingsContribution -> SettingsContributionKey
     }
     .modules: {
-        RuntimeModule
+        SessionsModule
     }
     resources: {
         merge RuntimeIcons
         merge SettingsResources
         merge ChatResources
         merge InstrumentPanelResources
-        merge HarnessPanelResources
-        DataTemplate [ DataType = RuntimeManagementService ] {
-            ContentPresenter [ Content = $Picker ]
+        merge SessionsPanelResources
+        merge SessionViewResources
+        merge NewSessionDialogResources
+        merge TextPromptResources
+        DataTemplate [ DataType = SessionsService ] {
+            ContentPresenter [ Content = $Panel ]
         }
         EditorShell x:root { }
     }

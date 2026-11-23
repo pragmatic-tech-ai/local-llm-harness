@@ -1,102 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { SupervisorClient, type HarnessInfo, type ModelInfo } from './SupervisorClient'
+import { SupervisorClient, type HarnessInfo } from './SupervisorClient'
 import { FakeSocket } from './FakeSocket'
 
 describe('SupervisorClient', () =>
 {
-    it('start_resolves_with_harness_info', async () =>
-    {
-        const socket = new FakeSocket()
-        const client = new SupervisorClient(() => socket)
-        client.Connect('ws://x')
-        socket.Open()
-        const pending = client.Start('llamacpp', 'gemma')
-        expect(JSON.parse(socket.sent[0])).toEqual({ id: 1, method: 'start', params: { runtime: 'llamacpp', model: 'gemma' } })
-        const expected: HarnessInfo = { id: 'h1', runtime: 'llamacpp', model: 'gemma', state: 'running', url: 'ws://h1' }
-        client.HandleFrame(JSON.stringify({ id: 1, result: expected }))
-        await expect(pending).resolves.toEqual(expected)
-    })
-
-    it('start_includes_n_ctx_when_given', () =>
-    {
-        const socket = new FakeSocket()
-        const client = new SupervisorClient(() => socket)
-        client.Connect('ws://x')
-        socket.Open()
-        void client.Start('llamacpp', 'gemma', 8192)
-        expect(JSON.parse(socket.sent[0])).toEqual({
-            id: 1,
-            method: 'start',
-            params: { runtime: 'llamacpp', model: 'gemma', n_ctx: 8192 }
-        })
-    })
-
-    it('start_omits_n_ctx_when_absent', () =>
-    {
-        const socket = new FakeSocket()
-        const client = new SupervisorClient(() => socket)
-        client.Connect('ws://x')
-        socket.Open()
-        void client.Start('llamacpp', 'gemma')
-        expect(JSON.parse(socket.sent[0]).params).toEqual({ runtime: 'llamacpp', model: 'gemma' })
-    })
-
-    it('list_models_parses', async () =>
-    {
-        const socket = new FakeSocket()
-        const client = new SupervisorClient(() => socket)
-        client.Connect('ws://x')
-        socket.Open()
-        const pending = client.ListModels()
-        const expected: ModelInfo[] = [{ name: 'gemma', runtimes: ['llamacpp', 'candle'], size_hint: '4GB' }]
-        client.HandleFrame(JSON.stringify({ id: 1, result: expected }))
-        await expect(pending).resolves.toEqual(expected)
-    })
-
-    it('harness_changed_notification_raises_signal', () =>
-    {
-        const client = new SupervisorClient()
-        const seen: HarnessInfo[] = []
-        client.OnHarnessChanged.Subscribe(p => seen.push(p))
-        const info: HarnessInfo = { id: 'h1', runtime: 'candle', model: 'm', state: 'stopped' }
-        client.HandleFrame(JSON.stringify({ method: 'harness_changed', params: info }))
-        expect(seen).toEqual([info])
-    })
-
-    it('request_before_open_is_queued_then_flushed', async () =>
-    {
-        const socket = new FakeSocket()
-        const client = new SupervisorClient(() => socket)
-        client.Connect('ws://x')
-        const pending = client.ListRuntimes()
-        expect(socket.sent).toEqual([])
-        socket.Open()
-        expect(socket.sent).toHaveLength(1)
-        client.HandleFrame(JSON.stringify({ id: 1, result: [{ name: 'llamacpp', kind: 'native', available: true }] }))
-        await expect(pending).resolves.toEqual([{ name: 'llamacpp', kind: 'native', available: true }])
-    })
-
-    it('rpc_error_rejects', async () =>
-    {
-        const socket = new FakeSocket()
-        const client = new SupervisorClient(() => socket)
-        client.Connect('ws://x')
-        socket.Open()
-        const pending = client.Stop('nope')
-        client.HandleFrame(JSON.stringify({ id: 1, error: { code: -1, message: 'unknown harness' } }))
-        await expect(pending).rejects.toThrow('unknown harness')
-    })
-
-    it('stop_sends_id_on_the_wire', () =>
-    {
-        const socket = new FakeSocket()
-        const client = new SupervisorClient(() => socket)
-        client.Connect('ws://x')
-        void client.Stop('candle:gemma-3-4b').catch(() => undefined)
-        socket.Open()
-        expect(JSON.parse(socket.sent[0])).toEqual({ id: 1, method: 'stop', params: { id: 'candle:gemma-3-4b' } })
-    })
-
     it('list_harnesses_parses', async () =>
     {
         const socket = new FakeSocket()
@@ -106,10 +13,36 @@ describe('SupervisorClient', () =>
         const pending = client.ListHarnesses()
         expect(JSON.parse(socket.sent[0]).method).toBe('list_harnesses')
         const expected: HarnessInfo[] = [
-            { id: 'a', runtime: 'llamacpp', model: 'gemma', state: 'running', url: 'ws://a' },
+            { id: 'a', runtime: 'llamacpp', model: 'gemma', state: 'ready', url: 'ws://a', chat_url: 'ws://a:8779' },
             { id: 'b', runtime: 'candle', model: 'm', state: 'stopped' }
         ]
         client.HandleFrame(JSON.stringify({ id: 1, result: expected }))
         await expect(pending).resolves.toEqual(expected)
+    })
+
+    it('rpc_error_rejects', async () =>
+    {
+        const socket = new FakeSocket()
+        const client = new SupervisorClient(() => socket)
+        client.Connect('ws://x')
+        socket.Open()
+        const pending = client.ListHarnesses()
+        client.HandleFrame(JSON.stringify({ id: 1, error: { code: -1, message: 'boom' } }))
+        await expect(pending).rejects.toThrow('boom')
+    })
+
+    it('runtime_url_takes_chat_url_port_on_supervisor_host', () =>
+    {
+        const harnesses: HarnessInfo[] = [
+            { id: 'a', runtime: 'r', model: 'm', state: 'loading' },
+            { id: 'b', runtime: 'r', model: 'm', state: 'ready', chat_url: 'ws://192.168.1.101:9001' }
+        ]
+        expect(SupervisorClient.RuntimeUrl('ws://localhost:8778', harnesses)).toBe('ws://localhost:9001')
+    })
+
+    it('runtime_url_falls_back_to_8779', () =>
+    {
+        expect(SupervisorClient.RuntimeUrl('ws://hive.local:8778', [])).toBe('ws://hive.local:8779')
+        expect(SupervisorClient.RuntimeUrl('wss://hive.local:8778/', [{ id: 'a', runtime: 'r', model: 'm', state: 'stopped' }])).toBe('wss://hive.local:8779')
     })
 })

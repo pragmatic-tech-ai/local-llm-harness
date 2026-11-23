@@ -73,11 +73,19 @@ export interface SessionSummary
     busy: boolean
 }
 
+/** One OpenAI-style call an assistant message carries in the committed transcript. */
+export interface ChatToolCall
+{
+    id: string
+    type: string
+    function: { name: string, arguments: unknown }
+}
+
 export interface ChatMessage
 {
     role: 'system' | 'user' | 'assistant' | 'tool'
     content: string
-    tool_calls?: unknown[]
+    tool_calls?: ChatToolCall[]
     tool_call_id?: string
     tool_result?: unknown
 }

@@ -8,7 +8,6 @@ import ToolResultMessage from "../messages.js"
 resources ChatResources {
     DataTemplate [ DataType = ChatViewModel ] {
         DockPanel [ LastChildFill = true, Margin = (12,12,12,12) ] {
-            TextBlock [ DockPanel.Dock = Top, Text = $ToolsText, Style = @BodySm, Foreground = @Fg2, Margin = (0,0,0,6) ]
             // Instrument panel to the right of the transcript (Content region split, not the shell dock).
             ContentControl [ DockPanel.Dock = Right, Width = 360, Content = $Panel, Margin = (12,0,0,0) ]
             DockPanel [ DockPanel.Dock = Bottom, Style = @ComposerSubmitStyle, LastChildFill = true, Margin = (0,8,0,0) ] {

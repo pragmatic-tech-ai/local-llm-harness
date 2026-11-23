@@ -79,6 +79,11 @@ export abstract class JsonRpcConnection
     private readonly pending = new Map<number, IPending>()
     private readonly queue: string[] = []
 
+    /** Raised when the socket opens (after the queued requests are flushed). */
+    public readonly OnOpened = new TypedSignal<void>()
+    /** Raised when the live socket closes on its own (never for a deliberate Disconnect or a replaced socket). */
+    public readonly OnClosed = new TypedSignal<void>()
+
     constructor(private readonly socketFactory: HarnessSocketFactory = (url) => new WebSocket(url) as unknown as IHarnessSocket)
     {
     }
@@ -101,6 +106,7 @@ export abstract class JsonRpcConnection
             {
                 socket.send(frame)
             }
+            this.OnOpened.Raise(undefined)
         }
         socket.onmessage = (ev) => this.HandleFrame(String(ev.data))
         socket.onerror = () => console.error(JsonRpcConnection.SocketErrorMessage)
@@ -110,6 +116,7 @@ export abstract class JsonRpcConnection
             if (this.socket === socket)
             {
                 this.socket = null
+                this.OnClosed.Raise(undefined)
             }
         }
     }

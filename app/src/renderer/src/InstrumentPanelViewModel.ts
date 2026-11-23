@@ -1,5 +1,5 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { RuntimeClient, TypedSignal, type IDisposable, type ModelProps } from './RuntimeClient'
+import { RuntimeClient, type IDisposable } from './RuntimeClient'
 import type { SamplingConfig } from './agents'
 import { LogprobVM } from './LogprobVM'
 
@@ -35,10 +35,12 @@ export class InstrumentPanelViewModel extends Observable
     private readonly _tokenizeCommand: RelayCommand
 
     public readonly Logprobs = new ObservableCollection<LogprobVM>()
-    /** Raised once per Bind with the harness's model_props, so siblings need no second fetch. */
-    public readonly OnModelProps = new TypedSignal<ModelProps>()
 
     private client: RuntimeClient | null = null
+    /** The sampling the session runs with (JSON), as last applied; null = unknown, so the next send applies the knobs. */
+    private appliedSampling: string | null = null
+    /** The thinking flag the session runs with; null = unknown. */
+    private appliedThinking: boolean | null = null
     private subscriptions: IDisposable[] = []
 
     constructor(client?: RuntimeClient)
@@ -60,7 +62,10 @@ export class InstrumentPanelViewModel extends Observable
         }
         this.subscriptions = []
         this.client = client
-        // Fresh harness = fresh panel: drop the previous harness's display state.
+        // A new binding runs with values unknown until ApplySession records the session's own.
+        this.appliedSampling = null
+        this.appliedThinking = null
+        // Fresh session = fresh panel: drop the previous session's display state.
         this.Logprobs.Clear()
         this.Change('Prompt', this._prompt, '', x => this._prompt = x)
         this.SetWarning('')
@@ -85,20 +90,67 @@ export class InstrumentPanelViewModel extends Observable
             {
                 this.SetWarning(InstrumentPanelViewModel.Format(InstrumentPanelViewModel.WarningFormat, p.needed, p.total))
             }))
-            // Shows the model + window size before the first turn. Rejects (ignored) if there is no connection.
-            client.ModelProps().then(
-                props =>
-                {
-                    if (this.client !== client)
-                    {
-                        return
-                    }
-                    this.SetModelName(props.model_name)
-                    this.SetContext(this._contextUsed, props.n_ctx)
-                    this.OnModelProps.Raise(props)
-                },
-                () => undefined)
+            this.RefreshModelProps()
         }
+    }
+
+    /** Shows the model + window size before the first turn. Rejects (ignored) without a running model. */
+    public RefreshModelProps(): void
+    {
+        const client = this.client
+        if (client === null)
+        {
+            return
+        }
+        client.ModelProps().then(
+            props =>
+            {
+                if (this.client !== client)
+                {
+                    return
+                }
+                this.SetModelName(props.model_name)
+                this.SetContext(this._contextUsed, props.n_ctx)
+            },
+            () => undefined)
+    }
+
+    /** Seeds the knobs from an attached session's effective values and records them as what the session runs with. */
+    public ApplySession(sampling: SamplingConfig, enableThinking: boolean): void
+    {
+        this.Temperature = sampling.temperature
+        this.TopP = sampling.top_p
+        this.TopK = sampling.top_k
+        this.RepeatPenalty = sampling.repeat_penalty
+        this.Seed = sampling.seed
+        this.MaxTokens = sampling.max_tokens
+        this.EnableThinking = enableThinking
+        this.appliedSampling = JSON.stringify(this.Config)
+        this.appliedThinking = enableThinking
+    }
+
+    /** The knobs when they differ from what the session runs with (then recorded as applied), else null. */
+    public TakeSamplingChange(): SamplingConfig | null
+    {
+        const config = this.Config
+        const key = JSON.stringify(config)
+        if (key === this.appliedSampling)
+        {
+            return null
+        }
+        this.appliedSampling = key
+        return config
+    }
+
+    /** The thinking toggle when it differs from what the session runs with (then recorded as applied), else null. */
+    public TakeThinkingChange(): boolean | null
+    {
+        if (this._enableThinking === this.appliedThinking)
+        {
+            return null
+        }
+        this.appliedThinking = this._enableThinking
+        return this._enableThinking
     }
 
     public get Temperature(): number
@@ -171,7 +223,7 @@ export class InstrumentPanelViewModel extends Observable
         this.Change('EnableThinking', this._enableThinking, v, x => this._enableThinking = x)
     }
 
-    /** The current knobs as the wire DTO; applied per turn by ChatViewModel.Send. */
+    /** The current knobs as the wire DTO; ChatViewModel.Send applies them when they changed. */
     public get Config(): SamplingConfig
     {
         return {
@@ -219,6 +271,9 @@ export class InstrumentPanelViewModel extends Observable
     /** Surfaces a failed set_sampling: the turn would otherwise run with stale knobs unnoticed. */
     public ReportSamplingError(message: string): void
     {
+        // What the session runs with is unknown again: the next send re-applies both.
+        this.appliedSampling = null
+        this.appliedThinking = null
         this.SetWarning(InstrumentPanelViewModel.Format(InstrumentPanelViewModel.SamplingFailedFormat, message))
     }
 
