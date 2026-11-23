@@ -20,7 +20,8 @@ export interface AgentTemplate
     model: string
     n_ctx: number
     enable_thinking: boolean
-    sampling?: SamplingConfig
+    /** Optional sampling defaults; a missing field takes the worker default. */
+    sampling?: Partial<SamplingConfig>
     host?: string
 }
 
@@ -108,10 +109,24 @@ export interface AttachedSession
     placement: Placement
 }
 
+export interface CatalogRuntime
+{
+    name: string
+    kind: string
+}
+
+export interface CatalogModel
+{
+    name: string
+    /** The runtimes able to load this model. */
+    runtimes: string[]
+    size_hint: unknown
+}
+
 export interface CatalogInfo
 {
-    runtimes: Record<string, unknown>[]
-    models: Record<string, unknown>[]
+    runtimes: CatalogRuntime[]
+    models: CatalogModel[]
     hosts: string[]
 }
 

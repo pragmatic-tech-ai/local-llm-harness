@@ -3,21 +3,26 @@ import type { TemplateNode } from './agents'
 
 /**
  * One row of a template tree (a group or a template) for a TreeView bound through a HierarchicalDataTemplate with
- * `itemsselector = Children`. Templates have no Children (undefined), so the tree draws them as leaves.
+ * `itemsselector = Children`. Templates have no Children (undefined), so the tree draws them as leaves. `Reconcile`
+ * makes a tree match a fresh `list_templates` reply in place, reusing nodes by `Key` so selection and expansion
+ * survive a refresh (a moved template keeps its node object).
  */
 export class TemplateTreeNodeViewModel extends Observable
 {
     private static readonly KindGroup = 'group'
     private static readonly PropIsExpanded = 'IsExpanded'
+    private static readonly GroupKeyPrefix = 'group:'
+    private static readonly TemplateKeyPrefix = 'template:'
+    private static readonly NodeProps = ['Node', 'Name', 'Path', 'Error', 'HasError']
 
-    public readonly Node: TemplateNode
+    private node: TemplateNode
     private readonly children: ObservableCollection<TemplateTreeNodeViewModel> | undefined
     private _isExpanded = true
 
     constructor(node: TemplateNode)
     {
         super()
-        this.Node = node
+        this.node = node
         if (node.kind === TemplateTreeNodeViewModel.KindGroup)
         {
             this.children = new ObservableCollection<TemplateTreeNodeViewModel>()
@@ -32,6 +37,25 @@ export class TemplateTreeNodeViewModel extends Observable
     public static FromNodes(nodes: readonly TemplateNode[]): TemplateTreeNodeViewModel[]
     {
         return nodes.map(node => new TemplateTreeNodeViewModel(node))
+    }
+
+    /** The wire node this row shows (replaced by Update). */
+    public get Node(): TemplateNode
+    {
+        return this.node
+    }
+
+    /** Identity across refreshes: a group by its path, a template by its id. */
+    public get Key(): string
+    {
+        return TemplateTreeNodeViewModel.KeyOf(this.node)
+    }
+
+    public static KeyOf(node: TemplateNode): string
+    {
+        return node.kind === TemplateTreeNodeViewModel.KindGroup
+            ? TemplateTreeNodeViewModel.GroupKeyPrefix + node.path
+            : TemplateTreeNodeViewModel.TemplateKeyPrefix + node.id
     }
 
     public get Name(): string
@@ -108,5 +132,77 @@ export class TemplateTreeNodeViewModel extends Observable
             }
         }
         return undefined
+    }
+
+    /** Every node of a tree by Key (the pool Reconcile reuses nodes from). */
+    public static Pool(roots: Iterable<TemplateTreeNodeViewModel>, into: Map<string, TemplateTreeNodeViewModel> = new Map()): Map<string, TemplateTreeNodeViewModel>
+    {
+        for (const node of roots)
+        {
+            into.set(node.Key, node)
+            if (node.children)
+            {
+                TemplateTreeNodeViewModel.Pool(node.children, into)
+            }
+        }
+        return into
+    }
+
+    /**
+     * Makes `target` match `nodes` (their order) in place: a node whose Key is in the pool is reused (updated, and
+     * moved here if it lived elsewhere), others are created, and rows no longer listed are removed. No reset is raised.
+     */
+    public static Reconcile(target: ObservableCollection<TemplateTreeNodeViewModel>, nodes: readonly TemplateNode[], pool: Map<string, TemplateTreeNodeViewModel>): void
+    {
+        const rows = nodes.map(node =>
+        {
+            const key = TemplateTreeNodeViewModel.KeyOf(node)
+            const reused = pool.get(key)
+            pool.delete(key)
+            const row = reused ?? TemplateTreeNodeViewModel.Empty(node)
+            row.Update(node, pool)
+            return row
+        })
+        rows.forEach((row, index) =>
+        {
+            const at = target.IndexOf(row)
+            if (at < 0)
+            {
+                target.Insert(index, row)
+            }
+            else if (at !== index)
+            {
+                target.Move(at, index)
+            }
+        })
+        // Every kept row now sits in front, so what remains at the tail is gone (or moved elsewhere).
+        while (target.Count > rows.length)
+        {
+            target.RemoveAt(target.Count - 1)
+        }
+    }
+
+    /** Points the row at a newer wire node with the same Key (and reconciles a group's children). */
+    public Update(node: TemplateNode, pool: Map<string, TemplateTreeNodeViewModel>): void
+    {
+        const old = this.node
+        this.node = node
+        if (old !== node)
+        {
+            for (const name of TemplateTreeNodeViewModel.NodeProps)
+            {
+                this.RaisePropertyChanged(name, undefined, (this as unknown as Record<string, unknown>)[name])
+            }
+        }
+        if (this.children !== undefined && node.kind === TemplateTreeNodeViewModel.KindGroup)
+        {
+            TemplateTreeNodeViewModel.Reconcile(this.children, node.children, pool)
+        }
+    }
+
+    /** A row for the node with no children yet (Update fills them from the pool). */
+    private static Empty(node: TemplateNode): TemplateTreeNodeViewModel
+    {
+        return new TemplateTreeNodeViewModel(node.kind === TemplateTreeNodeViewModel.KindGroup ? { ...node, children: [] } : node)
     }
 }

@@ -256,6 +256,14 @@ describe('SessionsService', () =>
         expect(rig.Methods()).toEqual(['list_sessions'])
     })
 
+    it('activation_re_presents_the_session_view', () =>
+    {
+        const rig = new Rig()
+        rig.host.viewed.push('agents editor')
+        rig.service.OnActivated()
+        expect(rig.host.viewed).toEqual([rig.service.View, 'agents editor', rig.service.View])
+    })
+
     it('empty_url_stays_inert', () =>
     {
         const rig = new Rig('')

@@ -1,7 +1,7 @@
 import { RelayCommand, ServiceBase, ServiceKey } from '@pragmatic-tech-ai/mural/runtime'
 import type { IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/services/content-host-service.js'
-import { ApplicationSettings, ButtonVariant, DialogAction, DialogService } from '@pragmatic-tech-ai/mural/framework'
+import { ApplicationSettings, ButtonVariant, DialogAction, DialogService, type IActivatable } from '@pragmatic-tech-ai/mural/framework'
 import { TypedSignal, type IDisposable } from './JsonRpcConnection'
 import { RuntimeClient } from './RuntimeClient'
 import { SupervisorClient, type HarnessInfo } from './SupervisorClient'
@@ -21,9 +21,10 @@ import { TextFormat } from './TextFormat'
  * Each connection attempt asks the supervisor (named by the `supervisor.url` setting, bounded by a timeout) for the
  * runtime's `chat_url`, falling back to the supervisor host on :8779. A failed or dropped connection retries with
  * backoff (1 s, 2 s, 4 s, ... capped at 10 s) and re-attaches the session that was shown. `Connection` reports the
- * state; the panel and the session header show it.
+ * state; the panel and the session header show it. The content host is shared with the Agents capability, so
+ * activating the Sessions rail re-presents the session view.
  */
-export class SessionsService extends ServiceBase
+export class SessionsService extends ServiceBase implements IActivatable
 {
     public static readonly Key = new ServiceKey<SessionsService>('SessionsService')
 
@@ -51,6 +52,7 @@ export class SessionsService extends ServiceBase
     /** Raised whenever `Connection` changes. */
     public readonly OnConnectionChanged = new TypedSignal<ConnectionState>()
 
+    private readonly host: ContentHostService
     private readonly subscriptions: IDisposable[] = []
     private connection = ConnectionState.Disconnected
     private supervisorUrl = ''
@@ -77,7 +79,8 @@ export class SessionsService extends ServiceBase
             this.Panel.OnRenameRequested.Subscribe(row => void this.Rename(row)),
             this.Panel.OnDeleteRequested.Subscribe(row => void this.Delete(row)))
         this.SetConnection(ConnectionState.Disconnected)
-        provider.getRequired(ContentHostService.Key).View(this.View)
+        this.host = provider.getRequired(ContentHostService.Key)
+        this.host.View(this.View)
         const settings = provider.getRequired(ApplicationSettings.Key)
         this.ApplyConnection(SessionsService.ReadUrl(settings))
         const changed = settings.Changed(SupervisorUrlSettingKey)
@@ -88,6 +91,12 @@ export class SessionsService extends ServiceBase
     public get Connection(): ConnectionState
     {
         return this.connection
+    }
+
+    /** The rail switched (back) to Sessions: present the session view in the shared content host. */
+    public OnActivated(): void
+    {
+        this.host.View(this.View)
     }
 
     /** Opens the New session dialog; Create makes the session, closes the dialog and opens the session. */
