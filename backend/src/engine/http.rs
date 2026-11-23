@@ -144,8 +144,11 @@ impl Engine for HttpEngine {
                 "tools are not supported by the http engine".into(),
             ));
         }
+        // The template shape, not the storage shape: a tool message's result lives in
+        // `tool_result` and `template_view` hands it over as `content`.
+        let views: Vec<Value> = messages.iter().map(ChatMessage::template_view).collect();
         let body = json!({
-            "messages": messages,
+            "messages": views,
             "add_generation_prompt": add_generation_prompt,
             "chat_template_kwargs": { "enable_thinking": enable_thinking },
         });

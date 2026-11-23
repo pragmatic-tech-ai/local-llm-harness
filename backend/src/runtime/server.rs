@@ -78,7 +78,6 @@ pub struct RuntimeConnection {
 }
 
 impl RuntimeConnection {
-    const NO_MODEL: &'static str = "no model running";
     const CLIENT_GONE: &'static str = "client connection closed";
 
     pub fn new(deps: RuntimeDeps) -> Self {
@@ -152,7 +151,7 @@ impl RuntimeConnection {
     }
 
     fn no_model() -> RpcError {
-        RpcError::internal(Self::NO_MODEL)
+        RpcError::internal(ToolLoop::NO_MODEL)
     }
 }
 

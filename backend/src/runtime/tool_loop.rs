@@ -85,7 +85,8 @@ impl ToolLoop {
     const CALL_ID_PREFIX: &'static str = "call_";
     const FIELD_TOOL_CALLS: &'static str = "tool_calls";
     const FIELD_CONTENT: &'static str = "content";
-    const NO_MODEL: &'static str = "no model running";
+    /// Reported when no harness is Ready (shared with the runtime server).
+    pub(crate) const NO_MODEL: &'static str = "no model running";
 
     /// `step_cap` is the maximum number of generate calls per user message; `0` means no
     /// generate call is made and every run ends `StepLimit` with 0 steps.
@@ -412,6 +413,13 @@ mod tests {
         async fn run_with(&mut self, connector: &FakeConnector) -> Result<LoopEnd, SinkClosed> {
             self.tool_loop
                 .run(&mut self.session, "q", false, connector, &mut self.sink)
+                .await
+        }
+
+        async fn run_thinking(&mut self, link: Arc<FakeLink>) -> Result<LoopEnd, SinkClosed> {
+            let connector = FakeConnector::new(Some(link));
+            self.tool_loop
+                .run(&mut self.session, "q", true, &connector, &mut self.sink)
                 .await
         }
 
@@ -887,6 +895,33 @@ mod tests {
         );
         assert!(later.ends_with(&closed_turn), "{later}");
         assert_eq!(later.matches("<|turn>model\n").count(), 2, "{later}");
+    }
+
+    #[tokio::test]
+    async fn thinking_preamble_reasoning_stays_hidden_and_turn_open() {
+        let mut f = Fixture::new();
+        let step1 = "<|channel>thought\nR-secret reasoning<channel|>Let me check.";
+        let link = FakeLink::new(
+            true,
+            vec![
+                Fixture::step(step1, vec![Fixture::echo_call("call_1")]),
+                Fixture::step("done", vec![]),
+            ],
+        );
+        assert_eq!(
+            f.run_thinking(link.clone()).await.unwrap().reason,
+            EndReason::Answered
+        );
+        let step2 = f.render(&link.requests()[1].messages, true);
+        assert!(!step2.contains("R-secret"), "{step2}");
+        assert!(!step2.contains("Let me check.<turn|>"), "{step2}");
+        let open_turn = concat!(
+            "<|turn>user\nq<turn|>\n<|turn>model\nLet me check.",
+            "<|tool_call>call:echo{text:<|\"|>x<|\"|>}<tool_call|>",
+            "<|tool_response>response:echo{text:<|\"|>x<|\"|>}<tool_response|>",
+            "<|channel>thought\n",
+        );
+        assert!(step2.ends_with(open_turn), "{step2}");
     }
 
     #[tokio::test]

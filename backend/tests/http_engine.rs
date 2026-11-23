@@ -135,6 +135,36 @@ async fn apply_template_maps_llama_endpoint() {
 }
 
 #[tokio::test]
+async fn apply_template_posts_tool_results_as_content() {
+    use backend::engine::{ChatMessage, Role};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/apply-template"))
+        .and(body_json(json!({
+            "messages": [
+                {"role": "user", "content": "time?"},
+                {"role": "tool", "content": {"utc": "2026-11-23T13:05:00Z"}, "tool_call_id": "call_1"}
+            ],
+            "add_generation_prompt": true,
+            "chat_template_kwargs": {"enable_thinking": false}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"prompt": "RENDERED"})))
+        .mount(&server)
+        .await;
+
+    let engine = HttpEngine::new(server.uri());
+    let mut tool = ChatMessage::new(Role::Tool, "");
+    tool.tool_call_id = Some("call_1".into());
+    tool.tool_result = Some(json!({"utc": "2026-11-23T13:05:00Z"}));
+    let messages = vec![ChatMessage::new(Role::User, "time?"), tool];
+    let prompt = engine
+        .apply_template(&messages, true, false, &[])
+        .await
+        .unwrap();
+    assert_eq!(prompt, "RENDERED");
+}
+
+#[tokio::test]
 async fn apply_template_with_tools_is_protocol_error() {
     use backend::engine::{ChatMessage, Role};
     let server = MockServer::start().await;

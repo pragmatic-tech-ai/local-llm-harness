@@ -74,16 +74,17 @@ pub struct OpenChannel;
 
 impl OpenChannel {
     const OPEN: &'static str = "<|channel>";
-    const CLOSE: &'static str = "<channel|>";
+    const NAME_END: char = '\n';
 
-    /// The opener text (from the last channel opener to the end) when `prompt` ends inside an
-    /// unclosed channel. The opener is the marker plus at most a channel-name line; anything
-    /// longer after it is prompt text, not an opener.
+    /// The opener text when `prompt` ends with exactly `<|channel>` + a channel name
+    /// (`[A-Za-z0-9_]+`) + `\n`. Anything else after the last marker (no newline, other
+    /// characters, more text) is prompt content, not an opener.
     pub fn at_tail(prompt: &str) -> Option<&str> {
-        let tail = &prompt[prompt.rfind(Self::OPEN)?..];
-        let unclosed = !tail.contains(Self::CLOSE);
-        let one_line = !tail.trim_end_matches('\n').contains('\n');
-        (unclosed && one_line).then_some(tail)
+        let at = prompt.rfind(Self::OPEN)?;
+        let name = prompt[at + Self::OPEN.len()..].strip_suffix(Self::NAME_END)?;
+        let is_name =
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        is_name.then_some(&prompt[at..])
     }
 }
 
@@ -207,20 +208,34 @@ mod tests {
         );
     }
 
-    fn after_tool_response() -> Vec<ChatMessage> {
-        let mut assistant = ChatMessage::new(Role::Assistant, "");
-        assistant.tool_calls = Some(vec![ToolCall {
-            id: "call_1".into(),
-            kind: "function".into(),
-            function: FunctionCall {
-                name: "get_time".into(),
-                arguments: serde_json::json!({}),
-            },
-        }]);
-        let mut tool = ChatMessage::new(Role::Tool, "");
-        tool.tool_call_id = Some("call_1".into());
-        tool.tool_result = Some(serde_json::json!({"utc": "x"}));
-        vec![ChatMessage::new(Role::User, "q"), assistant, tool]
+    /// Conversations rendered by the open-channel tests.
+    struct Conversations;
+
+    impl Conversations {
+        /// user, assistant(get_time call), tool result.
+        fn after_tool_response() -> Vec<ChatMessage> {
+            let mut assistant = ChatMessage::new(Role::Assistant, "");
+            assistant.tool_calls = Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "get_time".into(),
+                    arguments: serde_json::json!({}),
+                },
+            }]);
+            let mut tool = ChatMessage::new(Role::Tool, "");
+            tool.tool_call_id = Some("call_1".into());
+            tool.tool_result = Some(serde_json::json!({"utc": "x"}));
+            vec![ChatMessage::new(Role::User, "q"), assistant, tool]
+        }
+
+        /// Like `after_tool_response`, but the tool result's text (say, a file) ends in an
+        /// unclosed channel marker.
+        fn after_marker_tool_result() -> Vec<ChatMessage> {
+            let mut messages = Self::after_tool_response();
+            messages[2].tool_result = Some(serde_json::json!({"content": "notes <|channel>x"}));
+            messages
+        }
     }
 
     #[test]
@@ -228,7 +243,7 @@ mod tests {
         let t = ChatTemplate::from_jinja(GEMMA4).unwrap();
         let tools = [time_tool()];
         let prompt = t
-            .render(&after_tool_response(), true, true, &tools)
+            .render(&Conversations::after_tool_response(), true, true, &tools)
             .unwrap();
         assert_eq!(OpenChannel::at_tail(&prompt), Some("<|channel>thought\n"));
     }
@@ -249,7 +264,7 @@ mod tests {
         );
         // After a tool response without thinking: no channel at all.
         let plain = t
-            .render(&after_tool_response(), true, false, &tools)
+            .render(&Conversations::after_tool_response(), true, false, &tools)
             .unwrap();
         assert_eq!(OpenChannel::at_tail(&plain), None);
     }
@@ -261,7 +276,56 @@ mod tests {
             OpenChannel::at_tail("x<|channel>thought\n"),
             Some("<|channel>thought\n")
         );
+        assert_eq!(
+            OpenChannel::at_tail("x<|channel>my_chan2\n"),
+            Some("<|channel>my_chan2\n")
+        );
         assert_eq!(OpenChannel::at_tail("no channels here"), None);
+        assert_eq!(OpenChannel::at_tail("x<|channel>x"), None);
+        assert_eq!(OpenChannel::at_tail("x<|channel>\n"), None);
+        assert_eq!(OpenChannel::at_tail("x<|channel>a b\n"), None);
+        assert_eq!(OpenChannel::at_tail("x<|channel>thought\n\n"), None);
+        assert_eq!(OpenChannel::at_tail("x<|channel>thought\n<channel|>"), None);
+    }
+
+    #[test]
+    fn tool_result_ending_in_a_channel_marker_is_no_opener() {
+        let t = ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let tools = [time_tool()];
+        let plain = t
+            .render(
+                &Conversations::after_marker_tool_result(),
+                true,
+                false,
+                &tools,
+            )
+            .unwrap();
+        assert!(plain.contains("<|channel>x"), "{plain}");
+        assert_eq!(OpenChannel::at_tail(&plain), None, "{plain}");
+        // With thinking on, the template's own opener is the one found.
+        let thinking = t
+            .render(
+                &Conversations::after_marker_tool_result(),
+                true,
+                true,
+                &tools,
+            )
+            .unwrap();
+        assert_eq!(OpenChannel::at_tail(&thinking), Some("<|channel>thought\n"));
+    }
+
+    #[test]
+    fn thinking_off_prompts_have_no_opener() {
+        let t = ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let tools = [time_tool()];
+        for messages in [
+            vec![ChatMessage::new(Role::User, "q")],
+            Conversations::after_tool_response(),
+            Conversations::after_marker_tool_result(),
+        ] {
+            let prompt = t.render(&messages, true, false, &tools).unwrap();
+            assert_eq!(OpenChannel::at_tail(&prompt), None, "{prompt}");
+        }
     }
 
     #[test]
