@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -55,6 +56,10 @@ pub trait WorkerLink: Send + Sync {
     /// unparseable frame is an `Err` item; a socket closed before the response just ends the
     /// stream. Dropping the stream closes the socket, which makes the worker drop its engine
     /// stream.
+    ///
+    /// A stream that ends without a `turn_done`, `turn_rejected` or `turn_error` note was
+    /// truncated (the worker died or the socket dropped mid-turn); the consumer must treat that
+    /// as an error.
     async fn generate(
         &self,
         req: &GenerateRequest,
@@ -80,6 +85,9 @@ impl<L: WorkerLauncher, P: ReadinessProbe> ReadyWorkerUrl for HarnessManager<L, 
 /// Websocket `WorkerLink`: one connection per call, request id `1`.
 pub struct WsWorkerLink {
     url: String,
+    connect_timeout: Duration,
+    call_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 enum Frame {
@@ -91,19 +99,41 @@ enum Frame {
 struct NoteStream {
     ws: ClientWs,
     finished: bool,
+    idle_timeout: Duration,
 }
 
 impl WsWorkerLink {
     const REQUEST_ID: u64 = 1;
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+    const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+    const ERR_CONNECT_TIMEOUT: &'static str = "worker connect timed out";
+    const ERR_CALL_TIMEOUT: &'static str = "worker did not answer within 30s";
+    const ERR_IDLE_TIMEOUT: &'static str = "worker idle for 120s";
 
     pub fn new(url: String) -> Self {
-        Self { url }
+        Self {
+            url,
+            connect_timeout: Self::CONNECT_TIMEOUT,
+            call_timeout: Self::CALL_TIMEOUT,
+            idle_timeout: Self::STREAM_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Overrides the connect, whole-call and per-frame idle timeouts (tests use milliseconds).
+    pub fn with_timeouts(mut self, connect: Duration, call: Duration, idle: Duration) -> Self {
+        self.connect_timeout = connect;
+        self.call_timeout = call;
+        self.idle_timeout = idle;
+        self
     }
 
     /// Opens a socket and sends the single request.
     async fn open(&self, method: &str, params: Value) -> Result<ClientWs, LinkError> {
-        let (mut ws, _) = tokio_tungstenite::connect_async(self.url.as_str())
+        let connecting = tokio_tungstenite::connect_async(self.url.as_str());
+        let (mut ws, _) = tokio::time::timeout(self.connect_timeout, connecting)
             .await
+            .map_err(|_| LinkError(Self::ERR_CONNECT_TIMEOUT.into()))?
             .map_err(|e| LinkError(format!("connect {}: {e}", self.url)))?;
         let frame = json!({"id": Self::REQUEST_ID, "method": method, "params": params});
         ws.send(Message::text(frame.to_string()))
@@ -118,7 +148,10 @@ impl WsWorkerLink {
             serde_json::from_str(text).map_err(|e| LinkError(format!("unparseable frame: {e}")))?;
         if value.get("id") == Some(&json!(Self::REQUEST_ID)) {
             if let Some(err) = value.get("error") {
-                let message = err["message"].as_str().unwrap_or("worker error");
+                let message = err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("worker error");
                 return Err(LinkError(message.to_string()));
             }
             let result = value.get("result").cloned().unwrap_or(Value::Null);
@@ -135,12 +168,20 @@ impl WsWorkerLink {
 
     /// Reads frames until the response; its `result` is returned, notes are skipped.
     async fn call(&self, method: &str, params: Value) -> Result<Value, LinkError> {
+        tokio::time::timeout(self.call_timeout, self.exchange(method, params))
+            .await
+            .map_err(|_| LinkError(Self::ERR_CALL_TIMEOUT.into()))?
+    }
+
+    async fn exchange(&self, method: &str, params: Value) -> Result<Value, LinkError> {
         let mut ws = self.open(method, params).await?;
         while let Some(frame) = ws.next().await {
             let frame = frame.map_err(|e| LinkError(format!("receive: {e}")))?;
             let Message::Text(text) = frame else {
                 continue;
             };
+            // Any unparseable frame aborts the call: with one request per socket there is no
+            // way to tell a corrupt note from a corrupt response, so the exchange is untrusted.
             if let Frame::Response(result) = Self::classify(text.as_str())? {
                 return Ok(result);
             }
@@ -156,7 +197,12 @@ impl WsWorkerLink {
             return None;
         }
         loop {
-            let frame = state.ws.next().await?;
+            let next = tokio::time::timeout(state.idle_timeout, state.ws.next()).await;
+            let Ok(next) = next else {
+                state.finished = true;
+                return Some((Err(LinkError(Self::ERR_IDLE_TIMEOUT.into())), state));
+            };
+            let frame = next?;
             let frame = match frame {
                 Ok(frame) => frame,
                 Err(e) => {
@@ -198,6 +244,7 @@ impl WorkerLink for WsWorkerLink {
         let state = NoteStream {
             ws,
             finished: false,
+            idle_timeout: self.idle_timeout,
         };
         Ok(futures::stream::unfold(state, Self::next_note).boxed())
     }
@@ -235,9 +282,54 @@ mod tests {
         }
     }
 
+    const MS: Duration = Duration::from_millis(100);
+
+    /// What a raw scripted server does after accepting a websocket.
+    enum Script {
+        Silent,
+        Frames(Vec<&'static str>),
+        FramesThenSilent(Vec<&'static str>),
+    }
+
     struct Fixture;
 
     impl Fixture {
+        /// Accepts one websocket, reads the request, plays `script`. The returned receiver
+        /// fires once the server side sees the client close (or the stream end).
+        async fn raw_server(script: Script) -> (WsWorkerLink, tokio::sync::oneshot::Receiver<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let mut ws = tokio_tungstenite::accept_async(tcp)
+                    .await
+                    .expect("handshake");
+                let _ = ws.next().await;
+                let (frames, keep_open) = match script {
+                    Script::Silent => (vec![], true),
+                    Script::Frames(f) => (f, false),
+                    Script::FramesThenSilent(f) => (f, true),
+                };
+                for f in frames {
+                    ws.send(Message::text(f)).await.expect("send");
+                }
+                if !keep_open {
+                    let _ = ws.close(None).await;
+                    while let Some(Ok(_)) = ws.next().await {}
+                    return;
+                }
+                while let Some(Ok(_)) = ws.next().await {}
+                let _ = closed_tx.send(());
+            });
+            (
+                WsWorkerLink::new(format!("ws://{addr}")).with_timeouts(MS, MS, MS),
+                closed_rx,
+            )
+        }
+
         async fn link(engine: FakeEngine) -> WsWorkerLink {
             let addr = TestServer::spawn(Arc::new(engine), 8192).await;
             WsWorkerLink::new(format!("ws://{addr}"))
@@ -287,7 +379,58 @@ mod tests {
     async fn ws_link_error_frame_becomes_err() {
         let link = Fixture::link(FakeEngine::new(&[])).await;
         let err = link.call("no_such_method", json!({})).await.unwrap_err();
-        assert!(!err.0.is_empty());
+        assert!(err.0.contains("no_such_method"), "{}", err.0);
+    }
+
+    #[tokio::test]
+    async fn call_times_out_when_worker_never_answers() {
+        let (link, _closed) = Fixture::raw_server(Script::Silent).await;
+        let err = link.model_props().await.unwrap_err();
+        assert_eq!(err.0, WsWorkerLink::ERR_CALL_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn stream_errors_when_worker_goes_idle() {
+        let note = r#"{"method":"turn_started","params":{}}"#;
+        let (link, _closed) = Fixture::raw_server(Script::FramesThenSilent(vec![note])).await;
+        let mut stream = link.generate(&Fixture::request()).await.expect("generate");
+        assert_eq!(stream.next().await.unwrap().unwrap().method, "turn_started");
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(err.0, WsWorkerLink::ERR_IDLE_TIMEOUT);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unparseable_frame_becomes_err() {
+        let (link, _closed) = Fixture::raw_server(Script::Frames(vec!["not json"])).await;
+        let mut stream = link.generate(&Fixture::request()).await.expect("generate");
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert!(err.0.contains("unparseable"), "{}", err.0);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn socket_closed_before_response_ends_stream_without_error() {
+        let note = r#"{"method":"turn_started","params":{}}"#;
+        let (link, _closed) = Fixture::raw_server(Script::Frames(vec![note])).await;
+        let stream = link.generate(&Fixture::request()).await.expect("generate");
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_closes_socket() {
+        let note = r#"{"method":"turn_started","params":{}}"#;
+        let (link, closed) = Fixture::raw_server(Script::FramesThenSilent(vec![note])).await;
+        let link = link.with_timeouts(MS * 50, MS * 50, MS * 50);
+        let mut stream = link.generate(&Fixture::request()).await.expect("generate");
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("server saw close")
+            .expect("signal");
     }
 
     #[test]
