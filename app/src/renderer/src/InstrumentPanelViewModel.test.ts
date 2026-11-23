@@ -28,6 +28,11 @@ class Rig
         this.client.HandleFrame(JSON.stringify({ method, params }))
     }
 
+    public async Flush(): Promise<void>
+    {
+        await new Promise(r => setTimeout(r, 0))
+    }
+
     /** Ends the turn the way the runtime does: answers the latest send_turn (after its terminal notifications). */
     public async FinishTurn(): Promise<void>
     {
@@ -151,8 +156,8 @@ describe('InstrumentPanelViewModel', () =>
     {
         const rig = new Rig()
         rig.Send('one')
-        rig.client.HandleFrame(JSON.stringify({ id: 3, error: { code: 1, message: 'bad config' } }))
-        await new Promise(r => setTimeout(r, 0))
+        rig.client.HandleFrame(JSON.stringify({ id: 2, error: { code: 1, message: 'bad config' } }))
+        await rig.Flush()
         expect(rig.vm.Panel.Warning).toContain('bad config')
     })
 

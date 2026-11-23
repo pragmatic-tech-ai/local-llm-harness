@@ -1,5 +1,5 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { HarnessClient, type IDisposable, type SamplingConfig } from './HarnessClient'
+import { HarnessClient, TurnSignal, type IDisposable, type ModelProps, type SamplingConfig } from './HarnessClient'
 import { LogprobVM } from './LogprobVM'
 
 /** Low-level state of the model: sampling knobs, raw prompt, context fill, logprobs, tokenization. */
@@ -34,6 +34,8 @@ export class InstrumentPanelViewModel extends Observable
     private readonly _tokenizeCommand: RelayCommand
 
     public readonly Logprobs = new ObservableCollection<LogprobVM>()
+    /** Raised once per Bind with the harness's model_props, so siblings need no second fetch. */
+    public readonly OnModelProps = new TurnSignal<ModelProps>()
 
     private client: HarnessClient | null = null
     private subscriptions: IDisposable[] = []
@@ -92,6 +94,7 @@ export class InstrumentPanelViewModel extends Observable
                     }
                     this.SetModelName(props.model_name)
                     this.SetContext(this._contextUsed, props.n_ctx)
+                    this.OnModelProps.Raise(props)
                 },
                 () => undefined)
         }

@@ -1,5 +1,5 @@
 import { Key, Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { HarnessClient, type IDisposable } from './HarnessClient'
+import { HarnessClient, type IDisposable, type ModelProps, type ToolCallNote } from './HarnessClient'
 import { AssistantMessage, ToolCallMessage, ToolResultMessage, UserMessage } from './messages'
 import { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
 
@@ -20,6 +20,7 @@ export class ChatViewModel extends Observable
     private static readonly ToolsPrefix = 'tools: '
     private static readonly ToolsSeparator = ', '
     private static readonly NotKeptFormat = '[not kept: {0}]'
+    private static readonly ParseErrorFormat = '{0}  [parse error: {1}]'
     private static readonly AnsweredReason = 'answered'
 
     public readonly Transcript = new ObservableCollection<UserMessage | AssistantMessage | ToolCallMessage | ToolResultMessage>()
@@ -44,6 +45,7 @@ export class ChatViewModel extends Observable
     {
         super()
         this.Panel = new InstrumentPanelViewModel()
+        this.Panel.OnModelProps.Subscribe(p => this.RefreshTools(p))
         this._sendCommand = new RelayCommand(() => this.Send(), () => this.CanChat)
         // Enter-to-send: the TextBox (SubmitsOnEnter) leaves Return unhandled so
         // KeyDown bubbles to a DockPanel trigger; this command sends only on Return.
@@ -85,12 +87,12 @@ export class ChatViewModel extends Observable
                 client.OnTurnDone.Subscribe(() => { this.segment = null }),
                 client.OnTurnError.Subscribe(p => this.ReportFailure(ChatViewModel.Format(ChatViewModel.ErrorFormat, p.message))),
                 client.OnTurnRejected.Subscribe(p => this.ReportFailure(ChatViewModel.Format(ChatViewModel.RejectedFormat, p.needed, p.total))),
-                client.OnToolCall.Subscribe(p => this.Transcript.Add(new ToolCallMessage(p.name, ChatViewModel.Stringify(p.arguments)))),
+                client.OnToolCall.Subscribe(p => this.Transcript.Add(ChatViewModel.CallMessage(p))),
                 client.OnToolResult.Subscribe(p => this.Transcript.Add(new ToolResultMessage(p.name, p.ok, ChatViewModel.Stringify(p.content)))),
                 client.OnLoopDone.Subscribe(p => this.OnLoopDone(p.reason)))
         }
+        this.SetToolsText(ChatViewModel.ToolsOff)
         this.Panel.Bind(client)
-        this.RefreshTools(client)
         this._sendCommand.RaiseCanExecuteChanged()
         this._submitCommand.RaiseCanExecuteChanged()
         this.RaisePropertyChanged(ChatViewModel.CanChatProperty, old, this.CanChat)
@@ -215,31 +217,30 @@ export class ChatViewModel extends Observable
     {
         if (this.busy)
         {
-            this.segment?.Append(note)
+            this.AppendNote(note)
         }
         this.segment = null
         this.busy = false
         this.turnToken++
     }
 
-    private RefreshTools(client: HarnessClient | null): void
+    /** Panel-fetched props for the bound client: list the runtime's tools when the model supports them. */
+    private RefreshTools(props: ModelProps): void
     {
-        this.SetToolsText(ChatViewModel.ToolsOff)
-        if (client === null)
+        const client = this.client
+        if (client === null || props.supports_tools !== true)
         {
             return
         }
-        client.ModelProps()
-            .then(props => props.supports_tools === true ? client.ListTools() : [])
-            .then(
-                tools =>
+        client.ListTools().then(
+            tools =>
+            {
+                if (this.client === client && tools.length > 0)
                 {
-                    if (this.client === client && tools.length > 0)
-                    {
-                        this.SetToolsText(ChatViewModel.ToolsPrefix + tools.map(t => t.name).join(ChatViewModel.ToolsSeparator))
-                    }
-                },
-                () => undefined)
+                    this.SetToolsText(ChatViewModel.ToolsPrefix + tools.map(t => t.name).join(ChatViewModel.ToolsSeparator))
+                }
+            },
+            () => undefined)
     }
 
     private SetToolsText(value: string): void
@@ -252,8 +253,20 @@ export class ChatViewModel extends Observable
         }
     }
 
+    /** A call whose arguments did not parse shows the raw text plus the parse error. */
+    private static CallMessage(p: ToolCallNote): ToolCallMessage
+    {
+        const text = p.parse_error ? ChatViewModel.Format(ChatViewModel.ParseErrorFormat, p.raw, p.parse_error) : ChatViewModel.Stringify(p.arguments)
+        return new ToolCallMessage(p.name, text)
+    }
+
+    /** Strings pass through; undefined/null render empty; everything else as JSON. */
     private static Stringify(value: unknown): string
     {
+        if (value === undefined || value === null)
+        {
+            return ''
+        }
         return typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value))
     }
 
