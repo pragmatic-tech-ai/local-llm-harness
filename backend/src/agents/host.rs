@@ -152,10 +152,14 @@ impl LocalSupervisorHost {
         *self.models.lock().unwrap() = discover(&self.catalog);
     }
 
+    /// Same runtime and model (any state, any n_ctx): "this session's model".
+    fn same_model(info: &HarnessInfo, req: &ModelRequirement) -> bool {
+        info.runtime == req.runtime && info.model == req.model
+    }
+
     fn matches(info: &HarnessInfo, req: &ModelRequirement) -> bool {
         info.state == HarnessState::Ready
-            && info.runtime == req.runtime
-            && info.model == req.model
+            && Self::same_model(info, req)
             && info.n_ctx == Some(req.n_ctx)
     }
 
@@ -224,10 +228,12 @@ impl ModelHost for LocalSupervisorHost {
 
     async fn unload_if(&self, req: &ModelRequirement) -> Result<bool, HostError> {
         let _serial = self.loading.lock().await;
+        // Unloading means freeing the GPU from this session's model, which includes cancelling
+        // its in-progress load: a Loading harness of the same model is stopped too.
         let holds_it = self
             .harness
             .current()
-            .is_some_and(|i| i.runtime == req.runtime && i.model == req.model);
+            .is_some_and(|i| Self::same_model(&i, req));
         if !holds_it {
             return Ok(false);
         }
@@ -300,6 +306,8 @@ pub(crate) struct FakeHost {
     /// (model, model evicted, requirement matched the host state when the load returned).
     loads: StdMutex<Vec<(String, Option<String>, bool)>>,
     started: std::sync::atomic::AtomicUsize,
+    /// The (runtime, model) a scripted in-progress load is for (`HostState` has no model for it).
+    loading_model: StdMutex<Option<(String, String)>>,
 }
 
 #[cfg(test)]
@@ -356,6 +364,7 @@ impl FakeHost {
             gate: StdMutex::new(None),
             loads: StdMutex::new(Vec::new()),
             started: std::sync::atomic::AtomicUsize::new(0),
+            loading_model: StdMutex::new(None),
         })
     }
 
@@ -367,6 +376,15 @@ impl FakeHost {
     /// `(model, evicted model, matched at return)` for each load that reached the end.
     pub(crate) fn loads(&self) -> Vec<(String, Option<String>, bool)> {
         self.loads.lock().unwrap().clone()
+    }
+
+    /// Script a load in progress of `runtime`/`model` (state `loading`, nothing loaded).
+    pub(crate) fn set_loading(&self, runtime: &str, model: &str) {
+        *self.loading_model.lock().unwrap() = Some((runtime.to_string(), model.to_string()));
+        self.set_state(HostState {
+            loaded: None,
+            loading: true,
+        });
     }
 
     /// How many loads have taken the loading lock (before any gate).
@@ -456,7 +474,11 @@ impl ModelHost for FakeHost {
         };
         let gate = self.gate.lock().unwrap().clone();
         if let Some(gate) = gate {
-            gate.acquire().await.unwrap().forget();
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.acquire())
+                .await
+                .expect("the test never released the gate")
+                .unwrap()
+                .forget();
         }
         let matched = self.loaded_matches(req);
         self.loads
@@ -482,10 +504,17 @@ impl ModelHost for FakeHost {
             .unwrap()
             .loaded
             .as_ref()
-            .is_some_and(|l| l.0 == req.runtime && l.1 == req.model);
+            .is_some_and(|l| l.0 == req.runtime && l.1 == req.model)
+            || self
+                .loading_model
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|l| l.0 == req.runtime && l.1 == req.model);
         if !holds_it {
             return Ok(false);
         }
+        *self.loading_model.lock().unwrap() = None;
         self.unload_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.set_state(HostState::default());
@@ -790,6 +819,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unload_if_stops_a_loading_harness_of_the_same_model() {
+        let (host, harness) = Fixtures::host("unloadif-loading");
+        harness.set(Some(FakeHarness::info(
+            "llamacpp",
+            "gemma",
+            HarnessState::Loading,
+            Some(8192),
+        )));
+        assert!(!host.unload_if(&Fixtures::req("other", 8192)).await.unwrap());
+        assert_eq!(harness.stops.load(Ordering::SeqCst), 0);
+        assert!(host.unload_if(&Fixtures::req("gemma", 8192)).await.unwrap());
+        assert_eq!(harness.stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fake_host_unload_if_also_stops_a_loading_model() {
+        let fake = FakeHost::serving("h", &[("llamacpp", "gemma")]);
+        fake.set_loading("llamacpp", "gemma");
+        assert!(!fake.unload_if(&Fixtures::req("other", 1)).await.unwrap());
+        assert!(fake.unload_if(&Fixtures::req("gemma", 1)).await.unwrap());
+        assert_eq!(fake.unload_calls(), 1);
+        assert_eq!(fake.state(), HostState::default());
+    }
+
+    #[tokio::test]
     async fn unload_if_waits_for_an_in_flight_load() {
         let (host, harness) = Fixtures::host("unloadif-serial");
         let host = Arc::new(host);
@@ -799,9 +853,13 @@ mod tests {
             let host = Arc::clone(&host);
             tokio::spawn(async move { host.ensure_ready(&Fixtures::req("gemma", 8192)).await })
         };
-        while harness.starts().is_empty() {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while harness.starts().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the load never started");
         let unloader = {
             let host = Arc::clone(&host);
             tokio::spawn(async move { host.unload_if(&Fixtures::req("gemma", 8192)).await })
@@ -843,9 +901,13 @@ mod tests {
             let host = Arc::clone(&host);
             tokio::spawn(async move { host.ensure_ready(&Fixtures::req("gemma", 8192)).await })
         };
-        while harness.starts().is_empty() {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while harness.starts().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the load never started");
         let unloader = {
             let host = Arc::clone(&host);
             tokio::spawn(async move { host.unload().await })

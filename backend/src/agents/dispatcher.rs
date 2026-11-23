@@ -515,7 +515,11 @@ mod tests {
         assert_eq!(hive.load_started(), 1);
         gate.add_permits(2);
         for turn in turns {
-            turn.await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), turn)
+                .await
+                .expect("a turn never finished")
+                .unwrap()
+                .unwrap();
         }
         let loads = hive.loads();
         assert_eq!(loads.len(), 2);
