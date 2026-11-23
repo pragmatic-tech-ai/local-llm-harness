@@ -71,13 +71,27 @@ impl Config {
             .and_then(|tools| match Sandbox::new(&tools.sandbox) {
                 Ok(sandbox) => Some(sandbox),
                 Err(e) => {
-                    println!("tools sandbox unavailable: {e}");
+                    eprintln!("tools sandbox unavailable: {e}");
                     None
                 }
             });
         Ok(ToolRegistry::new(vec![Box::new(BuiltinSource::new(
             sandbox,
         ))])?)
+    }
+
+    /// Binds the runtime server's port. A failure degrades rather than aborts: the control
+    /// plane stays up and no `chat_url` is published.
+    async fn bind_runtime(addr: &str) -> Option<TcpListener> {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => Some(listener),
+            Err(e) => {
+                eprintln!(
+                    "runtime bind {addr} failed: {e}; chat through the runtime is unavailable"
+                );
+                None
+            }
+        }
     }
 
     fn engine_config(&self) -> EngineConfig {
@@ -113,8 +127,11 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
         registry.clone(),
         Config::TOOL_STEP_CAP,
     ));
-    let runtime_listener = TcpListener::bind(&config.runtime_bind).await?;
-    let runtime_addr = runtime_listener.local_addr()?;
+    let runtime_listener = Config::bind_runtime(&config.runtime_bind).await;
+    let runtime_addr = runtime_listener
+        .as_ref()
+        .map(TcpListener::local_addr)
+        .transpose()?;
     // The manager owns its catalog while the control server shares one via Arc: one clone.
     let shared = Arc::new(catalog.clone());
     let manager = Arc::new(HarnessManager::new(
@@ -122,21 +139,23 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
         ProcessLauncher::new(),
         WsProbe,
         ManagerConfig {
-            chat_port: Some(runtime_addr.port()),
+            chat_port: runtime_addr.map(|addr| addr.port()),
             ..ManagerConfig::default()
         },
     ));
-    println!(
-        "runtime listening on ws://{} ({} tools)",
-        runtime_addr,
-        registry.specs().len()
-    );
-    let deps = RuntimeDeps {
-        connector: Arc::new(SupervisorConnector::new(manager.clone())),
-        registry,
-        tool_loop,
-    };
-    tokio::spawn(RuntimeServer::serve(runtime_listener, deps));
+    if let (Some(listener), Some(addr)) = (runtime_listener, runtime_addr) {
+        println!(
+            "runtime listening on ws://{} ({} tools)",
+            addr,
+            registry.specs().len()
+        );
+        let deps = RuntimeDeps {
+            connector: Arc::new(SupervisorConnector::new(manager.clone())),
+            registry,
+            tool_loop,
+        };
+        tokio::spawn(RuntimeServer::serve(listener, deps));
+    }
     let listener = TcpListener::bind(&config.supervisor_bind).await?;
     println!(
         "supervisor listening on ws://{} (advertise {}, {} runtimes, {} model dirs)",
@@ -219,6 +238,14 @@ mod tests {
         assert_eq!(config.supervisor_bind, "0.0.0.0:9999");
         assert_eq!(config.catalog, Some(PathBuf::from("C:/x/catalog.toml")));
         assert_eq!(config.advertise_host.as_deref(), Some("10.0.0.5"));
+    }
+
+    #[tokio::test]
+    async fn runtime_bind_failure_degrades_to_none() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = taken.local_addr().unwrap().to_string();
+        assert!(Config::bind_runtime(&addr).await.is_none());
+        assert!(Config::bind_runtime("127.0.0.1:0").await.is_some());
     }
 
     #[test]

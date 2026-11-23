@@ -1,11 +1,16 @@
 //! The agent runtime's JSON-RPC websocket server: one `RuntimeSession` per client connection,
 //! `send_turn` drives the tool loop and streams its notifications while it runs.
+//!
+//! Requests on one connection run strictly one after another. A client that disconnects during
+//! `send_turn` is only noticed when the next notification write fails; the loop then stops and
+//! the turn is not committed. Cancelling a turn from the client is out of scope for this slice:
+//! the design spec's non-goals and extension points do not include it, so it needs a spec
+//! addition before it is built.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::{TcpListener, TcpStream};
@@ -15,9 +20,9 @@ use super::registry::ToolRegistry;
 use super::session::RuntimeSession;
 use super::tool_loop::{LoopSink, SinkClosed, ToolLoop};
 use super::worker::WorkerConnector;
-use crate::engine::SamplingConfig;
 use crate::rpc::{
-    BoxError, Frames, Request, RpcError, Ws, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND, ERR_PARSE,
+    BoxError, Frames, Request, RpcError, SetSamplingParams, TokenizeParams, Ws,
+    ERR_METHOD_NOT_FOUND, ERR_PARSE,
 };
 
 /// Everything a connection needs besides its own session.
@@ -26,16 +31,6 @@ pub struct RuntimeDeps {
     pub connector: Arc<dyn WorkerConnector>,
     pub registry: Arc<ToolRegistry>,
     pub tool_loop: Arc<ToolLoop>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenizeParams {
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SetSamplingParams {
-    config: SamplingConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,19 +152,19 @@ impl RuntimeConnection {
                     .map_err(|e| RpcError::internal(e.0))
             }
             "tokenize" => {
-                let p: TokenizeParams = Self::params(params)?;
+                let p: TokenizeParams = Frames::params(params)?;
                 let link = self.deps.connector.connect().ok_or_else(Self::no_model)?;
                 link.tokenize(&p.text)
                     .await
                     .map_err(|e| RpcError::internal(e.0))
             }
             "set_sampling" => {
-                let p: SetSamplingParams = Self::params(params)?;
+                let p: SetSamplingParams = Frames::params(params)?;
                 self.session.sampling = p.config;
                 Ok(Value::Null)
             }
             "send_turn" => {
-                let p: SendTurnParams = Self::params(params)?;
+                let p: SendTurnParams = Frames::params(params)?;
                 let ran = self
                     .deps
                     .tool_loop
@@ -206,15 +201,14 @@ impl RuntimeConnection {
     fn no_model() -> RpcError {
         RpcError::internal(Self::NO_MODEL)
     }
-
-    fn params<T: DeserializeOwned>(params: Value) -> Result<T, RpcError> {
-        serde_json::from_value(params).map_err(|e| RpcError::new(ERR_INVALID_PARAMS, e))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::SamplingConfig;
+    use crate::rpc::test_support::TestClient;
+    use crate::rpc::ERR_INVALID_PARAMS;
     use crate::runtime::executor::ToolExecutor;
     use crate::runtime::policy::ReadOnlyPolicy;
     use crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink, Scripted};
@@ -245,6 +239,10 @@ mod tests {
                 connection: RuntimeConnection::new(deps),
                 sink: RecordingSink::new(),
             }
+        }
+
+        fn deps(link: Option<Arc<FakeLink>>) -> RuntimeDeps {
+            Self::new(link).connection.deps
         }
 
         async fn call(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
@@ -338,5 +336,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(f.connection.closed);
+    }
+
+    #[tokio::test]
+    async fn serve_streams_notifications_before_the_response() {
+        let link = FakeLink::new(true, vec![Fixture::answer("hi")]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(RuntimeServer::serve(listener, Fixture::deps(Some(link))));
+        let mut client = TestClient::connect_to(addr).await;
+        let (notes, resp) = client.request("send_turn", json!({"content": "q"})).await;
+        assert_eq!(resp["result"], Value::Null);
+        let methods = TestClient::methods(&notes);
+        assert_eq!(methods.last().map(String::as_str), Some("loop_done"));
+        assert!(methods.contains(&"turn_done".to_string()));
+        let reply = client.send_raw("not json").await;
+        assert_eq!(reply["id"], Value::Null);
+        assert_eq!(reply["error"]["code"], ERR_PARSE);
     }
 }

@@ -43,13 +43,13 @@ pub(crate) struct Request {
 }
 
 #[derive(Debug, Deserialize)]
-struct TokenizeParams {
-    text: String,
+pub(crate) struct TokenizeParams {
+    pub(crate) text: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct SetSamplingParams {
-    config: SamplingConfig,
+pub(crate) struct SetSamplingParams {
+    pub(crate) config: SamplingConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +103,11 @@ impl Frames {
 
     pub(crate) fn notification(method: &str, params: Value) -> Value {
         json!({"method": method, "params": params})
+    }
+
+    /// Decodes request params, mapping a mismatch to an invalid-params error.
+    pub(crate) fn params<T: DeserializeOwned>(params: Value) -> Result<T, RpcError> {
+        serde_json::from_value(params).map_err(|e| RpcError::new(ERR_INVALID_PARAMS, e))
     }
 
     pub(crate) async fn send(ws: &mut Ws, value: Value) -> Result<(), BoxError> {
@@ -181,19 +186,15 @@ impl Connection {
             Ok(r) => r,
             Err(e) => {
                 let err = RpcError::new(ERR_PARSE, e);
-                return Self::send_json(ws, Self::error_frame(Value::Null, &err)).await;
+                return Frames::send(ws, Frames::error(Value::Null, &err)).await;
             }
         };
         let frame = match self.dispatch(ws, &request).await {
             Ok(result) => Frames::result(request.id, result),
-            Err(Failure::Rpc(err)) => Self::error_frame(request.id, &err),
+            Err(Failure::Rpc(err)) => Frames::error(request.id, &err),
             Err(Failure::Transport(e)) => return Err(e),
         };
-        Self::send_json(ws, frame).await
-    }
-
-    fn error_frame(id: Value, err: &RpcError) -> Value {
-        Frames::error(id, err)
+        Frames::send(ws, frame).await
     }
 
     async fn dispatch(&mut self, ws: &mut Ws, req: &Request) -> Result<Value, Failure> {
@@ -207,7 +208,7 @@ impl Connection {
                 "supports_tools": self.engine.supports_tools(),
             })),
             "tokenize" => {
-                let p: TokenizeParams = Self::params(req)?;
+                let p: TokenizeParams = Frames::params(req.params.clone())?;
                 let result = self
                     .engine
                     .tokenize(&p.text)
@@ -216,17 +217,17 @@ impl Connection {
                 Ok(Self::to_value(&result)?)
             }
             "set_sampling" => {
-                let p: SetSamplingParams = Self::params(req)?;
+                let p: SetSamplingParams = Frames::params(req.params.clone())?;
                 self.sampling = p.config;
                 Ok(Value::Null)
             }
             "send_turn" => {
-                let p: SendTurnParams = Self::params(req)?;
+                let p: SendTurnParams = Frames::params(req.params.clone())?;
                 self.send_turn(ws, p).await?;
                 Ok(Value::Null)
             }
             "generate" => {
-                let p: GenerateParams = Self::params(req)?;
+                let p: GenerateParams = Frames::params(req.params.clone())?;
                 self.generate(ws, p).await?;
                 Ok(Value::Null)
             }
@@ -234,10 +235,6 @@ impl Connection {
                 Err(RpcError::new(ERR_METHOD_NOT_FOUND, format!("unknown method: {other}")).into())
             }
         }
-    }
-
-    fn params<T: DeserializeOwned>(req: &Request) -> Result<T, RpcError> {
-        serde_json::from_value(req.params.clone()).map_err(|e| RpcError::new(ERR_INVALID_PARAMS, e))
     }
 
     fn to_value<T: Serialize>(v: &T) -> Result<Value, RpcError> {
@@ -372,13 +369,9 @@ impl Connection {
     }
 
     async fn notify(ws: &mut Ws, method: &str, params: Value) -> Result<(), Failure> {
-        Self::send_json(ws, Frames::notification(method, params))
+        Frames::send(ws, Frames::notification(method, params))
             .await
             .map_err(Failure::Transport)
-    }
-
-    async fn send_json(ws: &mut Ws, value: Value) -> Result<(), BoxError> {
-        Frames::send(ws, value).await
     }
 }
 
@@ -552,10 +545,26 @@ pub(crate) mod test_support {
         /// Starts `serve` over `engine` with the given window size and connects to it.
         pub(crate) async fn connect(engine: Arc<dyn Engine>, n_ctx: usize) -> Self {
             let addr = TestServer::spawn(engine, n_ctx).await;
+            Self::connect_to(addr).await
+        }
+
+        /// Connects to a server already listening on `addr`.
+        pub(crate) async fn connect_to(addr: std::net::SocketAddr) -> Self {
             let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
                 .await
                 .expect("connect");
             Self { ws, next_id: 1 }
+        }
+
+        /// Sends `text` verbatim and returns the first frame the server answers with.
+        pub(crate) async fn send_raw(&mut self, text: &str) -> Value {
+            self.ws.send(Message::text(text)).await.expect("send");
+            while let Some(frame) = self.ws.next().await {
+                if let Message::Text(reply) = frame.expect("frame") {
+                    return serde_json::from_str(reply.as_str()).expect("json");
+                }
+            }
+            panic!("connection closed before a reply");
         }
 
         /// Sends one request; returns the notifications received before its response, then the
