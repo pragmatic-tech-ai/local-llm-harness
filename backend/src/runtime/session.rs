@@ -5,7 +5,7 @@ use crate::engine::{ChatMessage, SamplingConfig};
 /// One per client connection. The transcript only ever holds whole, answered loops (see
 /// `ToolLoop::run`), so it is always a sequence the chat template accepts.
 pub struct RuntimeSession {
-    pub transcript: Vec<ChatMessage>,
+    transcript: Vec<ChatMessage>,
     pub sampling: SamplingConfig,
 }
 
@@ -25,6 +25,12 @@ impl RuntimeSession {
     pub fn transcript(&self) -> &[ChatMessage] {
         &self.transcript
     }
+
+    /// Replaces the transcript with `transcript`, which must extend it by whole answered
+    /// loops.
+    pub fn commit(&mut self, transcript: Vec<ChatMessage>) {
+        self.transcript = transcript;
+    }
 }
 
 impl Default for RuntimeSession {
@@ -42,7 +48,7 @@ mod tests {
     fn reset_clears_transcript_but_keeps_sampling() {
         let mut session = RuntimeSession::new();
         session.sampling.temperature = 0.1;
-        session.transcript.push(ChatMessage::new(Role::User, "q"));
+        session.commit(vec![ChatMessage::new(Role::User, "q")]);
         assert_eq!(session.transcript().len(), 1);
         session.reset();
         assert!(session.transcript().is_empty());

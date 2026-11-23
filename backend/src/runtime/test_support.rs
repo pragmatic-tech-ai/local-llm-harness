@@ -141,20 +141,44 @@ impl WorkerLink for FakeLink {
     }
 }
 
-/// A connector that hands out one link, or none.
+/// A connector that hands out scripted links (or none), one per `connect`; the last entry
+/// repeats forever.
 pub(crate) struct FakeConnector {
-    link: Option<Arc<FakeLink>>,
+    links: Mutex<VecDeque<Option<Arc<FakeLink>>>>,
+    connects: Mutex<usize>,
 }
 
 impl FakeConnector {
+    /// Always hands out `link` (or nothing).
     pub(crate) fn new(link: Option<Arc<FakeLink>>) -> Self {
-        Self { link }
+        Self::sequence(vec![link])
+    }
+
+    /// Hands out `links` in order, one per `connect`, then keeps repeating the last.
+    pub(crate) fn sequence(links: Vec<Option<Arc<FakeLink>>>) -> Self {
+        assert!(!links.is_empty(), "a connector needs at least one entry");
+        Self {
+            links: Mutex::new(links.into()),
+            connects: Mutex::new(0),
+        }
+    }
+
+    /// How many times `connect` has been called.
+    pub(crate) fn connects(&self) -> usize {
+        *self.connects.lock().expect("connects")
     }
 }
 
 impl WorkerConnector for FakeConnector {
     fn connect(&self) -> Option<Arc<dyn WorkerLink>> {
-        self.link.clone().map(|l| l as Arc<dyn WorkerLink>)
+        *self.connects.lock().expect("connects") += 1;
+        let mut links = self.links.lock().expect("links");
+        let link = if links.len() > 1 {
+            links.pop_front().expect("non-empty")
+        } else {
+            links.front().cloned().expect("non-empty")
+        };
+        link.map(|l| l as Arc<dyn WorkerLink>)
     }
 }
 

@@ -83,6 +83,9 @@ impl ToolLoop {
     const SUPPORTS_TOOLS: &'static str = "supports_tools";
     const FIELD_ID: &'static str = "id";
     const CALL_ID_PREFIX: &'static str = "call_";
+    const FIELD_TOOL_CALLS: &'static str = "tool_calls";
+    const FIELD_CONTENT: &'static str = "content";
+    const NO_MODEL: &'static str = "no model running";
 
     /// `step_cap` is the maximum number of generate calls per user message; `0` means no
     /// generate call is made and every run ends `StepLimit` with 0 steps.
@@ -103,8 +106,13 @@ impl ToolLoop {
     /// every `generate`, so ids repeat across steps and the chat template could bind a later
     /// result to an earlier call. Each call is renamed `call_{k}`, with k counting every tool
     /// call already in the scratch transcript plus its position in the step. The relayed
-    /// `tool_call` notes are the one exception to verbatim relay: only their `id` is rewritten
-    /// (by position, matching the order of `turn_done.tool_calls`).
+    /// `tool_call` notes and `turn_done.tool_calls` are the one exception to verbatim relay:
+    /// only their `id`s are rewritten (by position), so the wire is self-consistent.
+    ///
+    /// Every step asks the connector for the current Ready harness and re-reads its
+    /// `model_props`, so a harness swapped between steps is used (with its own tool support).
+    /// No harness at the first step ends `NoHarness`; one that disappears mid-loop ends `Error`
+    /// with a `turn_error` ("no model running"), since the user message was already in flight.
     ///
     /// A failing `model_props` ends the loop with `Error` and a `turn_error` carrying the
     /// link error: without it we cannot know whether to send tools, and guessing would either
@@ -117,32 +125,25 @@ impl ToolLoop {
         connector: &dyn WorkerConnector,
         sink: &mut dyn LoopSink,
     ) -> Result<LoopEnd, SinkClosed> {
-        let Some(link) = connector.connect() else {
-            return Self::finish(sink, 0, EndReason::NoHarness).await;
-        };
-        let props = match link.model_props().await {
-            Ok(props) => props,
-            Err(e) => return Self::fail(sink, 0, &e.0).await,
-        };
-        let supports_tools = props
-            .get(Self::SUPPORTS_TOOLS)
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let tools = if supports_tools {
-            self.registry.openai_tools()
-        } else {
-            Vec::new()
-        };
-
-        let mut scratch = session.transcript.clone();
+        let mut scratch = session.transcript().to_vec();
         scratch.push(ChatMessage::new(Role::User, content));
 
         let mut steps = 0;
         while steps < self.step_cap {
+            let Some(link) = connector.connect() else {
+                if steps == 0 {
+                    return Self::finish(sink, 0, EndReason::NoHarness).await;
+                }
+                return Self::fail(sink, steps, Self::NO_MODEL).await;
+            };
+            let tools = match link.model_props().await {
+                Ok(props) => self.tools_for(&props),
+                Err(e) => return Self::fail(sink, steps, &e.0).await,
+            };
             steps += 1;
             let request = GenerateRequest {
                 messages: scratch.clone(),
-                tools: tools.clone(),
+                tools,
                 enable_thinking,
                 sampling: session.sampling.clone(),
             };
@@ -157,17 +158,14 @@ impl ToolLoop {
                 StepEnd::WorkerError => return Self::finish(sink, steps, EndReason::Error).await,
                 StepEnd::Broken(message) => return Self::fail(sink, steps, &message).await,
             };
-            let Some((text, mut calls)) = Self::parse_done(&done) else {
+            let Some((text, calls)) = Self::parse_done(&done) else {
                 return Self::fail(sink, steps, Self::BAD_TURN_DONE).await;
             };
-            for (i, call) in calls.iter_mut().enumerate() {
-                call.id = Self::call_id(base + i);
-            }
-            scratch.push(Self::assistant_message(&text, &calls));
+            scratch.extend(Self::assistant_messages(&text, &calls));
             if calls.is_empty() {
                 // Commit only once the client has been told; a closed sink keeps the old state.
                 let end = Self::finish(sink, steps, EndReason::Answered).await?;
-                session.transcript = scratch;
+                session.commit(scratch);
                 return Ok(end);
             }
             if steps == self.step_cap {
@@ -206,6 +204,9 @@ impl ToolLoop {
                         }
                         seen_calls += 1;
                     }
+                    if note.method == Self::M_TURN_DONE {
+                        Self::rename_done_calls(&mut note.params, base);
+                    }
                     sink.notify(&note.method, note.params.clone()).await?;
                     match note.method.as_str() {
                         Self::M_TURN_DONE => return Ok(StepEnd::Done(note.params)),
@@ -216,6 +217,37 @@ impl ToolLoop {
                 }
                 Some(Err(e)) => return Ok(StepEnd::Broken(e.0)),
                 None => return Ok(StepEnd::Broken(Self::STREAM_ENDED.into())),
+            }
+        }
+    }
+
+    /// The tools to offer the harness behind `props`: the registry's, or none when the
+    /// model does not support tools.
+    fn tools_for(&self, props: &Value) -> Vec<Value> {
+        let supports_tools = props
+            .get(Self::SUPPORTS_TOOLS)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if supports_tools {
+            self.registry.openai_tools()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Renames each `turn_done.tool_calls[i].id` to its runtime id; other shapes are left for
+    /// `parse_done` to reject.
+    fn rename_done_calls(params: &mut Value, base: usize) {
+        let Some(calls) = params
+            .get_mut(Self::FIELD_TOOL_CALLS)
+            .and_then(Value::as_array_mut)
+        else {
+            return;
+        };
+        for (i, call) in calls.iter_mut().enumerate() {
+            if let Some(fields) = call.as_object_mut() {
+                let id = Value::String(Self::call_id(base + i));
+                fields.insert(Self::FIELD_ID.into(), id);
             }
         }
     }
@@ -237,15 +269,31 @@ impl ToolLoop {
     /// `(content, calls)` from `turn_done` params; `None` if the calls are malformed.
     fn parse_done(done: &Value) -> Option<(String, Vec<ParsedCall>)> {
         let text = done
-            .get("content")
+            .get(Self::FIELD_CONTENT)
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let calls = match done.get("tool_calls") {
+        let calls = match done.get(Self::FIELD_TOOL_CALLS) {
             None | Some(Value::Null) => Vec::new(),
             Some(raw) => serde_json::from_value(raw.clone()).ok()?,
         };
         Some((text, calls))
+    }
+
+    /// The transcript entries for one step's output. Text before calls becomes its own
+    /// assistant message, followed by a content-less one carrying the calls: chat templates
+    /// render an assistant message as calls, then the scanned tool responses, then content,
+    /// and content after the responses closes the model turn (Gemma 4 emits `<turn|>`), which
+    /// would leave the next step's prompt with no open model turn. Split, the text renders
+    /// before the calls inside one continuing model turn.
+    fn assistant_messages(text: &str, calls: &[ParsedCall]) -> Vec<ChatMessage> {
+        if calls.is_empty() || text.trim().is_empty() {
+            return vec![Self::assistant_message(text, calls)];
+        }
+        vec![
+            ChatMessage::new(Role::Assistant, text),
+            Self::assistant_message("", calls),
+        ]
     }
 
     fn assistant_message(text: &str, calls: &[ParsedCall]) -> ChatMessage {
@@ -286,8 +334,10 @@ impl ToolLoop {
         }
     }
 
+    /// The result travels once, as `tool_result` (what the template formats); `content` stays
+    /// empty.
     fn tool_message(call_id: &str, result: Value) -> ChatMessage {
-        let mut message = ChatMessage::new(Role::Tool, result.to_string());
+        let mut message = ChatMessage::new(Role::Tool, "");
         message.tool_call_id = Some(call_id.to_string());
         message.tool_result = Some(result);
         message
@@ -356,9 +406,26 @@ mod tests {
 
         async fn run(&mut self, link: Option<Arc<FakeLink>>) -> Result<LoopEnd, SinkClosed> {
             let connector = FakeConnector::new(link);
+            self.run_with(&connector).await
+        }
+
+        async fn run_with(&mut self, connector: &FakeConnector) -> Result<LoopEnd, SinkClosed> {
             self.tool_loop
-                .run(&mut self.session, "q", false, &connector, &mut self.sink)
+                .run(&mut self.session, "q", false, connector, &mut self.sink)
                 .await
+        }
+
+        /// `messages` rendered through the real Gemma 4 template, as the worker would.
+        fn render(&self, messages: &[ChatMessage], enable_thinking: bool) -> String {
+            let template = ChatTemplate::from_jinja(GEMMA4).expect("template");
+            template
+                .render(
+                    messages,
+                    true,
+                    enable_thinking,
+                    &self.registry.openai_tools(),
+                )
+                .expect("render")
         }
 
         fn echo_call(id: &str) -> Value {
@@ -445,6 +512,8 @@ mod tests {
         assert_eq!(t[2].role, Role::Tool);
         assert_eq!(t[2].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(t[2].tool_result, Some(json!({"text": "x"})));
+        // The result travels once, as tool_result.
+        assert_eq!(t[2].content, "");
         assert_eq!(
             (t[3].role, t[3].content.as_str()),
             (Role::Assistant, "done")
@@ -521,9 +590,7 @@ mod tests {
     #[tokio::test]
     async fn window_full_rolls_back() {
         let mut f = Fixture::new();
-        f.session
-            .transcript
-            .push(ChatMessage::new(Role::User, "old"));
+        f.session.commit(vec![ChatMessage::new(Role::User, "old")]);
         let link = FakeLink::new(
             true,
             vec![Notes::script(vec![Notes::started(), Notes::rejected(9, 8)])],
@@ -711,12 +778,10 @@ mod tests {
     #[tokio::test]
     async fn answered_loop_extends_prior_transcript() {
         let mut f = Fixture::new();
-        f.session
-            .transcript
-            .push(ChatMessage::new(Role::User, "old"));
-        f.session
-            .transcript
-            .push(ChatMessage::new(Role::Assistant, "older"));
+        f.session.commit(vec![
+            ChatMessage::new(Role::User, "old"),
+            ChatMessage::new(Role::Assistant, "older"),
+        ]);
         let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
         f.run(Some(link.clone())).await.unwrap();
         assert_eq!(link.requests()[0].messages.len(), 3);
@@ -750,6 +815,16 @@ mod tests {
         let results = f.tool_results();
         let result_ids: Vec<&Value> = results.iter().map(|n| &n.params["id"]).collect();
         assert_eq!(result_ids, relayed_ids);
+        let done_ids: Vec<&Value> = f
+            .sink
+            .notes
+            .iter()
+            .filter(|n| n.method == "turn_done")
+            .filter_map(|n| n.params["tool_calls"].as_array())
+            .flatten()
+            .map(|c| &c["id"])
+            .collect();
+        assert_eq!(done_ids, relayed_ids);
         let t = f.session.transcript();
         assert_eq!(t[1].tool_calls.as_ref().unwrap()[0].id, "call_1");
         assert_eq!(t[2].tool_call_id.as_deref(), Some("call_1"));
@@ -763,6 +838,110 @@ mod tests {
         let echo_at = prompt.find("<|tool_response>response:echo").expect("echo");
         let nope_at = prompt.find("<|tool_response>response:nope").expect("nope");
         assert!(echo_at < nope_at, "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn preamble_text_stays_inside_an_open_model_turn() {
+        let mut f = Fixture::new();
+        let link = FakeLink::new(
+            true,
+            vec![
+                Fixture::step("Let me check.", vec![Fixture::echo_call("call_1")]),
+                Fixture::step("done", vec![]),
+            ],
+        );
+        assert_eq!(
+            f.run(Some(link.clone())).await.unwrap().reason,
+            EndReason::Answered
+        );
+        let t = f.session.transcript();
+        assert_eq!(t.len(), 5);
+        assert_eq!(
+            (t[1].role, t[1].content.as_str()),
+            (Role::Assistant, "Let me check.")
+        );
+        assert!(t[1].tool_calls.is_none());
+        assert_eq!((t[2].role, t[2].content.as_str()), (Role::Assistant, ""));
+        assert_eq!(t[2].tool_calls.as_ref().unwrap()[0].id, "call_1");
+        assert_eq!(t[3].role, Role::Tool);
+        assert_eq!(t[4].content, "done");
+
+        let step2 = f.render(&link.requests()[1].messages, false);
+        assert!(!step2.ends_with("<turn|>\n"), "{step2}");
+        assert!(!step2.contains("Let me check.<turn|>"), "{step2}");
+        let call_and_response = concat!(
+            "<|tool_call>call:echo{text:<|\"|>x<|\"|>}<tool_call|>",
+            "<|tool_response>response:echo{text:<|\"|>x<|\"|>}<tool_response|>",
+        );
+        let open_turn =
+            format!("<|turn>user\nq<turn|>\n<|turn>model\nLet me check.{call_and_response}");
+        assert!(step2.ends_with(&open_turn), "{step2}");
+
+        // The next user message: the whole loop is one closed model turn.
+        let next = FakeLink::new(true, vec![Fixture::step("ok", vec![])]);
+        f.run(Some(next.clone())).await.unwrap();
+        let later = f.render(&next.requests()[0].messages, false);
+        let closed_turn = format!(
+            "<|turn>model\nLet me check.{call_and_response}done<turn|>\n\
+             <|turn>user\nq<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        );
+        assert!(later.ends_with(&closed_turn), "{later}");
+        assert_eq!(later.matches("<|turn>model\n").count(), 2, "{later}");
+    }
+
+    #[tokio::test]
+    async fn link_and_props_are_resolved_per_step() {
+        let mut f = Fixture::new();
+        let first = FakeLink::new(true, vec![Fixture::step("", vec![Fixture::echo_call("c")])]);
+        let second = FakeLink::new(false, vec![Fixture::step("done", vec![])]);
+        let connector = FakeConnector::sequence(vec![Some(first.clone()), Some(second.clone())]);
+        let end = f.run_with(&connector).await.unwrap();
+        assert_eq!(
+            end,
+            LoopEnd {
+                steps: 2,
+                reason: EndReason::Answered
+            }
+        );
+        assert_eq!(connector.connects(), 2);
+        assert_eq!(first.requests().len(), 1);
+        assert!(!first.requests()[0].tools.is_empty());
+        assert_eq!(second.requests().len(), 1);
+        assert!(second.requests()[0].tools.is_empty());
+        assert_eq!(second.requests()[0].messages.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn harness_gone_mid_loop_is_error() {
+        let mut f = Fixture::new();
+        let first = FakeLink::new(true, vec![Fixture::step("", vec![Fixture::echo_call("c")])]);
+        let connector = FakeConnector::sequence(vec![Some(first), None]);
+        let end = f.run_with(&connector).await.unwrap();
+        assert_eq!(
+            end,
+            LoopEnd {
+                steps: 1,
+                reason: EndReason::Error
+            }
+        );
+        let at = f.sink.notes.len() - 2;
+        assert_eq!(f.sink.notes[at].method, "turn_error");
+        assert_eq!(f.sink.notes[at].params["message"], "no model running");
+        assert_eq!(f.last().params, json!({"steps": 1, "reason": "error"}));
+        assert!(f.session.transcript().is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_props_failure_mid_loop_is_error() {
+        let mut f = Fixture::new();
+        let first = FakeLink::new(true, vec![Fixture::step("", vec![Fixture::echo_call("c")])]);
+        let connector =
+            FakeConnector::sequence(vec![Some(first), Some(FakeLink::failing_props("gone"))]);
+        let end = f.run_with(&connector).await.unwrap();
+        assert_eq!(end.reason, EndReason::Error);
+        assert_eq!(end.steps, 1);
+        let at = f.sink.notes.len() - 2;
+        assert_eq!(f.sink.notes[at].params["message"], "gone");
     }
 
     #[tokio::test]
