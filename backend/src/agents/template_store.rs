@@ -77,10 +77,10 @@ impl TemplateNode {
     fn sort_key(&self) -> (u8, String, String, String) {
         match self {
             TemplateNode::Group { name, path, .. } => {
-                (0, name.to_lowercase(), path.clone(), String::new())
+                (0, name.to_ascii_lowercase(), path.clone(), String::new())
             }
             TemplateNode::Template { name, path, id, .. } => {
-                (1, name.to_lowercase(), path.clone(), id.clone())
+                (1, name.to_ascii_lowercase(), path.clone(), id.clone())
             }
         }
     }
@@ -91,7 +91,7 @@ impl TemplateNode {
             match n {
                 TemplateNode::Group { children, .. } => Self::count_ids(children, counts),
                 TemplateNode::Template { id, .. } => {
-                    *counts.entry(id.to_lowercase()).or_insert(0) += 1;
+                    *counts.entry(id.to_ascii_lowercase()).or_insert(0) += 1;
                 }
             }
         }
@@ -103,8 +103,12 @@ impl TemplateNode {
             match n {
                 TemplateNode::Group { children, .. } => Self::flag_duplicates(children, counts),
                 TemplateNode::Template { id, error, .. } => {
-                    if counts.get(&id.to_lowercase()).copied().unwrap_or(0) > 1 {
-                        *error = Some(format!("{ERR_DUPLICATE}{id}"));
+                    if counts.get(&id.to_ascii_lowercase()).copied().unwrap_or(0) > 1 {
+                        let dup = format!("{ERR_DUPLICATE}{id}");
+                        *error = Some(match error.take() {
+                            Some(parse) => format!("{parse}; {dup}"),
+                            None => dup,
+                        });
                     }
                 }
             }
@@ -245,7 +249,12 @@ impl TemplateStore {
         let (id, old) = match id {
             Some(id) => {
                 let (old_file, _) = self.locate(id)?;
-                (id.to_string(), Some(old_file))
+                // Keep the on-disk stem (and its casing) as the id: a save never renames a file.
+                let stem = old_file
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| id.to_string());
+                (stem, Some(old_file))
             }
             None => (self.unique_id(&t.name), None),
         };
@@ -256,11 +265,23 @@ impl TemplateStore {
         // by hand (and refreshes). That is preferred to losing the template.
         Self::write_atomic(&dir, &id, t)?;
         if let Some(old) = old {
-            if old != dir.join(format!("{id}.{EXT}")) {
-                fs::remove_file(old)?;
+            let new_file = dir.join(format!("{id}.{EXT}"));
+            if !Self::same_file(&old, &new_file) {
+                if let Err(e) = fs::remove_file(&old) {
+                    // Roll back so no unresolvable duplicate is left behind.
+                    let _ = fs::remove_file(&new_file);
+                    return Err(e.into());
+                }
             }
         }
         Ok(id)
+    }
+
+    /// Path equality as the (case-insensitive) filesystem sees it; ASCII folding, matching
+    /// `find`, `count_ids` and `collect_ids`.
+    fn same_file(a: &Path, b: &Path) -> bool {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
     }
 
     pub fn delete(&self, id: &str) -> Result<(), TemplateError> {
@@ -294,12 +315,16 @@ impl TemplateStore {
             return Ok(());
         }
         let target = dir.with_file_name(new_name);
-        if current.to_lowercase() == new_name.to_lowercase() {
+        if current.eq_ignore_ascii_case(new_name) {
             // Case-only rename: on a case-insensitive filesystem the target "exists" (it is the
             // source), so go through a temporary name.
             let temp = dir.with_file_name(format!(".{new_name}.{RENAME_TMP}"));
             fs::rename(&dir, &temp)?;
-            fs::rename(&temp, &target)?;
+            if let Err(e) = fs::rename(&temp, &target) {
+                // Put the group back under its original name.
+                let _ = fs::rename(&temp, &dir);
+                return Err(e.into());
+            }
             return Ok(());
         }
         if target.exists() {
@@ -330,7 +355,11 @@ impl TemplateStore {
         let _g = self.lock()?;
         let (old, _) = self.locate(id)?;
         fs::create_dir_all(&dir)?;
-        fs::rename(old, dir.join(format!("{id}.{EXT}")))?;
+        let stem = old
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| id.to_string());
+        fs::rename(old, dir.join(format!("{stem}.{EXT}")))?;
         Ok(())
     }
 
@@ -433,7 +462,7 @@ impl TemplateStore {
                 Self::collect_ids(&p, out);
             } else if p.extension().and_then(|e| e.to_str()) == Some(EXT) {
                 if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    out.insert(stem.to_lowercase());
+                    out.insert(stem.to_ascii_lowercase());
                 }
             }
         }
@@ -506,6 +535,17 @@ mod tests {
 
         fn store(&self) -> TemplateStore {
             TemplateStore::open(&self.0.join("templates"), TemplateRules::for_tests()).unwrap()
+        }
+
+        fn invalid() -> TemplateError {
+            TemplateError("invalid path".into())
+        }
+
+        fn hand_file(&self, rel: &str, name: &str) {
+            let dir = self.0.join("templates").join(rel);
+            fs::create_dir_all(&dir).unwrap();
+            let body = toml::to_string_pretty(&TempDir::sample(name)).unwrap();
+            fs::write(dir.join(format!("{name}.toml")), body).unwrap();
         }
 
         fn sample(name: &str) -> AgentTemplate {
@@ -705,23 +745,12 @@ mod tests {
         assert_eq!(s.save(Some("default"), "Samples", &t).unwrap(), "default");
     }
 
-    fn invalid() -> TemplateError {
-        TemplateError("invalid path".into())
-    }
-
-    fn hand_file(d: &TempDir, rel: &str, name: &str) {
-        let dir = d.0.join("templates").join(rel);
-        fs::create_dir_all(&dir).unwrap();
-        let body = toml::to_string_pretty(&TempDir::sample(name)).unwrap();
-        fs::write(dir.join(format!("{name}.toml")), body).unwrap();
-    }
-
     #[test]
     fn hand_named_file_is_fully_usable() {
         let d = TempDir::new("hand");
         let root = d.0.join("templates");
         fs::create_dir_all(&root).unwrap();
-        hand_file(&d, "", "My Agent");
+        d.hand_file("", "My Agent");
         let s = d.store();
         assert_eq!(s.tree().len(), 1, "root is non-empty so no seed");
         assert!(
@@ -740,8 +769,8 @@ mod tests {
     #[test]
     fn duplicate_ids_are_flagged_and_refused() {
         let d = TempDir::new("dup");
-        hand_file(&d, "a", "x");
-        hand_file(&d, "b", "x");
+        d.hand_file("a", "x");
+        d.hand_file("b", "x");
         let s = d.store();
         let msg = "duplicate template id: x";
         let flat = |nodes: &[TemplateNode]| {
@@ -786,7 +815,7 @@ mod tests {
         for bad in [
             "con", "AUX", "Com1", "lpt9.txt", "nul", "trail ", "dots.", "a/prn",
         ] {
-            assert_eq!(s.create_group(bad), Err(invalid()), "{bad}");
+            assert_eq!(s.create_group(bad), Err(TempDir::invalid()), "{bad}");
         }
         s.create_group("com10").unwrap();
         assert_eq!(
@@ -837,11 +866,19 @@ mod tests {
         let d = TempDir::new("badpath");
         let s = d.store();
         for bad in ["../x", "/x", "C:/x", "Examples/"] {
-            assert_eq!(s.move_template("default", bad), Err(invalid()), "{bad}");
-            assert_eq!(s.rename_group(bad, "n"), Err(invalid()), "{bad}");
+            assert_eq!(
+                s.move_template("default", bad),
+                Err(TempDir::invalid()),
+                "{bad}"
+            );
+            assert_eq!(s.rename_group(bad, "n"), Err(TempDir::invalid()), "{bad}");
         }
         for bad in ["", "..", "a/b", "C:x", "con"] {
-            assert_eq!(s.rename_group("Examples", bad), Err(invalid()), "{bad}");
+            assert_eq!(
+                s.rename_group("Examples", bad),
+                Err(TempDir::invalid()),
+                "{bad}"
+            );
         }
     }
 
@@ -897,5 +934,87 @@ mod tests {
         let mut nodes = vec![node("a", "z"), node("a", "y")];
         nodes.sort_by_key(TemplateNode::sort_key);
         assert!(matches!(&nodes[0], TemplateNode::Template { path, .. } if path == "y"));
+    }
+
+    #[test]
+    fn save_with_differently_cased_id_keeps_file() {
+        let d = TempDir::new("casesave");
+        d.hand_file("g", "X");
+        let s = d.store();
+        let mut t = TempDir::sample("X");
+        t.system_prompt = "new content".into();
+        assert_eq!(s.save(Some("x"), "g", &t).unwrap(), "X");
+        let file = d.0.join("templates").join("g").join("X.toml");
+        assert!(file.is_file());
+        assert_eq!(s.get("X").unwrap().0.system_prompt, "new content");
+        // a cross-group save also keeps the on-disk casing
+        assert_eq!(s.save(Some("x"), "h", &t).unwrap(), "X");
+        assert_eq!(s.get("X").unwrap().1, "h");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_old_removal_rolls_back_new_copy() {
+        let d = TempDir::new("rollback");
+        d.hand_file("a", "x");
+        let s = d.store();
+        let old = d.0.join("templates").join("a").join("x.toml");
+        // Hold the old file open without FILE_SHARE_DELETE so removing it fails.
+        use std::os::windows::fs::OpenOptionsExt;
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&old)
+            .unwrap();
+        let res = s.save(Some("x"), "b", &TempDir::sample("x"));
+        drop(guard);
+        assert!(res.is_err());
+        assert!(!d.0.join("templates").join("b").join("x.toml").exists());
+        assert!(old.is_file());
+    }
+
+    #[test]
+    fn non_ascii_ids_tree_and_locate_agree() {
+        let d = TempDir::new("unicode");
+        d.hand_file("a", "\u{c9}x");
+        d.hand_file("b", "\u{e9}x");
+        let s = d.store();
+        // ASCII folding: the two are distinct ids everywhere, so nothing is flagged.
+        let mut errors = 0;
+        for g in s.tree() {
+            if let TemplateNode::Group { children, .. } = g {
+                for c in children {
+                    if matches!(c, TemplateNode::Template { error: Some(_), .. }) {
+                        errors += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(errors, 0);
+        assert_eq!(s.get("\u{c9}x").unwrap().1, "a");
+        assert_eq!(s.get("\u{e9}x").unwrap().1, "b");
+    }
+
+    #[test]
+    fn duplicate_flag_keeps_parse_error() {
+        let d = TempDir::new("duperr");
+        d.hand_file("a", "x");
+        let bad = d.0.join("templates").join("b");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("x.toml"), "not = [valid").unwrap();
+        let s = d.store();
+        let mut seen = 0;
+        for g in s.tree() {
+            if let TemplateNode::Group { path, children, .. } = g {
+                if let TemplateNode::Template { error: Some(e), .. } = &children[0] {
+                    assert!(e.ends_with("duplicate template id: x"));
+                    if path == "b" {
+                        assert!(e.contains("; duplicate"), "{e}");
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 2);
     }
 }
