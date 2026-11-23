@@ -28,7 +28,7 @@ use llama_cpp_2::vocab::LlamaVocab;
 
 use super::logprobs::{token_info, TOP_LOGPROBS};
 use super::template::ChatTemplate;
-use super::tool_format::GemmaToolFormat;
+use super::tool_format::{ToolCallFormat, ToolCallFormats};
 use super::{
     ChatMessage, CompletionChunk, Engine, EngineError, ModelProps, Result, SamplingConfig,
     TokenizeResult,
@@ -55,8 +55,8 @@ pub struct LocalLlamaEngine {
     model: Arc<LlamaModel>,
     n_ctx: u32,
     model_name: String,
-    /// Whether the model's chat template can render tools; computed once in `load`.
-    supports_tools: bool,
+    /// The tool-call syntax the model's chat template renders tools in; detected once in `load`.
+    tool_format: Option<&'static dyn ToolCallFormat>,
 }
 
 impl LocalLlamaEngine {
@@ -91,17 +91,17 @@ impl LocalLlamaEngine {
             .map(str::to_owned)
             .unwrap_or_else(|| Self::file_stem(model_path));
 
-        let supports_tools = model
+        let tool_format = model
             .meta_val_str(CHAT_TEMPLATE_KEY)
-            .map(|src| GemmaToolFormat::template_supports(&src))
-            .unwrap_or(false);
+            .ok()
+            .and_then(|src| ToolCallFormats::detect(&src));
 
         Ok(Self {
             backend,
             model: Arc::new(model),
             n_ctx,
             model_name,
-            supports_tools,
+            tool_format,
         })
     }
 
@@ -351,8 +351,8 @@ impl Engine for LocalLlamaEngine {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    fn supports_tools(&self) -> bool {
-        self.supports_tools
+    fn tool_format(&self) -> Option<&'static dyn ToolCallFormat> {
+        self.tool_format
     }
 
     async fn apply_template(

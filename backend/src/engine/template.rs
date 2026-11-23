@@ -67,6 +67,26 @@ impl ChatTemplate {
     }
 }
 
+/// A reasoning channel a rendered prompt leaves open. Gemma 4's generation prompt opens
+/// `<|channel>thought\n` itself after a tool response when thinking is on, so the model's
+/// output starts inside the channel, without the opener.
+pub struct OpenChannel;
+
+impl OpenChannel {
+    const OPEN: &'static str = "<|channel>";
+    const CLOSE: &'static str = "<channel|>";
+
+    /// The opener text (from the last channel opener to the end) when `prompt` ends inside an
+    /// unclosed channel. The opener is the marker plus at most a channel-name line; anything
+    /// longer after it is prompt text, not an opener.
+    pub fn at_tail(prompt: &str) -> Option<&str> {
+        let tail = &prompt[prompt.rfind(Self::OPEN)?..];
+        let unclosed = !tail.contains(Self::CLOSE);
+        let one_line = !tail.trim_end_matches('\n').contains('\n');
+        (unclosed && one_line).then_some(tail)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +205,63 @@ mod tests {
             prompt.contains("<|tool_response>response:get_time{utc:<|\"|>2026-11-23T13:05:00Z<|\"|>}<tool_response|>"),
             "{prompt}"
         );
+    }
+
+    fn after_tool_response() -> Vec<ChatMessage> {
+        let mut assistant = ChatMessage::new(Role::Assistant, "");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "get_time".into(),
+                arguments: serde_json::json!({}),
+            },
+        }]);
+        let mut tool = ChatMessage::new(Role::Tool, "");
+        tool.tool_call_id = Some("call_1".into());
+        tool.tool_result = Some(serde_json::json!({"utc": "x"}));
+        vec![ChatMessage::new(Role::User, "q"), assistant, tool]
+    }
+
+    #[test]
+    fn open_channel_found_after_tool_response_with_thinking() {
+        let t = ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let tools = [time_tool()];
+        let prompt = t
+            .render(&after_tool_response(), true, true, &tools)
+            .unwrap();
+        assert_eq!(OpenChannel::at_tail(&prompt), Some("<|channel>thought\n"));
+    }
+
+    #[test]
+    fn no_open_channel_in_closed_or_absent_cases() {
+        let t = ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let tools = [time_tool()];
+        let user = vec![ChatMessage::new(Role::User, "q")];
+        // Thinking off: the generation prompt opens and closes an empty channel.
+        let off = t.render(&user, true, false, &tools).unwrap();
+        assert!(off.ends_with("<|channel>thought\n<channel|>"), "{off}");
+        assert_eq!(OpenChannel::at_tail(&off), None);
+        // Thinking on after a user message: the model opens the channel itself.
+        assert_eq!(
+            OpenChannel::at_tail(&t.render(&user, true, true, &tools).unwrap()),
+            None
+        );
+        // After a tool response without thinking: no channel at all.
+        let plain = t
+            .render(&after_tool_response(), true, false, &tools)
+            .unwrap();
+        assert_eq!(OpenChannel::at_tail(&plain), None);
+    }
+
+    #[test]
+    fn open_channel_ignores_an_unclosed_marker_followed_by_more_prompt() {
+        assert_eq!(OpenChannel::at_tail("a <|channel> b\n<|turn>model\n"), None);
+        assert_eq!(
+            OpenChannel::at_tail("x<|channel>thought\n"),
+            Some("<|channel>thought\n")
+        );
+        assert_eq!(OpenChannel::at_tail("no channels here"), None);
     }
 
     #[test]

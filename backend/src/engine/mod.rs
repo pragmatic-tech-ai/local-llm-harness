@@ -12,6 +12,8 @@ pub mod types;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+use tool_format::ToolCallFormat;
+
 #[cfg(feature = "candle")]
 pub use candle::CandleEngine;
 pub use factory::{
@@ -56,8 +58,13 @@ pub trait Engine: Send + Sync {
         tools: &[serde_json::Value],
     ) -> Result<String>;
 
+    /// The tool-call syntax this engine's chat template renders tools in, if any.
+    fn tool_format(&self) -> Option<&'static dyn ToolCallFormat> {
+        None
+    }
+
     /// Whether this engine can render tool declarations into its prompt.
     fn supports_tools(&self) -> bool {
-        false
+        self.tool_format().is_some()
     }
 }

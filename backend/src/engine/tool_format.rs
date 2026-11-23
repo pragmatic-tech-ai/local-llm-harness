@@ -1,4 +1,5 @@
-//! Gemma 4 tool-call syntax: value grammar, single-call parsing and a streaming parser.
+//! Tool-call formats: the `ToolCallFormat`/`ToolCallParser` seam the worker uses, and the
+//! Gemma 4 syntax behind it (value grammar, single-call parsing and a streaming parser).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
@@ -22,8 +23,90 @@ pub enum ParseEvent {
     ResponseMarker,
 }
 
-/// Stateless helpers for the Gemma 4 tool-call syntax.
+/// A model family's tool-call syntax, as the worker needs it: whether a chat template renders
+/// tools in it, and a parser for the model's output.
+pub trait ToolCallFormat: Send + Sync {
+    /// True iff the chat template source `src` renders tools in this syntax.
+    fn template_supports(&self, src: &str) -> bool;
+
+    /// A fresh streaming parser for one generation.
+    fn new_parser(&self) -> Box<dyn ToolCallParser>;
+}
+
+/// Streaming parser over one generation's output.
+pub trait ToolCallParser: Send {
+    /// Feeds streamed text; returns what was decided by it.
+    fn push(&mut self, text: &str) -> Vec<ParseEvent>;
+
+    /// Signals end of stream; reports anything still undecided.
+    fn finish(&mut self) -> Vec<ParseEvent>;
+
+    /// The text outside call spans.
+    fn content(&self) -> String;
+
+    /// The calls decoded so far.
+    fn calls(&self) -> Vec<ParsedCall>;
+}
+
+/// The tool-call formats the worker knows.
+pub struct ToolCallFormats;
+
+impl ToolCallFormats {
+    const KNOWN: &'static [&'static dyn ToolCallFormat] = &[&GemmaToolFormat];
+
+    /// The format a chat template renders tools in, if it is a known one.
+    pub fn detect(src: &str) -> Option<&'static dyn ToolCallFormat> {
+        Self::KNOWN
+            .iter()
+            .copied()
+            .find(|format| format.template_supports(src))
+    }
+}
+
+/// A parser for generations made without tools: every byte is content, nothing is a call.
+#[derive(Default)]
+pub struct PlainTextParser {
+    content: String,
+}
+
+impl PlainTextParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ToolCallParser for PlainTextParser {
+    fn push(&mut self, text: &str) -> Vec<ParseEvent> {
+        self.content.push_str(text);
+        Vec::new()
+    }
+
+    fn finish(&mut self) -> Vec<ParseEvent> {
+        Vec::new()
+    }
+
+    fn content(&self) -> String {
+        self.content.clone()
+    }
+
+    fn calls(&self) -> Vec<ParsedCall> {
+        Vec::new()
+    }
+}
+
+/// The Gemma 4 tool-call syntax.
 pub struct GemmaToolFormat;
+
+impl ToolCallFormat for GemmaToolFormat {
+    /// True iff the chat template mentions both `tools` and the call marker.
+    fn template_supports(&self, src: &str) -> bool {
+        src.contains("tools") && src.contains(Self::CALL_OPEN)
+    }
+
+    fn new_parser(&self) -> Box<dyn ToolCallParser> {
+        Box::new(GemmaToolParser::new())
+    }
+}
 
 impl GemmaToolFormat {
     const CALL_OPEN: &'static str = "<|tool_call>";
@@ -32,11 +115,6 @@ impl GemmaToolFormat {
     const QUOTE: &'static str = "<|\"|>";
     const CALL_PREFIX: &'static str = "call:";
     const MAX_DEPTH: usize = 64;
-
-    /// True iff the chat template mentions both `tools` and the call marker.
-    pub fn template_supports(src: &str) -> bool {
-        src.contains("tools") && src.contains(Self::CALL_OPEN)
-    }
 
     /// Parses one value of the Gemma 4 grammar; trailing non-whitespace is an error.
     pub fn parse_value(text: &str) -> Result<Value, String> {
@@ -296,7 +374,6 @@ pub struct GemmaToolParser {
     in_string: bool,
     content: String,
     calls: Vec<ParsedCall>,
-    finished: bool,
     /// Set once the stream is over (response marker or `finish()`); later pushes are ignored.
     closed: bool,
 }
@@ -322,65 +399,8 @@ impl GemmaToolParser {
             in_string: false,
             content: String::new(),
             calls: Vec::new(),
-            finished: false,
             closed: false,
         }
-    }
-
-    /// Text outside call spans, excluding held-back bytes; nothing at or after the response marker.
-    pub fn content(&self) -> String {
-        self.content.clone()
-    }
-
-    pub fn calls(&self) -> Vec<ParsedCall> {
-        self.calls.clone()
-    }
-
-    /// True once `<|tool_response>` has been seen.
-    pub fn finished(&self) -> bool {
-        self.finished
-    }
-
-    pub fn push(&mut self, text: &str) -> Vec<ParseEvent> {
-        let mut events = Vec::new();
-        if self.closed {
-            return events;
-        }
-        self.pending.push_str(text);
-        loop {
-            let progressed = match self.mode {
-                Mode::Text => self.step_text(&mut events),
-                Mode::InCall => self.step_call(&mut events),
-            };
-            if !progressed || self.closed {
-                break;
-            }
-        }
-        events
-    }
-
-    /// Signals end of stream; see the type docs for the unterminated-call behaviour.
-    pub fn finish(&mut self) -> Vec<ParseEvent> {
-        let mut events = Vec::new();
-        if self.closed {
-            return events;
-        }
-        self.closed = true;
-        match self.mode {
-            Mode::Text => {
-                let held = std::mem::take(&mut self.pending);
-                self.content.push_str(&held);
-            }
-            Mode::InCall => {
-                let body = std::mem::take(&mut self.pending);
-                let call = self.build_call(body, Some(Self::UNTERMINATED.to_string()));
-                events.push(ParseEvent::Call(call));
-                self.mode = Mode::Text;
-                self.scan_pos = 0;
-                self.in_string = false;
-            }
-        }
-        events
     }
 
     /// Releases decided text; returns true if a marker was consumed (state changed).
@@ -457,7 +477,6 @@ impl GemmaToolParser {
 
     fn end_with_response(&mut self, events: &mut Vec<ParseEvent>) {
         self.pending.clear();
-        self.finished = true;
         self.closed = true;
         events.push(ParseEvent::ResponseMarker);
     }
@@ -489,6 +508,59 @@ impl GemmaToolParser {
     }
 }
 
+impl ToolCallParser for GemmaToolParser {
+    fn push(&mut self, text: &str) -> Vec<ParseEvent> {
+        let mut events = Vec::new();
+        if self.closed {
+            return events;
+        }
+        self.pending.push_str(text);
+        loop {
+            let progressed = match self.mode {
+                Mode::Text => self.step_text(&mut events),
+                Mode::InCall => self.step_call(&mut events),
+            };
+            if !progressed || self.closed {
+                break;
+            }
+        }
+        events
+    }
+
+    /// Signals end of stream; see the type docs for the unterminated-call behaviour.
+    fn finish(&mut self) -> Vec<ParseEvent> {
+        let mut events = Vec::new();
+        if self.closed {
+            return events;
+        }
+        self.closed = true;
+        match self.mode {
+            Mode::Text => {
+                let held = std::mem::take(&mut self.pending);
+                self.content.push_str(&held);
+            }
+            Mode::InCall => {
+                let body = std::mem::take(&mut self.pending);
+                let call = self.build_call(body, Some(Self::UNTERMINATED.to_string()));
+                events.push(ParseEvent::Call(call));
+                self.mode = Mode::Text;
+                self.scan_pos = 0;
+                self.in_string = false;
+            }
+        }
+        events
+    }
+
+    /// Text outside call spans, excluding held-back bytes; nothing at or after the response marker.
+    fn content(&self) -> String {
+        self.content.clone()
+    }
+
+    fn calls(&self) -> Vec<ParsedCall> {
+        self.calls.clone()
+    }
+}
+
 impl Default for GemmaToolParser {
     fn default() -> Self {
         Self::new()
@@ -517,22 +589,17 @@ mod tests {
         /// Parses `text` whole and char-by-char; asserts both agree and returns the whole-fed parser.
         fn both(text: &str) -> GemmaToolParser {
             let mut whole = GemmaToolParser::new();
-            whole.push(text);
-            whole.finish();
+            let mut whole_events = whole.push(text);
+            whole_events.extend(whole.finish());
             let mut slow = GemmaToolParser::new();
-            Self::chars(&mut slow, text);
-            slow.finish();
+            let mut slow_events = Self::chars(&mut slow, text);
+            slow_events.extend(slow.finish());
+            assert_eq!(slow_events, whole_events, "events differ for {:?}", text);
             assert_eq!(slow.calls(), whole.calls(), "calls differ for {:?}", text);
             assert_eq!(
                 slow.content(),
                 whole.content(),
                 "content differs for {:?}",
-                text
-            );
-            assert_eq!(
-                slow.finished(),
-                whole.finished(),
-                "finished differs for {:?}",
                 text
             );
             whole
@@ -558,7 +625,6 @@ mod tests {
     fn response_marker_inside_call_ends_it_implicitly() {
         let text = "hi <|tool_call>call:get_time{}<|tool_response>response:x{}";
         let p = TestFeed::both(text);
-        assert!(p.finished());
         assert_eq!(p.content(), "hi ");
         let calls = p.calls();
         assert_eq!(calls.len(), 1);
@@ -573,8 +639,10 @@ mod tests {
 
     #[test]
     fn response_marker_inside_string_is_opaque() {
-        let p = TestFeed::both("<|tool_call>call:f{s:<|\"|>a<|tool_response>b<|\"|>}<tool_call|>");
-        assert!(!p.finished());
+        let text = "<|tool_call>call:f{s:<|\"|>a<|tool_response>b<|\"|>}<tool_call|>";
+        let p = TestFeed::both(text);
+        let events = GemmaToolParser::new().push(text);
+        assert!(!events.contains(&ParseEvent::ResponseMarker));
         assert_eq!(p.calls()[0].arguments, json!({"s":"a<|tool_response>b"}));
     }
 
@@ -779,7 +847,6 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], ParseEvent::Call(_)));
         assert_eq!(events[1], ParseEvent::ResponseMarker);
-        assert!(p.finished());
         assert!(p.push("more").is_empty());
         assert_eq!(p.content(), "");
         assert_eq!(p.calls().len(), 1);
@@ -788,9 +855,9 @@ mod tests {
     #[test]
     fn text_before_response_marker_is_content() {
         let mut p = GemmaToolParser::new();
-        TestFeed::chars(&mut p, "hi<|tool_response>junk");
+        let events = TestFeed::chars(&mut p, "hi<|tool_response>junk");
         assert_eq!(p.content(), "hi");
-        assert!(p.finished());
+        assert_eq!(events, [ParseEvent::ResponseMarker]);
     }
 
     #[test]
@@ -863,9 +930,32 @@ mod tests {
     #[test]
     fn template_supports_detects_gemma4() {
         let fixture = include_str!("../../tests/fixtures/gemma4-chat-template.jinja");
-        assert!(GemmaToolFormat::template_supports(fixture));
-        assert!(!GemmaToolFormat::template_supports(
-            "{% for m in messages %}{{m.content}}{% endfor %}"
-        ));
+        let plain = "{% for m in messages %}{{m.content}}{% endfor %}";
+        assert!(GemmaToolFormat.template_supports(fixture));
+        assert!(!GemmaToolFormat.template_supports(plain));
+        assert!(ToolCallFormats::detect(fixture).is_some());
+        assert!(ToolCallFormats::detect(plain).is_none());
+    }
+
+    #[test]
+    fn detected_format_parses_through_the_trait() {
+        let fixture = include_str!("../../tests/fixtures/gemma4-chat-template.jinja");
+        let format = ToolCallFormats::detect(fixture).expect("gemma");
+        let mut parser = format.new_parser();
+        let events = parser.push(READ_FILE);
+        assert_eq!(events.len(), 1);
+        assert_eq!(parser.calls()[0].name, "read_file");
+        assert_eq!(parser.content(), "");
+    }
+
+    #[test]
+    fn plain_text_parser_keeps_everything_as_content() {
+        let mut parser = PlainTextParser::new();
+        assert!(parser.push("hi ").is_empty());
+        assert!(parser.push(READ_FILE).is_empty());
+        assert!(parser.push("<|tool_response>x").is_empty());
+        assert!(parser.finish().is_empty());
+        assert!(parser.calls().is_empty());
+        assert_eq!(parser.content(), format!("hi {READ_FILE}<|tool_response>x"));
     }
 }

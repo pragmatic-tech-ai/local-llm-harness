@@ -10,19 +10,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::StreamExt;
-use serde::Deserialize;
 use serde_json::Value;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::net::TcpListener;
 
 use super::registry::ToolRegistry;
 use super::session::RuntimeSession;
 use super::tool_loop::{LoopSink, SinkClosed, ToolLoop};
 use super::worker::WorkerConnector;
 use crate::rpc::{
-    BoxError, Frames, Request, RpcError, SetSamplingParams, TokenizeParams, Ws,
-    ERR_METHOD_NOT_FOUND, ERR_PARSE,
+    Failure, FrameLoop, Frames, Request, RpcDispatch, RpcError, SendTurnParams, SetSamplingParams,
+    TokenizeParams, Ws, ERR_METHOD_NOT_FOUND,
 };
 
 /// Everything a connection needs besides its own session.
@@ -31,13 +28,6 @@ pub struct RuntimeDeps {
     pub connector: Arc<dyn WorkerConnector>,
     pub registry: Arc<ToolRegistry>,
     pub tool_loop: Arc<ToolLoop>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SendTurnParams {
-    content: String,
-    #[serde(default)]
-    enable_thinking: bool,
 }
 
 /// Accepts websocket connections forever; each gets its own session.
@@ -56,9 +46,9 @@ impl RuntimeServer {
                     continue;
                 }
             };
-            let connection = RuntimeConnection::new(deps.clone());
+            let mut connection = RuntimeConnection::new(deps.clone());
             tokio::spawn(async move {
-                if let Err(e) = connection.run(stream).await {
+                if let Err(e) = FrameLoop::run(&mut connection, stream).await {
                     eprintln!("runtime connection ended: {e}");
                 }
             });
@@ -99,46 +89,9 @@ impl RuntimeConnection {
         }
     }
 
-    async fn run(mut self, stream: TcpStream) -> Result<(), BoxError> {
-        let mut ws = tokio_tungstenite::accept_async(stream).await?;
-        while let Some(frame) = ws.next().await {
-            let Message::Text(text) = frame? else {
-                continue;
-            };
-            self.handle_frame(&mut ws, text.as_str()).await?;
-            if self.closed {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_frame(&mut self, ws: &mut Ws, text: &str) -> Result<(), BoxError> {
-        let request: Request = match serde_json::from_str(text) {
-            Ok(r) => r,
-            Err(e) => {
-                let err = RpcError::new(ERR_PARSE, e);
-                return Frames::send(ws, Frames::error(Value::Null, &err)).await;
-            }
-        };
-        let outcome = {
-            let mut sink = WsSink { ws: &mut *ws };
-            self.dispatch(&request.method, request.params, &mut sink)
-                .await
-        };
-        if self.closed {
-            return Ok(());
-        }
-        let frame = match outcome {
-            Ok(result) => Frames::result(request.id, result),
-            Err(err) => Frames::error(request.id, &err),
-        };
-        Frames::send(ws, frame).await
-    }
-
     /// Handles one request. Notifications go to `sink` while it runs; the returned value is the
     /// request's own response. A closed sink marks the connection finished.
-    pub(crate) async fn dispatch(
+    pub(crate) async fn handle_request(
         &mut self,
         method: &str,
         params: Value,
@@ -203,12 +156,27 @@ impl RuntimeConnection {
     }
 }
 
+#[async_trait]
+impl RpcDispatch for RuntimeConnection {
+    /// A closed client ends the connection without a reply.
+    async fn dispatch(&mut self, ws: &mut Ws, request: &Request) -> Result<Value, Failure> {
+        let mut sink = WsSink { ws };
+        let outcome = self
+            .handle_request(&request.method, request.params.clone(), &mut sink)
+            .await;
+        if self.closed {
+            return Err(Failure::Closed);
+        }
+        outcome.map_err(Failure::Rpc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::SamplingConfig;
     use crate::rpc::test_support::TestClient;
-    use crate::rpc::ERR_INVALID_PARAMS;
+    use crate::rpc::{ERR_INVALID_PARAMS, ERR_PARSE};
     use crate::runtime::executor::ToolExecutor;
     use crate::runtime::policy::ReadOnlyPolicy;
     use crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink, Scripted};
@@ -247,7 +215,7 @@ mod tests {
 
         async fn call(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
             self.connection
-                .dispatch(method, params, &mut self.sink)
+                .handle_request(method, params, &mut self.sink)
                 .await
         }
 

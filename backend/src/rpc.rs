@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::engine::tool_format::{GemmaToolParser, ParseEvent, ParsedCall};
+use crate::engine::template::OpenChannel;
+use crate::engine::tool_format::{ParseEvent, ParsedCall, PlainTextParser, ToolCallParser};
 use crate::engine::{ChatMessage, Engine, ModelProps, SamplingConfig};
 use crate::session::{ChatSession, ContextFill, TurnRejected};
 
@@ -52,11 +54,12 @@ pub(crate) struct SetSamplingParams {
     pub(crate) config: SamplingConfig,
 }
 
+/// `send_turn` params, shared by the worker and the agent runtime.
 #[derive(Debug, Deserialize)]
-struct SendTurnParams {
-    content: String,
+pub(crate) struct SendTurnParams {
+    pub(crate) content: String,
     #[serde(default)]
-    enable_thinking: bool,
+    pub(crate) enable_thinking: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,16 +119,72 @@ impl Frames {
     }
 }
 
-/// Why a request failed: a JSON-RPC error (reported to the client as an error response) or a
-/// transport failure (the socket is dead, so the connection ends without a reply).
-enum Failure {
+/// Why a request failed: a JSON-RPC error (reported to the client as an error response), a
+/// transport failure (the socket is dead, so the connection ends with that error and no
+/// reply), or the client is gone (the connection ends quietly, no reply).
+pub(crate) enum Failure {
     Rpc(RpcError),
     Transport(BoxError),
+    Closed,
 }
 
 impl From<RpcError> for Failure {
     fn from(e: RpcError) -> Self {
         Self::Rpc(e)
+    }
+}
+
+/// One JSON-RPC server's request handling; `FrameLoop` does the socket and envelope work.
+#[async_trait]
+pub(crate) trait RpcDispatch: Send {
+    /// Handles one request. Notifications may be written to `ws` while it runs; the returned
+    /// value becomes the request's response.
+    async fn dispatch(&mut self, ws: &mut Ws, request: &Request) -> Result<Value, Failure>;
+}
+
+/// The websocket frame loop shared by the worker and the agent runtime: accept, read text
+/// frames, decode the envelope, dispatch, answer.
+pub(crate) struct FrameLoop;
+
+impl FrameLoop {
+    pub(crate) async fn run<D: RpcDispatch>(
+        dispatcher: &mut D,
+        stream: TcpStream,
+    ) -> Result<(), BoxError> {
+        let mut ws = tokio_tungstenite::accept_async(stream).await?;
+        while let Some(frame) = ws.next().await {
+            let Message::Text(text) = frame? else {
+                continue;
+            };
+            if !Self::handle_frame(dispatcher, &mut ws, text.as_str()).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Answers one frame; `Ok(false)` means the connection is over.
+    async fn handle_frame<D: RpcDispatch>(
+        dispatcher: &mut D,
+        ws: &mut Ws,
+        text: &str,
+    ) -> Result<bool, BoxError> {
+        let request: Request = match serde_json::from_str(text) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = RpcError::new(ERR_PARSE, e);
+                Frames::send(ws, Frames::error(Value::Null, &err)).await?;
+                return Ok(true);
+            }
+        };
+        let frame = match dispatcher.dispatch(ws, &request).await {
+            Ok(result) => Frames::result(request.id, result),
+            Err(Failure::Rpc(err)) => Frames::error(request.id, &err),
+            Err(Failure::Transport(e)) => return Err(e),
+            Err(Failure::Closed) => return Ok(false),
+        };
+        Frames::send(ws, frame).await?;
+        Ok(true)
     }
 }
 
@@ -145,14 +204,14 @@ pub async fn serve(
                 continue;
             }
         };
-        let connection = Connection {
+        let mut connection = Connection {
             engine: Arc::clone(&engine),
             props: props.clone(),
             session: ChatSession::new(Arc::clone(&engine), props.clone(), system.clone()),
             sampling: SamplingConfig::default(),
         };
         tokio::spawn(async move {
-            if let Err(e) = connection.run(stream).await {
+            if let Err(e) = FrameLoop::run(&mut connection, stream).await {
                 eprintln!("connection ended: {e}");
             }
         });
@@ -167,36 +226,8 @@ struct Connection {
     sampling: SamplingConfig,
 }
 
-impl Connection {
-    const TOOLS_UNSUPPORTED: &'static str = "tools are not supported by this engine";
-
-    async fn run(mut self, stream: TcpStream) -> Result<(), BoxError> {
-        let mut ws = tokio_tungstenite::accept_async(stream).await?;
-        while let Some(frame) = ws.next().await {
-            let Message::Text(text) = frame? else {
-                continue;
-            };
-            self.handle_frame(&mut ws, text.as_str()).await?;
-        }
-        Ok(())
-    }
-
-    async fn handle_frame(&mut self, ws: &mut Ws, text: &str) -> Result<(), BoxError> {
-        let request: Request = match serde_json::from_str(text) {
-            Ok(r) => r,
-            Err(e) => {
-                let err = RpcError::new(ERR_PARSE, e);
-                return Frames::send(ws, Frames::error(Value::Null, &err)).await;
-            }
-        };
-        let frame = match self.dispatch(ws, &request).await {
-            Ok(result) => Frames::result(request.id, result),
-            Err(Failure::Rpc(err)) => Frames::error(request.id, &err),
-            Err(Failure::Transport(e)) => return Err(e),
-        };
-        Frames::send(ws, frame).await
-    }
-
+#[async_trait]
+impl RpcDispatch for Connection {
     async fn dispatch(&mut self, ws: &mut Ws, req: &Request) -> Result<Value, Failure> {
         match req.method.as_str() {
             // Send the clean client shape {n_ctx, model_name}; ModelProps's own Serialize goes
@@ -236,6 +267,10 @@ impl Connection {
             }
         }
     }
+}
+
+impl Connection {
+    const TOOLS_UNSUPPORTED: &'static str = "tools are not supported by this engine";
 
     fn to_value<T: Serialize>(v: &T) -> Result<Value, RpcError> {
         serde_json::to_value(v).map_err(RpcError::internal)
@@ -279,12 +314,20 @@ impl Connection {
     }
 
     /// Stateless turn: renders `p.messages` (with `p.tools`), checks the window, streams the
-    /// reply and parses Gemma 4 tool calls out of it. Nothing is stored on the connection.
+    /// reply and, when tools were offered, parses tool calls out of it with the engine's
+    /// `ToolCallFormat`. Nothing is stored on the connection.
     ///
     /// Wire contract:
     /// - Non-empty `tools` on an engine whose `supports_tools()` is false yields a single
     ///   `turn_error {message: "tools are not supported by this engine"}` before anything else
     ///   (no `turn_started`, no render, no `complete`).
+    /// - Without tools the reply is plain text: no `tool_call` notes, no cut at a response
+    ///   marker, `turn_done.tool_calls` is empty.
+    /// - If the rendered prompt ends inside an open reasoning channel (Gemma 4 opens
+    ///   `<|channel>thought\n` itself after a tool response when thinking is on), the model's
+    ///   output starts inside it; `turn_done.content` is prefixed with that opener so the text
+    ///   is self-contained and the template can strip the reasoning from history. Relayed
+    ///   `turn_chunk`s stay raw.
     /// - Every engine chunk is relayed raw as `turn_chunk {text, tokens, stop}`, including the
     ///   chunk that carries the response marker; that chunk keeps the engine's own `stop` flag
     ///   (normally false, since the engine is cut off mid-stream). Chunks after it are never
@@ -323,7 +366,7 @@ impl Connection {
             Err(e) => return Self::turn_error(ws, e).await,
         };
 
-        let mut parser = GemmaToolParser::new();
+        let mut parser = self.parser_for(&tools);
         while let Some(item) = stream.next().await {
             let chunk = match item {
                 Ok(chunk) => chunk,
@@ -351,8 +394,18 @@ impl Connection {
                 Self::notify_call(ws, &call).await?;
             }
         }
-        let done = json!({"content": parser.content(), "tool_calls": parser.calls()});
+        let opener = OpenChannel::at_tail(&prompt).unwrap_or_default();
+        let content = format!("{opener}{}", parser.content());
+        let done = json!({"content": content, "tool_calls": parser.calls()});
         Self::notify(ws, "turn_done", done).await
+    }
+
+    /// The engine's tool-call parser when tools were offered; plain text otherwise.
+    fn parser_for(&self, tools: &[Value]) -> Box<dyn ToolCallParser> {
+        match self.engine.tool_format() {
+            Some(format) if !tools.is_empty() => format.new_parser(),
+            _ => Box::new(PlainTextParser::new()),
+        }
     }
 
     async fn notify_call(ws: &mut Ws, call: &ParsedCall) -> Result<(), Failure> {
@@ -380,6 +433,8 @@ impl Connection {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use crate::engine::template::ChatTemplate;
+    use crate::engine::tool_format::{GemmaToolFormat, ToolCallFormat};
     use crate::engine::{CompletionChunk, TokenizeResult};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
@@ -388,11 +443,13 @@ pub(crate) mod test_support {
     use tokio_tungstenite::MaybeTlsStream;
 
     /// An `Engine` that replays scripted chunks. `apply_template` records the `tools` it is
-    /// given and returns `"PROMPT"`; `tokenize` reports a configurable count.
+    /// given and returns `"PROMPT"` (or renders through a real template, see
+    /// `with_template`); `tokenize` reports a configurable count.
     pub(crate) struct FakeEngine {
         chunks: Vec<String>,
         token_count: usize,
         supports_tools: bool,
+        template: Option<ChatTemplate>,
         recorded_tools: Mutex<Vec<Vec<Value>>>,
         pulled: Arc<AtomicUsize>,
         dropped: Arc<AtomicBool>,
@@ -435,6 +492,7 @@ pub(crate) mod test_support {
                 chunks: chunks.iter().map(|c| c.to_string()).collect(),
                 token_count: 10,
                 supports_tools: false,
+                template: None,
                 recorded_tools: Mutex::new(Vec::new()),
                 pulled: Arc::new(AtomicUsize::new(0)),
                 dropped: Arc::new(AtomicBool::new(false)),
@@ -456,8 +514,15 @@ pub(crate) mod test_support {
             self
         }
 
+        /// With tool support the fake speaks the Gemma 4 tool-call format.
         pub(crate) fn with_tools_support(mut self, supports_tools: bool) -> Self {
             self.supports_tools = supports_tools;
+            self
+        }
+
+        /// `apply_template` renders through this real chat template instead of `"PROMPT"`.
+        pub(crate) fn with_template(mut self, src: &str) -> Self {
+            self.template = Some(ChatTemplate::from_jinja(src).expect("template"));
             self
         }
 
@@ -501,20 +566,29 @@ pub(crate) mod test_support {
 
         async fn apply_template(
             &self,
-            _messages: &[crate::engine::ChatMessage],
-            _add_generation_prompt: bool,
-            _enable_thinking: bool,
+            messages: &[crate::engine::ChatMessage],
+            add_generation_prompt: bool,
+            enable_thinking: bool,
             tools: &[Value],
         ) -> crate::engine::Result<String> {
             self.recorded_tools
                 .lock()
                 .expect("tools lock")
                 .push(tools.to_vec());
-            Ok("PROMPT".to_string())
+            let Some(template) = &self.template else {
+                return Ok("PROMPT".to_string());
+            };
+            template
+                .render(messages, add_generation_prompt, enable_thinking, tools)
+                .map_err(|e| crate::engine::EngineError::Protocol(e.to_string()))
         }
 
-        fn supports_tools(&self) -> bool {
-            self.supports_tools
+        fn tool_format(&self) -> Option<&'static dyn ToolCallFormat> {
+            if self.supports_tools {
+                Some(&GemmaToolFormat as &'static dyn ToolCallFormat)
+            } else {
+                None
+            }
         }
     }
 
@@ -626,8 +700,32 @@ mod tests {
     struct Harness;
 
     impl Harness {
+        const GEMMA4: &'static str = include_str!("../tests/fixtures/gemma4-chat-template.jinja");
+
         fn messages() -> Value {
             json!([{"role": "user", "content": "hi"}])
+        }
+
+        fn tools() -> Value {
+            json!([{"type": "function", "function": {"name": "get_time"}}])
+        }
+
+        /// A tool-capable fake replaying `chunks`.
+        fn tool_engine(chunks: &[&str]) -> FakeEngine {
+            FakeEngine::new(chunks).with_tools_support(true)
+        }
+
+        /// `generate` params offering the `get_time` tool.
+        fn with_tools() -> Value {
+            json!({"messages": Self::messages(), "tools": Self::tools()})
+        }
+
+        /// The prompt of the (single) `turn_started` in `notes`.
+        fn prompt_of(notes: &[Value]) -> String {
+            TestClient::params_of(notes, "turn_started")[0]["prompt"]
+                .as_str()
+                .expect("prompt")
+                .to_string()
         }
 
         async fn generate(engine: FakeEngine, n_ctx: usize, params: Value) -> (Vec<Value>, Value) {
@@ -658,9 +756,8 @@ mod tests {
 
     #[tokio::test]
     async fn generate_emits_tool_call_and_stops_at_response_marker() {
-        let engine = FakeEngine::new(&MARKER_CHUNKS);
-        let params = json!({"messages": Harness::messages()});
-        let (notes, _) = Harness::generate(engine, 8192, params).await;
+        let engine = Harness::tool_engine(&MARKER_CHUNKS);
+        let (notes, _) = Harness::generate(engine, 8192, Harness::with_tools()).await;
         let calls = TestClient::params_of(&notes, "tool_call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["id"], "call_1");
@@ -674,9 +771,8 @@ mod tests {
 
     #[tokio::test]
     async fn generate_stops_at_response_marker_without_call() {
-        let engine = FakeEngine::new(&["Hi", "<|tool_response>", "response:x{}"]);
-        let params = json!({"messages": Harness::messages()});
-        let (notes, _) = Harness::generate(engine, 8192, params).await;
+        let engine = Harness::tool_engine(&["Hi", "<|tool_response>", "response:x{}"]);
+        let (notes, _) = Harness::generate(engine, 8192, Harness::with_tools()).await;
         assert_eq!(TestClient::params_of(&notes, "turn_chunk").len(), 2);
         let done = &TestClient::params_of(&notes, "turn_done")[0];
         assert_eq!(done["content"], "Hi");
@@ -685,10 +781,9 @@ mod tests {
 
     #[tokio::test]
     async fn generate_drops_the_stream_at_response_marker() {
-        let engine = Arc::new(FakeEngine::new(&MARKER_CHUNKS));
+        let engine = Arc::new(Harness::tool_engine(&MARKER_CHUNKS));
         let mut client = TestClient::connect(engine.clone(), 8192).await;
-        let params = json!({"messages": Harness::messages()});
-        let (notes, _) = client.request("generate", params).await;
+        let (notes, _) = client.request("generate", Harness::with_tools()).await;
         assert_eq!(TestClient::params_of(&notes, "turn_chunk").len(), 4);
         // The marker is the 4th chunk; the 5th must never have been pulled.
         assert_eq!(engine.pulled_chunks(), 4);
@@ -714,9 +809,8 @@ mod tests {
 
     #[tokio::test]
     async fn generate_reports_unterminated_call_at_end_of_stream() {
-        let engine = FakeEngine::new(&["Hi ", "<|tool_call>call:get_time{"]);
-        let params = json!({"messages": Harness::messages()});
-        let (notes, _) = Harness::generate(engine, 8192, params).await;
+        let engine = Harness::tool_engine(&["Hi ", "<|tool_call>call:get_time{"]);
+        let (notes, _) = Harness::generate(engine, 8192, Harness::with_tools()).await;
         let calls = TestClient::params_of(&notes, "tool_call");
         assert_eq!(calls.len(), 1);
         assert!(calls[0]["parse_error"].is_string());
@@ -752,6 +846,65 @@ mod tests {
         assert_eq!(
             engine.recorded_tools(),
             vec![tools.as_array().cloned().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_without_tools_does_not_parse_calls() {
+        let engine = Arc::new(Harness::tool_engine(&MARKER_CHUNKS));
+        let mut client = TestClient::connect(engine.clone(), 8192).await;
+        let params = json!({"messages": Harness::messages()});
+        let (notes, _) = client.request("generate", params).await;
+        assert!(TestClient::params_of(&notes, "tool_call").is_empty());
+        assert_eq!(TestClient::params_of(&notes, "turn_chunk").len(), 5);
+        assert_eq!(engine.pulled_chunks(), 5);
+        let done = &TestClient::params_of(&notes, "turn_done")[0];
+        assert_eq!(done["content"], MARKER_CHUNKS.concat());
+        assert_eq!(done["tool_calls"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn generate_restores_the_open_thinking_channel_in_turn_done() {
+        let chunks = ["The clock reads 14:05.", "<channel|>", "It's 14:05."];
+        let engine = Harness::tool_engine(&chunks).with_template(Harness::GEMMA4);
+        let mut client = TestClient::connect(Arc::new(engine), 8192).await;
+        let tools = json!([{"type": "function", "function": {
+            "name": "get_time", "description": "Current time",
+            "parameters": {"type": "object", "properties": {}}}}]);
+        let mut messages = vec![
+            json!({"role": "user", "content": "time?"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "call_1",
+                "type": "function", "function": {"name": "get_time", "arguments": {}}}]}),
+            json!({"role": "tool", "content": "", "tool_call_id": "call_1",
+                "tool_result": {"utc": "2026-11-23T13:05:00Z"}}),
+        ];
+        let params = json!({"messages": messages, "tools": tools, "enable_thinking": true});
+        let (notes, _) = client.request("generate", params).await;
+        let step1 = Harness::prompt_of(&notes);
+        assert!(
+            step1.ends_with("<tool_response|><|channel>thought\n"),
+            "{step1}"
+        );
+        let relayed = TestClient::params_of(&notes, "turn_chunk");
+        assert_eq!(relayed[0]["text"], "The clock reads 14:05.");
+        let done = &TestClient::params_of(&notes, "turn_done")[0];
+        assert_eq!(
+            done["content"],
+            "<|channel>thought\nThe clock reads 14:05.<channel|>It's 14:05."
+        );
+
+        // The answer goes into history as content; the next prompt must not show the reasoning.
+        messages.push(json!({"role": "assistant", "content": done["content"]}));
+        messages.push(json!({"role": "user", "content": "thanks"}));
+        let params = json!({"messages": messages, "tools": tools, "enable_thinking": true});
+        let (notes, _) = client.request("generate", params).await;
+        let step2 = Harness::prompt_of(&notes);
+        assert!(!step2.contains("The clock reads"), "{step2}");
+        assert!(
+            step2.ends_with(
+                "<tool_response|>It's 14:05.<turn|>\n<|turn>user\nthanks<turn|>\n<|turn>model\n"
+            ),
+            "{step2}"
         );
     }
 
