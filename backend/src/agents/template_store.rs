@@ -1,6 +1,6 @@
 //! File-backed store of agent templates: a directory tree of TOML files, directories are groups.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,8 @@ const ERR_NOT_EMPTY: &str = "group is not empty";
 const ERR_TEMPLATE_NOT_FOUND: &str = "template not found";
 const ERR_GROUP_NOT_FOUND: &str = "group not found";
 const ERR_GROUP_EXISTS: &str = "group already exists";
+const ERR_DUPLICATE: &str = "duplicate template id: ";
+const RENAME_TMP: &str = "rename-tmp";
 const ERR_LOCK: &str = "template store lock poisoned";
 
 /// An error from the template store; the message is user-presentable.
@@ -71,10 +73,41 @@ pub enum TemplateNode {
 }
 
 impl TemplateNode {
-    fn sort_key(&self) -> (u8, String) {
+    /// Groups first, then by name; the path (and id) break ties so ordering is deterministic.
+    fn sort_key(&self) -> (u8, String, String, String) {
         match self {
-            TemplateNode::Group { name, .. } => (0, name.to_lowercase()),
-            TemplateNode::Template { name, .. } => (1, name.to_lowercase()),
+            TemplateNode::Group { name, path, .. } => {
+                (0, name.to_lowercase(), path.clone(), String::new())
+            }
+            TemplateNode::Template { name, path, id, .. } => {
+                (1, name.to_lowercase(), path.clone(), id.clone())
+            }
+        }
+    }
+
+    /// Counts template ids (case-insensitively) across the whole tree.
+    fn count_ids(nodes: &[TemplateNode], counts: &mut HashMap<String, usize>) {
+        for n in nodes {
+            match n {
+                TemplateNode::Group { children, .. } => Self::count_ids(children, counts),
+                TemplateNode::Template { id, .. } => {
+                    *counts.entry(id.to_lowercase()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    /// Marks every template whose id occurs more than once with a duplicate error.
+    fn flag_duplicates(nodes: &mut [TemplateNode], counts: &HashMap<String, usize>) {
+        for n in nodes {
+            match n {
+                TemplateNode::Group { children, .. } => Self::flag_duplicates(children, counts),
+                TemplateNode::Template { id, error, .. } => {
+                    if counts.get(&id.to_lowercase()).copied().unwrap_or(0) > 1 {
+                        *error = Some(format!("{ERR_DUPLICATE}{id}"));
+                    }
+                }
+            }
         }
     }
 }
@@ -130,8 +163,14 @@ impl TemplateStore {
         }
     }
 
+    /// The whole tree. Templates whose id (file stem) occurs more than once anywhere in the tree
+    /// are all flagged with `duplicate template id: {id}`.
     pub fn tree(&self) -> Vec<TemplateNode> {
-        Self::read_level(&self.root, "")
+        let mut nodes = Self::read_level(&self.root, "");
+        let mut counts = HashMap::new();
+        TemplateNode::count_ids(&nodes, &mut counts);
+        TemplateNode::flag_duplicates(&mut nodes, &counts);
+        nodes
     }
 
     fn read_level(dir: &Path, rel: &str) -> Vec<TemplateNode> {
@@ -211,6 +250,10 @@ impl TemplateStore {
             None => (self.unique_id(&t.name), None),
         };
         fs::create_dir_all(&dir)?;
+        // When the template moves between groups the new file is written first and the old one
+        // removed after. A crash in between leaves the id in two groups; `tree` then flags both
+        // as duplicates and `locate` refuses the id until the user deletes or renames one file
+        // by hand (and refreshes). That is preferred to losing the template.
         Self::write_atomic(&dir, &id, t)?;
         if let Some(old) = old {
             if old != dir.join(format!("{id}.{EXT}")) {
@@ -243,7 +286,22 @@ impl TemplateStore {
         if !dir.is_dir() {
             return Err(TemplateError::of(ERR_GROUP_NOT_FOUND));
         }
+        let current = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if current == new_name {
+            return Ok(());
+        }
         let target = dir.with_file_name(new_name);
+        if current.to_lowercase() == new_name.to_lowercase() {
+            // Case-only rename: on a case-insensitive filesystem the target "exists" (it is the
+            // source), so go through a temporary name.
+            let temp = dir.with_file_name(format!(".{new_name}.{RENAME_TMP}"));
+            fs::rename(&dir, &temp)?;
+            fs::rename(&temp, &target)?;
+            return Ok(());
+        }
         if target.exists() {
             return Err(TemplateError::of(ERR_GROUP_EXISTS));
         }
@@ -284,11 +342,34 @@ impl TemplateStore {
             .map_err(|_| TemplateError::of(ERR_LOCK))
     }
 
-    fn valid_segment(s: &str) -> bool {
-        !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', ':']) && !s.ends_with('.')
+    /// True for Windows device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9), case-insensitive,
+    /// with or without an extension.
+    fn is_reserved(s: &str) -> bool {
+        let stem = s.split('.').next().unwrap_or_default().trim_end();
+        let up = stem.to_ascii_uppercase();
+        if matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+            return true;
+        }
+        let digit = |p: &str| {
+            up.strip_prefix(p)
+                .is_some_and(|d| matches!(d.as_bytes(), [b'1'..=b'9']))
+        };
+        digit("COM") || digit("LPT")
     }
 
-    /// Resolves a `/`-separated relative group path to a directory under the root.
+    fn valid_segment(s: &str) -> bool {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && !s.contains(['/', '\\', ':'])
+            && !s.ends_with('.')
+            && !s.ends_with(' ')
+            && !Self::is_reserved(s)
+    }
+
+    /// Resolves a `/`-separated relative group path to a directory under the root. The empty
+    /// string is the root. Trailing slashes (`a/`), leading slashes, empty segments, `..`,
+    /// drive prefixes and reserved names are all rejected with `invalid path`.
     fn dir_for(&self, path: &str) -> Result<PathBuf, TemplateError> {
         let mut dir = self.root.clone();
         if path.is_empty() {
@@ -304,34 +385,42 @@ impl TemplateStore {
     }
 
     /// Finds the file for `id` anywhere in the tree: (file path, relative group path).
+    /// Any id that is a valid path segment without `.` is accepted, so hand-named files such as
+    /// `My Agent.toml` work. An id present in more than one group is refused with
+    /// `duplicate template id: {id}` (for every operation, `delete` and `move_template`
+    /// included: the user resolves it by renaming or deleting one file by hand and refreshing).
     fn locate(&self, id: &str) -> Result<(PathBuf, String), TemplateError> {
         let not_found = || TemplateError(format!("{ERR_TEMPLATE_NOT_FOUND}: {id}"));
-        if id.is_empty() || Self::slugify(id) != id {
+        if !Self::valid_segment(id) || id.contains('.') {
             return Err(not_found());
         }
-        Self::find(&self.root, "", &format!("{id}.{EXT}")).ok_or_else(not_found)
+        let mut found = Vec::new();
+        Self::find(&self.root, "", &format!("{id}.{EXT}"), &mut found);
+        match found.len() {
+            0 => Err(not_found()),
+            1 => Ok(found.remove(0)),
+            _ => Err(TemplateError(format!("{ERR_DUPLICATE}{id}"))),
+        }
     }
 
-    fn find(dir: &Path, rel: &str, file_name: &str) -> Option<(PathBuf, String)> {
-        let direct = dir.join(file_name);
-        if direct.is_file() {
-            return Some((direct, rel.to_string()));
-        }
-        for entry in fs::read_dir(dir).ok()?.flatten() {
+    fn find(dir: &Path, rel: &str, file_name: &str, out: &mut Vec<(PathBuf, String)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
             let p = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
             if p.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
                 let child = if rel.is_empty() {
                     name
                 } else {
                     format!("{rel}/{name}")
                 };
-                if let Some(found) = Self::find(&p, &child, file_name) {
-                    return Some(found);
-                }
+                Self::find(&p, &child, file_name, out);
+            } else if name.eq_ignore_ascii_case(file_name) {
+                out.push((p, rel.to_string()));
             }
         }
-        None
     }
 
     fn collect_ids(dir: &Path, out: &mut HashSet<String>) {
@@ -344,18 +433,22 @@ impl TemplateStore {
                 Self::collect_ids(&p, out);
             } else if p.extension().and_then(|e| e.to_str()) == Some(EXT) {
                 if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    out.insert(stem.to_string());
+                    out.insert(stem.to_lowercase());
                 }
             }
         }
     }
 
+    /// A fresh slug id for `name`. A slug that is a Windows reserved name gets a `-agent`
+    /// suffix (`con` becomes `con-agent`).
     fn unique_id(&self, name: &str) -> String {
         let mut taken = HashSet::new();
         Self::collect_ids(&self.root, &mut taken);
         let base = Self::slugify(name);
         let base = if base.is_empty() {
             FALLBACK_SLUG.to_string()
+        } else if Self::is_reserved(&base) {
+            format!("{base}-{FALLBACK_SLUG}")
         } else {
             base
         };
@@ -385,8 +478,12 @@ impl TemplateStore {
         let body = toml::to_string_pretty(t)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let tmp = dir.join(format!(".{id}.{EXT}.{TMP_EXT}"));
-        fs::write(&tmp, body)?;
-        fs::rename(&tmp, dir.join(format!("{id}.{EXT}")))
+        let result =
+            fs::write(&tmp, body).and_then(|_| fs::rename(&tmp, dir.join(format!("{id}.{EXT}"))));
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
     }
 }
 
@@ -606,5 +703,199 @@ mod tests {
         let mut t = s.get("default").unwrap().0;
         t.name = "Renamed".into();
         assert_eq!(s.save(Some("default"), "Samples", &t).unwrap(), "default");
+    }
+
+    fn invalid() -> TemplateError {
+        TemplateError("invalid path".into())
+    }
+
+    fn hand_file(d: &TempDir, rel: &str, name: &str) {
+        let dir = d.0.join("templates").join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        let body = toml::to_string_pretty(&TempDir::sample(name)).unwrap();
+        fs::write(dir.join(format!("{name}.toml")), body).unwrap();
+    }
+
+    #[test]
+    fn hand_named_file_is_fully_usable() {
+        let d = TempDir::new("hand");
+        let root = d.0.join("templates");
+        fs::create_dir_all(&root).unwrap();
+        hand_file(&d, "", "My Agent");
+        let s = d.store();
+        assert_eq!(s.tree().len(), 1, "root is non-empty so no seed");
+        assert!(
+            matches!(&s.tree()[0], TemplateNode::Template { id, error: None, .. } if id == "My Agent")
+        );
+        assert_eq!(s.get("My Agent").unwrap().1, "");
+        let mut t = TempDir::sample("Renamed");
+        t.name = "Renamed".into();
+        assert_eq!(s.save(Some("My Agent"), "g", &t).unwrap(), "My Agent");
+        assert_eq!(s.get("My Agent").unwrap().1, "g");
+        s.move_template("My Agent", "h").unwrap();
+        s.delete("My Agent").unwrap();
+        assert!(s.get("My Agent").is_err());
+    }
+
+    #[test]
+    fn duplicate_ids_are_flagged_and_refused() {
+        let d = TempDir::new("dup");
+        hand_file(&d, "a", "x");
+        hand_file(&d, "b", "x");
+        let s = d.store();
+        let msg = "duplicate template id: x";
+        let flat = |nodes: &[TemplateNode]| {
+            nodes
+                .iter()
+                .flat_map(|n| match n {
+                    TemplateNode::Group { children, .. } => children.clone(),
+                    t => vec![t.clone()],
+                })
+                .collect::<Vec<_>>()
+        };
+        let leaves = flat(&s.tree());
+        assert_eq!(leaves.len(), 2);
+        for l in leaves {
+            assert!(matches!(l, TemplateNode::Template { error: Some(e), .. } if e == msg));
+        }
+        assert_eq!(s.get("x"), Err(TemplateError(msg.into())));
+        assert_eq!(s.delete("x"), Err(TemplateError(msg.into())));
+        assert_eq!(s.move_template("x", "c"), Err(TemplateError(msg.into())));
+    }
+
+    #[test]
+    fn group_rename_same_name_and_case_only() {
+        let d = TempDir::new("case");
+        let s = d.store();
+        s.rename_group("Examples", "Examples").unwrap();
+        assert_eq!(s.get("default").unwrap().1, "Examples");
+        s.rename_group("Examples", "examples").unwrap();
+        assert_eq!(s.get("default").unwrap().1, "examples");
+        assert!(matches!(&s.tree()[0], TemplateNode::Group { name, .. } if name == "examples"));
+        s.create_group("other").unwrap();
+        assert_eq!(
+            s.rename_group("other", "examples"),
+            Err(TemplateError("group already exists".into()))
+        );
+    }
+
+    #[test]
+    fn reserved_names_are_rejected_or_suffixed() {
+        let d = TempDir::new("resv");
+        let s = d.store();
+        for bad in [
+            "con", "AUX", "Com1", "lpt9.txt", "nul", "trail ", "dots.", "a/prn",
+        ] {
+            assert_eq!(s.create_group(bad), Err(invalid()), "{bad}");
+        }
+        s.create_group("com10").unwrap();
+        assert_eq!(
+            s.save(None, "", &TempDir::sample("CON")).unwrap(),
+            "con-agent"
+        );
+        assert_eq!(
+            s.save(None, "", &TempDir::sample("com1")).unwrap(),
+            "com1-agent"
+        );
+    }
+
+    #[test]
+    fn failed_write_removes_tmp_file() {
+        let d = TempDir::new("tmp");
+        let s = d.store();
+        let dir = d.0.join("templates");
+        fs::create_dir_all(dir.join("x.toml")).unwrap();
+        assert!(TemplateStore::write_atomic(&dir, "x", &TempDir::sample("x")).is_err());
+        assert!(!dir.join(".x.toml.tmp").exists());
+        drop(s);
+    }
+
+    #[test]
+    fn save_unknown_id_is_not_found() {
+        let d = TempDir::new("nope");
+        let s = d.store();
+        assert_eq!(
+            s.save(Some("nope"), "", &TempDir::sample("n")),
+            Err(TemplateError("template not found: nope".into()))
+        );
+    }
+
+    #[test]
+    fn id_is_stable_across_name_change() {
+        let d = TempDir::new("stable");
+        let s = d.store();
+        let id = s.save(None, "", &TempDir::sample("First")).unwrap();
+        let mut t = TempDir::sample("Second");
+        t.name = "Second".into();
+        assert_eq!(s.save(Some(&id), "", &t).unwrap(), id);
+        assert_eq!(s.get(&id).unwrap().0.name, "Second");
+        assert!(d.0.join("templates").join(format!("{id}.toml")).is_file());
+    }
+
+    #[test]
+    fn rename_and_move_reject_bad_paths_and_names() {
+        let d = TempDir::new("badpath");
+        let s = d.store();
+        for bad in ["../x", "/x", "C:/x", "Examples/"] {
+            assert_eq!(s.move_template("default", bad), Err(invalid()), "{bad}");
+            assert_eq!(s.rename_group(bad, "n"), Err(invalid()), "{bad}");
+        }
+        for bad in ["", "..", "a/b", "C:x", "con"] {
+            assert_eq!(s.rename_group("Examples", bad), Err(invalid()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn concurrent_saves_get_unique_ids() {
+        let d = TempDir::new("conc");
+        let s = d.store();
+        let ids: Vec<String> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| sc.spawn(|| s.save(None, "", &TempDir::sample("Same")).unwrap()))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let set: HashSet<_> = ids.iter().collect();
+        assert_eq!(set.len(), 8);
+    }
+
+    #[test]
+    fn root_with_only_empty_groups_is_not_seeded() {
+        let d = TempDir::new("emptyg");
+        fs::create_dir_all(d.0.join("templates").join("empty")).unwrap();
+        let s = d.store();
+        assert_eq!(s.tree().len(), 1);
+        assert!(s.get("default").is_err());
+    }
+
+    #[test]
+    fn seed_falls_back_to_first_llamacpp_model() {
+        let d = TempDir::new("fallback");
+        let rules = TemplateRules {
+            runtimes: vec!["llamacpp".into(), "candle".into()],
+            models: vec![
+                ("only-candle".into(), vec!["candle".into()]),
+                ("alpha".into(), vec!["candle".into(), "llamacpp".into()]),
+                ("beta".into(), vec!["llamacpp".into()]),
+            ],
+            tools: vec![],
+        };
+        let s = TemplateStore::open(&d.0.join("templates"), rules).unwrap();
+        assert_eq!(s.get("default").unwrap().0.model, "alpha");
+    }
+
+    #[test]
+    fn sort_ties_break_on_path() {
+        let node = |id: &str, path: &str| TemplateNode::Template {
+            id: id.into(),
+            path: path.into(),
+            name: "Same".into(),
+            runtime: String::new(),
+            model: String::new(),
+            error: None,
+        };
+        let mut nodes = vec![node("a", "z"), node("a", "y")];
+        nodes.sort_by_key(TemplateNode::sort_key);
+        assert!(matches!(&nodes[0], TemplateNode::Template { path, .. } if path == "y"));
     }
 }
