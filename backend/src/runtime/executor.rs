@@ -100,6 +100,10 @@ impl ToolExecutor {
             // A panicking tool is reported as data, not unwound into the caller.
             Ok(Err(e)) => ToolOutcome::Err(format!("tool panicked: {e}")),
             Err(_) => {
+                // Aborting only cancels the async task. Work a tool handed to
+                // `spawn_blocking` (the file tools do) cannot be interrupted: it runs to
+                // completion on the blocking pool and its result is dropped. Tools that must be
+                // stoppable have to check for cancellation themselves.
                 handle.abort();
                 ToolOutcome::Err(Self::timeout_message(self.timeout))
             }
