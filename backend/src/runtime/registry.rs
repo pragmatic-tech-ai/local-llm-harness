@@ -15,24 +15,32 @@ pub enum RegistryError {
 /// Named collection of tools, preserving source order.
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
+    specs: Vec<ToolSpec>,
     index: HashMap<String, usize>,
 }
 
 impl ToolRegistry {
     pub fn new(sources: Vec<Box<dyn ToolSource>>) -> Result<Self, RegistryError> {
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut specs: Vec<ToolSpec> = Vec::new();
         let mut index = HashMap::new();
         for source in &sources {
             for tool in source.tools() {
-                let name = tool.spec().name;
+                let spec = tool.spec();
+                let name = spec.name.clone();
                 if index.contains_key(&name) {
                     return Err(RegistryError::Duplicate(name));
                 }
                 index.insert(name, tools.len());
+                specs.push(spec);
                 tools.push(tool);
             }
         }
-        Ok(Self { tools, index })
+        Ok(Self {
+            tools,
+            specs,
+            index,
+        })
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -40,7 +48,7 @@ impl ToolRegistry {
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|t| t.spec()).collect()
+        self.specs.clone()
     }
 
     /// Tool list in the OpenAI chat-completions `tools` shape.

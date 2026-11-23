@@ -46,6 +46,7 @@ impl SchemaCheck {
             "boolean" => value.is_boolean(),
             "object" => value.is_object(),
             "array" => value.is_array(),
+            // Unknown or unsupported schema types (e.g. "null") are not enforced.
             _ => true,
         }
     }
@@ -92,13 +93,21 @@ impl ToolExecutor {
         let ctx = ToolContext {
             call_id: call.id.clone(),
         };
-        match tokio::time::timeout(self.timeout, tool.call(call.arguments.clone(), &ctx)).await {
-            Ok(outcome) => outcome,
-            Err(_) => ToolOutcome::Err(format!(
-                "tool timed out after {}s",
-                self.timeout.as_secs_f64()
-            )),
+        let call_args = call.arguments.clone();
+        let mut handle = tokio::spawn(async move { tool.call(call_args, &ctx).await });
+        match tokio::time::timeout(self.timeout, &mut handle).await {
+            Ok(Ok(outcome)) => outcome,
+            // A panicking tool is reported as data, not unwound into the caller.
+            Ok(Err(e)) => ToolOutcome::Err(format!("tool panicked: {e}")),
+            Err(_) => {
+                handle.abort();
+                ToolOutcome::Err(Self::timeout_message(self.timeout))
+            }
         }
+    }
+
+    pub fn timeout_message(timeout: Duration) -> String {
+        format!("tool timed out after {}s", timeout.as_secs_f64())
     }
 }
 
@@ -108,7 +117,17 @@ mod tests {
     use crate::runtime::policy::ReadOnlyPolicy;
     use crate::runtime::test_tools::TestSource;
     use crate::runtime::tool::ToolSource;
+    use crate::runtime::tool::ToolSpec;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct AskPolicy;
+
+    impl ToolPolicy for AskPolicy {
+        fn decide(&self, _spec: &ToolSpec, _args: &Value) -> Decision {
+            Decision::Ask
+        }
+    }
 
     struct Fixture;
 
@@ -175,13 +194,57 @@ mod tests {
         let ex = Fixture::executor(TestSource::slow_boxed(), Duration::from_millis(50));
         let out = ex.execute(&Fixture::call("slow", json!({}))).await;
         assert_eq!(out, ToolOutcome::Err("tool timed out after 0.05s".into()));
+    }
+
+    #[test]
+    fn timeout_message_renders_seconds() {
         assert_eq!(
-            format!(
-                "tool timed out after {}s",
-                Duration::from_secs(10).as_secs_f64()
-            ),
+            ToolExecutor::timeout_message(Duration::from_secs(10)),
             "tool timed out after 10s"
         );
+    }
+
+    #[tokio::test]
+    async fn executor_reports_ask_as_unsupported() {
+        let reg = ToolRegistry::new(vec![TestSource::echo_boxed()]).unwrap();
+        let ex = ToolExecutor::new(Arc::new(reg), Box::new(AskPolicy), Duration::from_secs(1));
+        let out = ex
+            .execute(&Fixture::call("echo", json!({"text":"x"})))
+            .await;
+        assert_eq!(
+            out,
+            ToolOutcome::Err("approval required (not supported yet)".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_reports_panicking_tool_as_error() {
+        let ex = Fixture::executor(TestSource::panic_boxed(), Duration::from_secs(1));
+        let out = ex.execute(&Fixture::call("panic", json!({}))).await;
+        match out {
+            ToolOutcome::Err(m) => assert!(m.starts_with("tool panicked")),
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_aborts_timed_out_tool() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let ex = Fixture::executor(
+            TestSource::flag_boxed(flag.clone()),
+            Duration::from_millis(50),
+        );
+        let out = ex.execute(&Fixture::call("flag", json!({}))).await;
+        assert!(!out.is_ok());
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn schema_integer_rejects_fraction_and_accepts_large_u64() {
+        let schema = json!({"properties":{"n":{"type":"integer"}}});
+        assert!(SchemaCheck::validate(&schema, &json!({"n":1.5})).is_err());
+        assert!(SchemaCheck::validate(&schema, &json!({"n":u64::MAX})).is_ok());
     }
 
     #[tokio::test]

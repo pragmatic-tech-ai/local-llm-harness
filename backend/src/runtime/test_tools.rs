@@ -1,5 +1,6 @@
 //! Test-only tools shared by runtime tests (`crate::runtime::test_tools`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,6 +71,48 @@ impl Tool for WriterTool {
     }
 }
 
+/// Panics when called.
+pub(crate) struct PanicTool;
+
+/// Sets the flag after a 200 ms sleep; used to prove aborted calls never finish.
+pub(crate) struct FlagTool {
+    pub(crate) flag: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for PanicTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "panic".into(),
+            description: "Panics".into(),
+            parameters: json!({"type": "object"}),
+            side_effects: false,
+        }
+    }
+
+    async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
+        panic!("boom");
+    }
+}
+
+#[async_trait]
+impl Tool for FlagTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "flag".into(),
+            description: "Sets a flag after sleeping".into(),
+            parameters: json!({"type": "object"}),
+            side_effects: false,
+        }
+    }
+
+    async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.flag.store(true, Ordering::SeqCst);
+        ToolOutcome::Ok(json!({}))
+    }
+}
+
 /// A `ToolSource` over a fixed list of tools.
 pub(crate) struct TestSource {
     tools: Vec<Arc<dyn Tool>>,
@@ -86,6 +129,14 @@ impl TestSource {
 
     pub(crate) fn slow_boxed() -> Box<dyn ToolSource> {
         Box::new(Self::new(vec![Arc::new(SlowTool)]))
+    }
+
+    pub(crate) fn panic_boxed() -> Box<dyn ToolSource> {
+        Box::new(Self::new(vec![Arc::new(PanicTool)]))
+    }
+
+    pub(crate) fn flag_boxed(flag: Arc<AtomicBool>) -> Box<dyn ToolSource> {
+        Box::new(Self::new(vec![Arc::new(FlagTool { flag })]))
     }
 
     pub(crate) fn writer_boxed() -> Box<dyn ToolSource> {
