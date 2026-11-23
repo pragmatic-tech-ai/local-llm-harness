@@ -14,6 +14,24 @@ pub struct ContextFill {
     pub total: usize,
 }
 
+impl ContextFill {
+    /// The window rule shared by every turn: `used` prompt tokens plus a positive `max_tokens`
+    /// reservation (the default `-1`, unlimited, reserves nothing) must fit in `total`.
+    /// On rejection the fill is returned alongside the reason so callers can still report it.
+    pub fn check(
+        used: usize,
+        total: usize,
+        max_tokens: i32,
+    ) -> std::result::Result<ContextFill, (ContextFill, TurnRejected)> {
+        let fill = ContextFill { used, total };
+        let needed = used + max_tokens.max(0) as usize;
+        if needed > total {
+            return Err((fill, TurnRejected::WindowFull { needed, total }));
+        }
+        Ok(fill)
+    }
+}
+
 /// Why a turn was refused before any generation started.
 #[derive(Debug, thiserror::Error)]
 pub enum TurnRejected {
@@ -127,16 +145,16 @@ impl ChatSession {
             .await
             .map_err(|e| TurnFailure::bare(e.into()))?
             .count;
-        let total = self.props.n_ctx;
-        let fill = ContextFill { used, total };
-        let needed = used + cfg.max_tokens.max(0) as usize;
-        if needed > total {
-            return Err(TurnFailure {
-                prompt: Some(prompt),
-                fill: Some(fill),
-                reason: TurnRejected::WindowFull { needed, total },
-            });
-        }
+        let fill = match ContextFill::check(used, self.props.n_ctx, cfg.max_tokens) {
+            Ok(fill) => fill,
+            Err((fill, reason)) => {
+                return Err(TurnFailure {
+                    prompt: Some(prompt),
+                    fill: Some(fill),
+                    reason,
+                })
+            }
+        };
 
         let stream = match self.engine.complete(&prompt, cfg).await {
             Ok(s) => s,

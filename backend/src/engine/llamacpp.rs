@@ -28,6 +28,7 @@ use llama_cpp_2::vocab::LlamaVocab;
 
 use super::logprobs::{token_info, TOP_LOGPROBS};
 use super::template::ChatTemplate;
+use super::tool_format::GemmaToolFormat;
 use super::{
     ChatMessage, CompletionChunk, Engine, EngineError, ModelProps, Result, SamplingConfig,
     TokenizeResult,
@@ -54,6 +55,8 @@ pub struct LocalLlamaEngine {
     model: Arc<LlamaModel>,
     n_ctx: u32,
     model_name: String,
+    /// Whether the model's chat template can render tools; computed once in `load`.
+    supports_tools: bool,
 }
 
 impl LocalLlamaEngine {
@@ -88,11 +91,17 @@ impl LocalLlamaEngine {
             .map(str::to_owned)
             .unwrap_or_else(|| Self::file_stem(model_path));
 
+        let supports_tools = model
+            .meta_val_str(CHAT_TEMPLATE_KEY)
+            .map(|src| GemmaToolFormat::template_supports(&src))
+            .unwrap_or(false);
+
         Ok(Self {
             backend,
             model: Arc::new(model),
             n_ctx,
             model_name,
+            supports_tools,
         })
     }
 
@@ -343,7 +352,7 @@ impl Engine for LocalLlamaEngine {
     }
 
     fn supports_tools(&self) -> bool {
-        true
+        self.supports_tools
     }
 
     async fn apply_template(

@@ -137,7 +137,7 @@ async fn ws_model_props_returns_client_shape() {
     send(&mut ws, 1, "model_props", json!({})).await;
     let (notes, resp) = collect(&mut ws, 1).await;
     assert!(notes.is_empty());
-    assert_eq!(resp["result"], json!({"n_ctx": 100, "model_name": "fake"}));
+    assert_eq!(resp["result"], json!({"n_ctx": 100, "model_name": "fake", "supports_tools": false}));
 }
 
 #[tokio::test]

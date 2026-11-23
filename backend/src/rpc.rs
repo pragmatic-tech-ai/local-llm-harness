@@ -7,6 +7,10 @@
 //!
 //! `send_turn` streams `turn_started`, `turn_chunk`*, then `turn_done` | `turn_error`
 //! (or `turn_started` + `turn_rejected`); the request's own response is sent last.
+//!
+//! `generate` is the stateless variant: the caller supplies the whole conversation (and
+//! optionally tools). It streams the same notifications, plus a `tool_call` note as soon as each
+//! call completes, and ends with `turn_done {content, tool_calls}`.
 
 use std::sync::Arc;
 
@@ -18,7 +22,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::engine::{Engine, ModelProps, SamplingConfig};
+use crate::engine::tool_format::{GemmaToolParser, ParseEvent, ParsedCall};
+use crate::engine::{ChatMessage, Engine, ModelProps, SamplingConfig};
 use crate::session::{ChatSession, ContextFill, TurnRejected};
 
 const ERR_PARSE: i64 = -32700;
@@ -52,6 +57,17 @@ struct SendTurnParams {
     content: String,
     #[serde(default)]
     enable_thinking: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenerateParams {
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    enable_thinking: bool,
+    #[serde(default)]
+    sampling: Option<SamplingConfig>,
 }
 
 #[derive(Debug)]
@@ -164,6 +180,7 @@ impl Connection {
             "model_props" => Ok(json!({
                 "n_ctx": self.props.n_ctx,
                 "model_name": self.props.model_name,
+                "supports_tools": self.engine.supports_tools(),
             })),
             "tokenize" => {
                 let p: TokenizeParams = Self::params(req)?;
@@ -184,6 +201,11 @@ impl Connection {
                 self.send_turn(ws, p).await?;
                 Ok(Value::Null)
             }
+            "generate" => {
+                let p: GenerateParams = Self::params(req)?;
+                self.generate(ws, p).await?;
+                Ok(Value::Null)
+            }
             other => {
                 Err(RpcError::new(ERR_METHOD_NOT_FOUND, format!("unknown method: {other}")).into())
             }
@@ -199,7 +221,6 @@ impl Connection {
     }
 
     async fn send_turn(&mut self, ws: &mut Ws, p: SendTurnParams) -> Result<(), Failure> {
-        let started = |prompt: &str, fill: ContextFill| json!({"prompt": prompt, "prompt_tokens": fill.used, "n_ctx": fill.total});
         let turn = match self
             .session
             .begin_turn(&p.content, &self.sampling, p.enable_thinking)
@@ -208,20 +229,18 @@ impl Connection {
             Ok(t) => t,
             Err(failure) => {
                 if let (Some(prompt), Some(fill)) = (&failure.prompt, failure.fill) {
-                    Self::notify(ws, "turn_started", started(prompt, fill)).await?;
+                    Self::notify(ws, "turn_started", Self::started(prompt, fill)).await?;
                 }
                 return match failure.reason {
                     TurnRejected::WindowFull { needed, total } => {
                         let params = json!({"needed": needed, "total": total});
                         Self::notify(ws, "turn_rejected", params).await
                     }
-                    TurnRejected::Engine(e) => {
-                        Self::notify(ws, "turn_error", json!({"message": e.to_string()})).await
-                    }
+                    TurnRejected::Engine(e) => Self::turn_error(ws, e).await,
                 };
             }
         };
-        Self::notify(ws, "turn_started", started(&turn.prompt, turn.fill)).await?;
+        Self::notify(ws, "turn_started", Self::started(&turn.prompt, turn.fill)).await?;
         let mut stream = turn.stream;
         while let Some(item) = stream.next().await {
             match item {
@@ -238,6 +257,83 @@ impl Connection {
         Self::notify(ws, "turn_done", json!({})).await
     }
 
+    /// Stateless turn: renders `p.messages` (with `p.tools`), checks the window, streams the
+    /// reply and parses Gemma 4 tool calls out of it. Nothing is stored on the connection.
+    async fn generate(&mut self, ws: &mut Ws, p: GenerateParams) -> Result<(), Failure> {
+        let cfg = p.sampling.unwrap_or_else(|| self.sampling.clone());
+        let tools = p.tools.unwrap_or_default();
+        let prompt = match self
+            .engine
+            .apply_template(&p.messages, true, p.enable_thinking, &tools)
+            .await
+        {
+            Ok(prompt) => prompt,
+            Err(e) => return Self::turn_error(ws, e).await,
+        };
+        let used = match self.engine.tokenize(&prompt).await {
+            Ok(t) => t.count,
+            Err(e) => return Self::turn_error(ws, e).await,
+        };
+        let fill = match ContextFill::check(used, self.props.n_ctx, cfg.max_tokens) {
+            Ok(fill) => fill,
+            Err((fill, TurnRejected::WindowFull { needed, total })) => {
+                Self::notify(ws, "turn_started", Self::started(&prompt, fill)).await?;
+                let params = json!({"needed": needed, "total": total});
+                return Self::notify(ws, "turn_rejected", params).await;
+            }
+            Err((_, TurnRejected::Engine(e))) => return Self::turn_error(ws, e).await,
+        };
+        Self::notify(ws, "turn_started", Self::started(&prompt, fill)).await?;
+        let mut stream = match self.engine.complete(&prompt, &cfg).await {
+            Ok(stream) => stream,
+            Err(e) => return Self::turn_error(ws, e).await,
+        };
+
+        let mut parser = GemmaToolParser::new();
+        while let Some(item) = stream.next().await {
+            let chunk = match item {
+                Ok(chunk) => chunk,
+                Err(e) => return Self::turn_error(ws, e).await,
+            };
+            // The chunk is relayed raw (model mechanics stay visible), even the one carrying
+            // the response marker; nothing after it is relayed.
+            let params = json!({"text": chunk.text, "tokens": chunk.tokens, "stop": chunk.stop});
+            Self::notify(ws, "turn_chunk", params).await?;
+            let mut response_marker = false;
+            for event in parser.push(&chunk.text) {
+                match event {
+                    ParseEvent::Call(call) => Self::notify_call(ws, &call).await?,
+                    ParseEvent::ResponseMarker => response_marker = true,
+                }
+            }
+            if response_marker {
+                // Dropping the stream stops the engine: the model is inventing tool output.
+                break;
+            }
+        }
+        drop(stream);
+        for event in parser.finish() {
+            if let ParseEvent::Call(call) = event {
+                Self::notify_call(ws, &call).await?;
+            }
+        }
+        let done = json!({"content": parser.content(), "tool_calls": parser.calls()});
+        Self::notify(ws, "turn_done", done).await
+    }
+
+    async fn notify_call(ws: &mut Ws, call: &ParsedCall) -> Result<(), Failure> {
+        let params = Self::to_value(call)?;
+        Self::notify(ws, "tool_call", params).await
+    }
+
+    async fn turn_error(ws: &mut Ws, e: impl ToString) -> Result<(), Failure> {
+        Self::notify(ws, "turn_error", json!({"message": e.to_string()})).await
+    }
+
+    fn started(prompt: &str, fill: ContextFill) -> Value {
+        json!({"prompt": prompt, "prompt_tokens": fill.used, "n_ctx": fill.total})
+    }
+
     async fn notify(ws: &mut Ws, method: &str, params: Value) -> Result<(), Failure> {
         Self::send_json(ws, json!({"method": method, "params": params}))
             .await
@@ -247,5 +343,301 @@ impl Connection {
     async fn send_json(ws: &mut Ws, value: Value) -> Result<(), BoxError> {
         ws.send(Message::text(value.to_string())).await?;
         Ok(())
+    }
+}
+
+/// Scripted engine and WebSocket client for exercising `serve` end to end; reused by other
+/// modules' tests (`crate::rpc::test_support`).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::engine::{CompletionChunk, TokenizeResult};
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use std::sync::Mutex;
+    use tokio_tungstenite::MaybeTlsStream;
+
+    /// An `Engine` that replays scripted chunks. `apply_template` records the `tools` it is
+    /// given and returns `"PROMPT"`; `tokenize` reports a configurable count.
+    pub(crate) struct FakeEngine {
+        chunks: Vec<String>,
+        token_count: usize,
+        supports_tools: bool,
+        recorded_tools: Mutex<Vec<Vec<Value>>>,
+    }
+
+    impl FakeEngine {
+        /// A fake that streams `chunks` (the last one flagged `stop`), tokenizes every text to
+        /// 10 tokens and reports no tool support.
+        pub(crate) fn new(chunks: &[&str]) -> Self {
+            Self {
+                chunks: chunks.iter().map(|c| c.to_string()).collect(),
+                token_count: 10,
+                supports_tools: false,
+                recorded_tools: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(crate) fn with_token_count(mut self, token_count: usize) -> Self {
+            self.token_count = token_count;
+            self
+        }
+
+        pub(crate) fn with_tools_support(mut self, supports_tools: bool) -> Self {
+            self.supports_tools = supports_tools;
+            self
+        }
+
+        /// The `tools` argument of every `apply_template` call so far.
+        pub(crate) fn recorded_tools(&self) -> Vec<Vec<Value>> {
+            self.recorded_tools.lock().expect("tools lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Engine for FakeEngine {
+        async fn props(&self) -> crate::engine::Result<ModelProps> {
+            unreachable!()
+        }
+
+        async fn tokenize(&self, _text: &str) -> crate::engine::Result<TokenizeResult> {
+            Ok(TokenizeResult {
+                tokens: vec![],
+                count: self.token_count,
+            })
+        }
+
+        async fn detokenize(&self, _tokens: &[i64]) -> crate::engine::Result<String> {
+            unreachable!()
+        }
+
+        async fn complete(
+            &self,
+            _prompt: &str,
+            _cfg: &SamplingConfig,
+        ) -> crate::engine::Result<BoxStream<'static, crate::engine::Result<CompletionChunk>>>
+        {
+            let last = self.chunks.len().saturating_sub(1);
+            let chunks: Vec<_> = self
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    Ok(CompletionChunk {
+                        text: text.clone(),
+                        tokens: vec![],
+                        stop: i == last,
+                    })
+                })
+                .collect();
+            Ok(futures::stream::iter(chunks).boxed())
+        }
+
+        async fn apply_template(
+            &self,
+            _messages: &[crate::engine::ChatMessage],
+            _add_generation_prompt: bool,
+            _enable_thinking: bool,
+            tools: &[Value],
+        ) -> crate::engine::Result<String> {
+            self.recorded_tools
+                .lock()
+                .expect("tools lock")
+                .push(tools.to_vec());
+            Ok("PROMPT".to_string())
+        }
+
+        fn supports_tools(&self) -> bool {
+            self.supports_tools
+        }
+    }
+
+    /// A WebSocket client connected to a real `serve` loop on an ephemeral port.
+    pub(crate) struct TestClient {
+        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        next_id: u64,
+    }
+
+    impl TestClient {
+        /// Starts `serve` over `engine` with the given window size and connects to it.
+        pub(crate) async fn connect(engine: Arc<dyn Engine>, n_ctx: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let props = ModelProps {
+                n_ctx,
+                model_name: "fake".into(),
+            };
+            tokio::spawn(serve(listener, engine, props, None));
+            let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+                .await
+                .expect("connect");
+            Self { ws, next_id: 1 }
+        }
+
+        /// Sends one request; returns the notifications received before its response, then the
+        /// response frame.
+        pub(crate) async fn request(&mut self, method: &str, params: Value) -> (Vec<Value>, Value) {
+            let id = self.next_id;
+            self.next_id += 1;
+            let frame = json!({"id": id, "method": method, "params": params});
+            self.ws
+                .send(Message::text(frame.to_string()))
+                .await
+                .expect("send");
+            let mut notes = Vec::new();
+            while let Some(frame) = self.ws.next().await {
+                let Message::Text(text) = frame.expect("frame") else {
+                    continue;
+                };
+                let value: Value = serde_json::from_str(text.as_str()).expect("json");
+                if value.get("id") == Some(&json!(id)) {
+                    return (notes, value);
+                }
+                notes.push(value);
+            }
+            panic!("connection closed before the response");
+        }
+
+        /// The `method` of each notification, in order.
+        pub(crate) fn methods(notes: &[Value]) -> Vec<String> {
+            notes
+                .iter()
+                .map(|n| n["method"].as_str().unwrap_or_default().to_string())
+                .collect()
+        }
+
+        /// The params of every notification named `method`.
+        pub(crate) fn params_of(notes: &[Value], method: &str) -> Vec<Value> {
+            notes
+                .iter()
+                .filter(|n| n["method"] == method)
+                .map(|n| n["params"].clone())
+                .collect()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{FakeEngine, TestClient};
+    use super::*;
+
+    const MARKER_CHUNKS: [&str; 5] = [
+        "Checking.",
+        "<|tool_call>call:get_time{}",
+        "<tool_call|>",
+        "<|tool_response>",
+        "fake",
+    ];
+
+    struct Harness;
+
+    impl Harness {
+        fn messages() -> Value {
+            json!([{"role": "user", "content": "hi"}])
+        }
+
+        async fn generate(engine: FakeEngine, n_ctx: usize, params: Value) -> (Vec<Value>, Value) {
+            let mut client = TestClient::connect(Arc::new(engine), n_ctx).await;
+            client.request("generate", params).await
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_streams_chunks_then_done_with_content() {
+        let engine = FakeEngine::new(&["Hello", " world"]);
+        let params = json!({"messages": Harness::messages()});
+        let (notes, resp) = Harness::generate(engine, 8192, params).await;
+        assert_eq!(
+            TestClient::methods(&notes),
+            ["turn_started", "turn_chunk", "turn_chunk", "turn_done"]
+        );
+        assert_eq!(resp["result"], Value::Null);
+        let done = &TestClient::params_of(&notes, "turn_done")[0];
+        assert_eq!(done["content"], "Hello world");
+        assert_eq!(done["tool_calls"], json!([]));
+        let started = &TestClient::params_of(&notes, "turn_started")[0];
+        assert_eq!(
+            started,
+            &json!({"prompt": "PROMPT", "prompt_tokens": 10, "n_ctx": 8192})
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_emits_tool_call_and_stops_at_response_marker() {
+        let engine = FakeEngine::new(&MARKER_CHUNKS);
+        let params = json!({"messages": Harness::messages()});
+        let (notes, _) = Harness::generate(engine, 8192, params).await;
+        let calls = TestClient::params_of(&notes, "tool_call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["name"], "get_time");
+        assert_eq!(calls[0]["arguments"], json!({}));
+        assert_eq!(TestClient::params_of(&notes, "turn_chunk").len(), 4);
+        let done = &TestClient::params_of(&notes, "turn_done")[0];
+        assert_eq!(done["content"], "Checking.");
+        assert_eq!(done["tool_calls"][0]["name"], "get_time");
+    }
+
+    #[tokio::test]
+    async fn generate_stops_at_response_marker_without_call() {
+        let engine = FakeEngine::new(&["Hi", "<|tool_response>", "response:x{}"]);
+        let params = json!({"messages": Harness::messages()});
+        let (notes, _) = Harness::generate(engine, 8192, params).await;
+        assert_eq!(TestClient::params_of(&notes, "turn_chunk").len(), 2);
+        let done = &TestClient::params_of(&notes, "turn_done")[0];
+        assert_eq!(done["content"], "Hi");
+        assert_eq!(done["tool_calls"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn generate_reports_unterminated_call_at_end_of_stream() {
+        let engine = FakeEngine::new(&["Hi ", "<|tool_call>call:get_time{"]);
+        let params = json!({"messages": Harness::messages()});
+        let (notes, _) = Harness::generate(engine, 8192, params).await;
+        let calls = TestClient::params_of(&notes, "tool_call");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0]["parse_error"].is_string());
+        let methods = TestClient::methods(&notes);
+        assert_eq!(methods.last().map(String::as_str), Some("turn_done"));
+        let done = &TestClient::params_of(&notes, "turn_done")[0];
+        assert_eq!(done["tool_calls"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_when_window_full() {
+        let engine = FakeEngine::new(&["x"]).with_token_count(9000);
+        let params = json!({"messages": Harness::messages()});
+        let (notes, resp) = Harness::generate(engine, 8192, params).await;
+        assert_eq!(
+            TestClient::methods(&notes),
+            ["turn_started", "turn_rejected"]
+        );
+        assert_eq!(
+            TestClient::params_of(&notes, "turn_rejected")[0],
+            json!({"needed": 9000, "total": 8192})
+        );
+        assert_eq!(resp["result"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn generate_passes_tools_to_template() {
+        let tools = json!([{"type": "function", "function": {"name": "get_time"}}]);
+        let engine = Arc::new(FakeEngine::new(&["ok"]));
+        let mut client = TestClient::connect(engine.clone(), 8192).await;
+        let params = json!({"messages": Harness::messages(), "tools": tools});
+        client.request("generate", params).await;
+        assert_eq!(
+            engine.recorded_tools(),
+            vec![tools.as_array().cloned().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_props_reports_supports_tools() {
+        let engine = FakeEngine::new(&[]).with_tools_support(true);
+        let mut client = TestClient::connect(Arc::new(engine), 8192).await;
+        let (_, resp) = client.request("model_props", json!({})).await;
+        assert_eq!(resp["result"]["supports_tools"], true);
     }
 }
