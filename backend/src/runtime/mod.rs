@@ -1,3 +1,4 @@
+pub mod builtin;
 pub mod executor;
 pub mod policy;
 pub mod registry;
