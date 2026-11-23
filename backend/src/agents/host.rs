@@ -223,7 +223,9 @@ impl ModelHost for LocalSupervisorHost {
     /// next event) a single forwarder task serves all subscribers; it ends when the harness's
     /// channel closes or the host is dropped. Must be called inside a tokio runtime.
     fn subscribe(&self) -> broadcast::Receiver<()> {
-        let mut forwarder = self.forwarder.lock().unwrap();
+        // Subscribe first so the caller cannot miss an event sent once the forwarder runs.
+        let rx = self.events.subscribe();
+        let mut forwarder = self.forwarder.lock().unwrap_or_else(|e| e.into_inner());
         if forwarder.is_none() {
             let mut source = self.harness.subscribe();
             let tx = self.events.clone();
@@ -238,13 +240,18 @@ impl ModelHost for LocalSupervisorHost {
                 }
             }));
         }
-        self.events.subscribe()
+        rx
     }
 }
 
 impl Drop for LocalSupervisorHost {
     fn drop(&mut self) {
-        if let Some(task) = self.forwarder.lock().unwrap().take() {
+        if let Some(task) = self
+            .forwarder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             task.abort();
         }
     }
