@@ -1,7 +1,7 @@
 # Tool Calling and the Agent Runtime Component — Design
 
 **Date:** 2026-11-23
-**Status:** proposed (awaiting approval)
+**Status:** implemented and live-verified on the hive 2026-11-23 (main @3304a8c6). Live proof: "What time is it?" → get_time → local-time answer; "What does notes.txt in the sandbox say?" → list_dir → read_file → quoted "The harness sandbox works."; candle + gemma-3 reports supports_tools false and plain chat works.
 
 ## Intent and why
 
