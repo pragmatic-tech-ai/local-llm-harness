@@ -359,29 +359,54 @@ mod tests {
         assert!(Config::bind_runtime("127.0.0.1:0").await.is_some());
     }
 
-    #[test]
-    fn startup_builds_stores_and_seeds() {
-        let dir = std::env::temp_dir().join(format!("agents-stack-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let toml = format!(
-            "[agents]
+    /// A temp data dir removed on drop, so a failing assertion still cleans up.
+    struct DataDir(PathBuf);
+
+    impl DataDir {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("agents-stack-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+
+        /// A catalog whose agents data lives at `data_dir`, with `extra` TOML appended.
+        fn catalog(data_dir: &std::path::Path, extra: &str) -> Arc<Catalog> {
+            let toml = format!(
+                "[agents]
 data_dir = {:?}
 [[runtime]]
 name = \"rt\"
 kind = \"llamacpp\"
 exe = \"x\"
-",
-            dir.to_string_lossy()
-        );
-        let catalog = Arc::new(Catalog::from_toml(&toml).unwrap());
+{extra}",
+                data_dir.to_string_lossy()
+            );
+            Arc::new(Catalog::from_toml(&toml).unwrap())
+        }
+
+        fn registry() -> Arc<ToolRegistry> {
+            Arc::new(ToolRegistry::new(vec![Box::new(BuiltinSource::new(None))]).unwrap())
+        }
+    }
+
+    impl Drop for DataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn startup_builds_stores_and_seeds() {
+        let dir = DataDir::new("ok");
+        let catalog = DataDir::catalog(&dir.0, "");
         let manager = Arc::new(HarnessManager::new(
             (*catalog).clone(),
             ProcessLauncher::new(),
             WsProbe,
             ManagerConfig::default(),
         ));
-        let registry =
-            Arc::new(ToolRegistry::new(vec![Box::new(BuiltinSource::new(None))]).unwrap());
+        let registry = DataDir::registry();
         let executor = Arc::new(ToolExecutor::new(
             registry.clone(),
             Box::new(ReadOnlyPolicy),
@@ -391,11 +416,43 @@ exe = \"x\"
         let names = AgentsStack::host_names(&catalog).unwrap();
         let stack = AgentsStack::open(&catalog, names, &registry).unwrap();
         let deps = stack.into_deps(manager, registry, tool_loop);
-        assert_eq!(AgentsStack::template_count(&deps.templates.tree()), 1);
+        let tree = deps.templates.tree();
+        assert_eq!(AgentsStack::template_count(&tree), 1);
+        match &tree[..] {
+            [TemplateNode::Group { name, children, .. }] => {
+                assert_eq!(name, "Examples");
+                assert!(matches!(
+                    &children[..],
+                    [TemplateNode::Template { name, .. }] if name == "Default"
+                ));
+            }
+            other => panic!("unexpected tree: {other:?}"),
+        }
         assert!(deps.sessions.list().is_empty());
         assert_eq!(deps.catalog.hosts, ["hive"]);
         assert_eq!(deps.catalog.runtimes.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unusable_data_dir_fails_to_open() {
+        let dir = DataDir::new("file");
+        std::fs::write(&dir.0, b"not a directory").unwrap();
+        let catalog = DataDir::catalog(&dir.0.join("data"), "");
+        let names = AgentsStack::host_names(&catalog).unwrap();
+        assert!(AgentsStack::open(&catalog, names, &DataDir::registry()).is_err());
+    }
+
+    #[test]
+    fn unsupported_host_is_a_host_names_error() {
+        let dir = DataDir::new("host");
+        let catalog = DataDir::catalog(
+            &dir.0,
+            "[[host]]
+name = \"far\"
+kind = \"ssh\"
+",
+        );
+        assert!(AgentsStack::host_names(&catalog).is_err());
     }
 
     #[test]

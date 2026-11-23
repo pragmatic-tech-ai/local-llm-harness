@@ -245,8 +245,8 @@ impl WorkerLink for WsWorkerLink {
 mod tests {
     use super::*;
     use crate::engine::Role;
-    use std::sync::Arc;
     use crate::rpc::test_support::{FakeEngine, TestServer};
+    use std::sync::Arc;
 
     const MS: Duration = Duration::from_millis(100);
     const GENEROUS: Duration = Duration::from_secs(5);
