@@ -6,6 +6,7 @@ pub mod http;
 pub mod llamacpp;
 pub mod logprobs;
 pub mod template;
+pub mod tool_format;
 pub mod types;
 
 use async_trait::async_trait;
