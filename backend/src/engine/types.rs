@@ -240,6 +240,12 @@ mod tests {
     }
 
     #[test]
+    fn template_view_tool_role_without_result_falls_back_to_content() {
+        let tool = ChatMessage::new(Role::Tool, "plain");
+        assert_eq!(tool.template_view()["content"], "plain");
+    }
+
+    #[test]
     fn props_missing_n_ctx_fails_to_deserialize() {
         let raw = r#"{"default_generation_settings":{}, "model_path":"m.gguf"}"#;
         assert!(serde_json::from_str::<ModelProps>(raw).is_err());

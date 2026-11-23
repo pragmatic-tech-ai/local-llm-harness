@@ -127,6 +127,28 @@ async fn apply_template_maps_llama_endpoint() {
         ChatMessage::new(Role::System, "be brief"),
         ChatMessage::new(Role::User, "hi"),
     ];
-    let prompt = engine.apply_template(&messages, true, false, &[]).await.unwrap();
+    let prompt = engine
+        .apply_template(&messages, true, false, &[])
+        .await
+        .unwrap();
     assert_eq!(prompt, "RENDERED");
+}
+
+#[tokio::test]
+async fn apply_template_with_tools_is_protocol_error() {
+    use backend::engine::{ChatMessage, Role};
+    let server = MockServer::start().await;
+    let engine = HttpEngine::new(server.uri());
+    let messages = vec![ChatMessage::new(Role::User, "hi")];
+    let tools = vec![json!({"type":"function","function":{"name":"f"}})];
+    let err = engine
+        .apply_template(&messages, true, false, &tools)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Protocol(_)));
+}
+
+#[test]
+fn http_engine_does_not_support_tools() {
+    assert!(!HttpEngine::new("http://127.0.0.1:1".to_string()).supports_tools());
 }

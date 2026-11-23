@@ -59,9 +59,7 @@ pub struct ChatSession {
 impl ChatSession {
     pub fn new(engine: Arc<dyn Engine>, props: ModelProps, system: Option<String>) -> Self {
         let messages = system
-            .map(|content| {
-                vec![ChatMessage::new(Role::System, content)]
-            })
+            .map(|content| vec![ChatMessage::new(Role::System, content)])
             .unwrap_or_default();
         Self {
             engine,
@@ -165,7 +163,10 @@ impl ChatSession {
                         if let Some(user_message) = pending.take() {
                             let mut history = history.lock().expect("messages lock");
                             history.push(user_message);
-                            history.push(ChatMessage::new(Role::Assistant, std::mem::take(&mut reply)));
+                            history.push(ChatMessage::new(
+                                Role::Assistant,
+                                std::mem::take(&mut reply),
+                            ));
                         }
                     }
                 }
@@ -267,6 +268,11 @@ mod tests {
 
     fn msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage::new(role, content)
+    }
+
+    #[test]
+    fn engine_trait_default_does_not_support_tools() {
+        assert!(!FakeEngine::new(1).supports_tools());
     }
 
     #[tokio::test]

@@ -36,6 +36,14 @@ fi
 scp -q "$TMP/src.tar" "$HOST:$CLONE_FWD/../harness-build/src.tar" || exit 1
 
 FEATURE_ARGS=""
+# Re-quote each cargo arg so spaces/specials survive the generated .cmd.
+CARGO_QUOTED=""
+for a in "${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}"; do
+    case "$a" in
+        *[!A-Za-z0-9_:./=-]*) CARGO_QUOTED="$CARGO_QUOTED \"${a//\"/\"\"}\"" ;;
+        *) CARGO_QUOTED="$CARGO_QUOTED $a" ;;
+    esac
+done
 CUDA_LINES=""
 case "$FEATURES" in
     "") ;;
@@ -58,9 +66,10 @@ esac
     # Separate target dir: the live supervisor's target/release must stay untouched.
     echo 'set "CARGO_TARGET_DIR=C:\llm-harness\local-llm-harness\backend\target\hive-test"'
     echo "cd /d $CLONE_WIN"
+    # NOTE: tar only adds/overwrites; files deleted locally stay in the hive clone until --restore.
     echo "tar -xf $BUILD_DIR\src.tar"
     echo "cd backend"
-    echo "cargo test --release --offline --lib $FEATURE_ARGS ${CARGO_ARGS[*]:-}"
+    echo "cargo test --release --offline --lib $FEATURE_ARGS ${CARGO_QUOTED}"
     echo 'echo TEST_EXIT=%ERRORLEVEL%'
 } | sed 's/$/\r/' > "$TMP/run-tests.cmd"
 
