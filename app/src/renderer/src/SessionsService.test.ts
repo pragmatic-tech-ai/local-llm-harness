@@ -506,5 +506,42 @@ describe('SessionsService', () =>
         await vi.advanceTimersByTimeAsync(3000)
         expect(rig.urls).toEqual(['ws://hive:8779', 'ws://hive:8779'])
     })
+
+    it('new_session_is_disabled_while_the_shown_session_runs_a_turn', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1')])
+        const command = rig.service.Panel.NewSessionCommand
+        expect(command.CanExecute(undefined)).toBe(true)
+        rig.service.View.Chat.Draft = 'long job'
+        rig.service.View.Chat.SendCommand.Execute(undefined)
+        expect(command.CanExecute(undefined)).toBe(false)
+        rig.Notify('loop_done', { steps: 1, reason: 'answered' })
+        await rig.Respond('send_turn', null)
+        expect(command.CanExecute(undefined)).toBe(true)
+    })
+
+    it('session_created_during_a_turn_is_listed_but_not_opened', async () =>
+    {
+        const rig = new Rig()
+        await rig.ShowSession('s1', [Rig.Summary('s1')])
+        rig.service.Panel.NewSessionCommand.Execute(undefined)
+        await Rig.Flush()
+        const body = rig.dialogs.shown[0].Content as NewSessionDialogViewModel
+        await rig.Respond('list_templates', [{ kind: 'template', id: 't1', path: '', name: 'Default', runtime: 'llamacpp', model: 'gemma', error: null }])
+        body.SelectedNode = body.Roots.Get(0)!
+        // The turn starts while the dialog is still open.
+        rig.service.View.Chat.Draft = 'long job'
+        rig.service.View.Chat.SendCommand.Execute(undefined)
+        body.CreateCommand.Execute(undefined)
+        await rig.Respond('create_session', Rig.Summary('new'))
+        expect(rig.dialogs.closed).toHaveLength(1)
+        expect(rig.service.Panel.Find('new')).toBeDefined()
+        expect(rig.service.Panel.SelectedSession?.Id).toBe('s1')
+        expect(rig.service.View.ShownId).toBe('s1')
+        expect(rig.Methods().filter(m => m === 'attach_session')).toHaveLength(1)
+        expect(rig.service.Panel.StatusText).toBe('Finish the running turn before switching sessions.')
+        expect(rig.service.View.Chat.IsBusy).toBe(true)
+    })
 })
 

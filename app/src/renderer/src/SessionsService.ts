@@ -127,9 +127,18 @@ export class SessionsService extends ServiceBase
         }
     }
 
-    /** Shows a session that was just created: its row selected, its view attached. */
+    /**
+     * Shows a session that was just created: its row selected, its view attached. While the shown session runs a
+     * turn (the dialog was open when it started) the session is only listed: opening it would abort that turn.
+     */
     public OpenCreated(summary: SessionSummary): void
     {
+        if (this.View.Chat.IsBusy)
+        {
+            this.Panel.Add(summary)
+            this.Panel.ReportSwitchRefused()
+            return
+        }
         this.Panel.Show(summary)
         void this.View.Attach(summary.id)
     }

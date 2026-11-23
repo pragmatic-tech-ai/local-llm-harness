@@ -54,7 +54,7 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
     constructor()
     {
         super()
-        this.newSessionCommand = new RelayCommand(() => this.OnNewSessionRequested.Raise(undefined), () => this.client !== null)
+        this.newSessionCommand = new RelayCommand(() => this.OnNewSessionRequested.Raise(undefined), () => this.client !== null && !this.switchLocked)
         this.RenameCommand = new RelayCommand(arg => this.ForRow(arg, row => this.RequestRename(row)))
         this.DeleteCommand = new RelayCommand(arg => this.ForRow(arg, row => this.RequestDelete(row)))
     }
@@ -110,7 +110,7 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
         }
         if (this.switchLocked && this._selected !== null)
         {
-            this.SetStatus(SessionsPanelViewModel.SwitchLockedText)
+            this.ReportSwitchRefused()
             this.ReannounceSelection()
             return
         }
@@ -122,10 +122,24 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
     public SetSwitchLocked(locked: boolean): void
     {
         this.switchLocked = locked
+        // New session opens the new session, so it is a switch too.
+        this.newSessionCommand.RaiseCanExecuteChanged()
         if (!locked && this._statusText === SessionsPanelViewModel.SwitchLockedText)
         {
             this.SetStatus('')
         }
+    }
+
+    /** True while a turn in the shown session forbids switching (and so opening another session). */
+    public get IsSwitchLocked(): boolean
+    {
+        return this.switchLocked
+    }
+
+    /** Explains a refused switch on the status line. */
+    public ReportSwitchRefused(): void
+    {
+        this.SetStatus(SessionsPanelViewModel.SwitchLockedText)
     }
 
     /** Shows a failed action (rename, delete, ...) on the panel's status line. */
@@ -207,6 +221,14 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
     /** Adds (or updates) a row for a session the caller just created, and selects it without raising OnOpen. */
     public Show(summary: SessionSummary): SessionRowViewModel
     {
+        const row = this.Add(summary)
+        this.SetSelected(row)
+        return row
+    }
+
+    /** Adds (or updates) a row for a session the caller just created, leaving the selection alone. */
+    public Add(summary: SessionSummary): SessionRowViewModel
+    {
         let row = this.Find(summary.id)
         if (row === undefined)
         {
@@ -219,7 +241,6 @@ export class SessionsPanelViewModel extends Observable implements ISessionRowOwn
         {
             row.Update(summary)
         }
-        this.SetSelected(row)
         return row
     }
 
