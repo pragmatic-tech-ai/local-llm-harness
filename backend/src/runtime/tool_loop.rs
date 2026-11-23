@@ -11,12 +11,11 @@ use serde_json::{json, Map, Value};
 
 use super::executor::ToolExecutor;
 use super::registry::ToolRegistry;
-use super::session::RuntimeSession;
 use super::tool::ToolCallRequest;
-use super::worker::{GenerateRequest, LinkError, Note, WorkerConnector};
+use super::worker::{GenerateRequest, LinkError, Note, WorkerLink};
 use crate::engine::tool_format::ParsedCall;
 use crate::engine::types::{FunctionCall, ToolCall};
-use crate::engine::{ChatMessage, Role};
+use crate::engine::{ChatMessage, Role, SamplingConfig};
 
 /// The client went away; nothing more can be reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,10 +63,29 @@ enum StepEnd {
     Broken(String),
 }
 
+/// What one session configures for its turns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnConfig {
+    /// The maximum number of generate calls per user message; `0` means no generate call is
+    /// made and every run ends `StepLimit` with 0 steps.
+    pub step_budget: usize,
+    /// Names of the registry tools this session may use.
+    pub tools: Vec<String>,
+    pub enable_thinking: bool,
+    pub sampling: SamplingConfig,
+}
+
+/// Where the loop gets the worker link for each step.
+#[async_trait]
+pub trait TurnLinks: Send + Sync {
+    /// The link to use for zero-based `step`. The `Err` text is reported as `turn_error`
+    /// (except at step 0, where it ends the loop `NoHarness`).
+    async fn link(&self, step: usize) -> Result<Arc<dyn WorkerLink>, String>;
+}
+
 pub struct ToolLoop {
     executor: Arc<ToolExecutor>,
     registry: Arc<ToolRegistry>,
-    step_cap: usize,
 }
 
 impl ToolLoop {
@@ -88,19 +106,14 @@ impl ToolLoop {
     /// Reported when no harness is Ready (shared with the runtime server).
     pub(crate) const NO_MODEL: &'static str = "no model running";
 
-    /// `step_cap` is the maximum number of generate calls per user message; `0` means no
-    /// generate call is made and every run ends `StepLimit` with 0 steps.
-    pub fn new(executor: Arc<ToolExecutor>, registry: Arc<ToolRegistry>, step_cap: usize) -> Self {
-        Self {
-            executor,
-            registry,
-            step_cap,
-        }
+    pub fn new(executor: Arc<ToolExecutor>, registry: Arc<ToolRegistry>) -> Self {
+        Self { executor, registry }
     }
 
-    /// Runs one user message to completion. The user message and every step's messages are
-    /// committed to `session` only when the loop ends `Answered`; any other end (including a
-    /// closed sink) leaves the transcript as it was. A closed sink aborts at once with
+    /// Runs one user message to completion on top of `transcript`. The new transcript (the
+    /// user message and every step's messages) is returned only when the loop ends `Answered`,
+    /// after `loop_done` was delivered; the caller commits it. Any other end (including a
+    /// closed sink) returns `None`, so the caller's transcript stays as it was. A closed sink aborts at once with
     /// `Err(SinkClosed)`; dropping the in-flight stream makes the worker stop generating.
     ///
     /// The runtime is the authority on call ids. The worker numbers calls from `call_1` on
@@ -110,70 +123,82 @@ impl ToolLoop {
     /// `tool_call` notes and `turn_done.tool_calls` are the one exception to verbatim relay:
     /// only their `id`s are rewritten (by position), so the wire is self-consistent.
     ///
-    /// Every step asks the connector for the current Ready harness and re-reads its
-    /// `model_props`, so a harness swapped between steps is used (with its own tool support).
-    /// No harness at the first step ends `NoHarness`; one that disappears mid-loop ends `Error`
-    /// with a `turn_error` ("no model running"), since the user message was already in flight.
+    /// Every step asks `links` for the current link and re-reads its `model_props`, so a
+    /// harness swapped between steps is used (with its own tool support). No link at the first
+    /// step ends `NoHarness`; one that disappears mid-loop ends `Error` with a `turn_error`
+    /// carrying the link's text, since the user message was already in flight. Only the tools
+    /// named in `config.tools` are offered to the model and executed.
     ///
     /// A failing `model_props` ends the loop with `Error` and a `turn_error` carrying the
     /// link error: without it we cannot know whether to send tools, and guessing would either
     /// break a tool-less model or silently disable tools.
     pub async fn run(
         &self,
-        session: &mut RuntimeSession,
+        transcript: &[ChatMessage],
         content: &str,
-        enable_thinking: bool,
-        connector: &dyn WorkerConnector,
+        config: &TurnConfig,
+        links: &dyn TurnLinks,
         sink: &mut dyn LoopSink,
-    ) -> Result<LoopEnd, SinkClosed> {
-        let mut scratch = session.transcript().to_vec();
+    ) -> Result<(LoopEnd, Option<Vec<ChatMessage>>), SinkClosed> {
+        let mut scratch = transcript.to_vec();
         scratch.push(ChatMessage::new(Role::User, content));
 
         let mut steps = 0;
-        while steps < self.step_cap {
-            let Some(link) = connector.connect() else {
-                if steps == 0 {
-                    return Self::finish(sink, 0, EndReason::NoHarness).await;
+        while steps < config.step_budget {
+            let link = match links.link(steps).await {
+                Ok(link) => link,
+                Err(message) => {
+                    if steps == 0 {
+                        return Self::ended(Self::finish(sink, 0, EndReason::NoHarness).await);
+                    }
+                    return Self::ended(Self::fail(sink, steps, &message).await);
                 }
-                return Self::fail(sink, steps, Self::NO_MODEL).await;
             };
             let tools = match link.model_props().await {
-                Ok(props) => self.tools_for(&props),
-                Err(e) => return Self::fail(sink, steps, &e.0).await,
+                Ok(props) => self.tools_for(&props, &config.tools),
+                Err(e) => return Self::ended(Self::fail(sink, steps, &e.0).await),
             };
             steps += 1;
             let request = GenerateRequest {
                 messages: scratch.clone(),
                 tools,
-                enable_thinking,
-                sampling: session.sampling.clone(),
+                enable_thinking: config.enable_thinking,
+                sampling: config.sampling.clone(),
             };
             let stream = match link.generate(&request).await {
                 Ok(stream) => stream,
-                Err(e) => return Self::fail(sink, steps, &e.0).await,
+                Err(e) => return Self::ended(Self::fail(sink, steps, &e.0).await),
             };
             let base = Self::calls_in(&scratch);
             let done = match Self::read_step(stream, base, sink).await? {
                 StepEnd::Done(done) => done,
-                StepEnd::Rejected => return Self::finish(sink, steps, EndReason::WindowFull).await,
-                StepEnd::WorkerError => return Self::finish(sink, steps, EndReason::Error).await,
-                StepEnd::Broken(message) => return Self::fail(sink, steps, &message).await,
+                StepEnd::Rejected => {
+                    return Self::ended(Self::finish(sink, steps, EndReason::WindowFull).await)
+                }
+                StepEnd::WorkerError => {
+                    return Self::ended(Self::finish(sink, steps, EndReason::Error).await)
+                }
+                StepEnd::Broken(message) => {
+                    return Self::ended(Self::fail(sink, steps, &message).await)
+                }
             };
             let Some((text, calls)) = Self::parse_done(&done) else {
-                return Self::fail(sink, steps, Self::BAD_TURN_DONE).await;
+                return Self::ended(Self::fail(sink, steps, Self::BAD_TURN_DONE).await);
             };
             scratch.extend(Self::assistant_messages(&text, &calls));
             if calls.is_empty() {
                 // Commit only once the client has been told; a closed sink keeps the old state.
                 let end = Self::finish(sink, steps, EndReason::Answered).await?;
-                session.commit(scratch);
-                return Ok(end);
+                return Ok((end, Some(scratch)));
             }
-            if steps == self.step_cap {
+            if steps == config.step_budget {
                 break;
             }
             for call in &calls {
-                let outcome = self.executor.execute(&Self::request_of(call)).await;
+                let outcome = self
+                    .executor
+                    .execute(&Self::request_of(call), &config.tools)
+                    .await;
                 let result = outcome.result_value();
                 let params = json!({
                     "id": call.id,
@@ -185,7 +210,14 @@ impl ToolLoop {
                 scratch.push(Self::tool_message(&call.id, result));
             }
         }
-        Self::finish(sink, steps, EndReason::StepLimit).await
+        Self::ended(Self::finish(sink, steps, EndReason::StepLimit).await)
+    }
+
+    /// An end that commits nothing.
+    fn ended(
+        end: Result<LoopEnd, SinkClosed>,
+    ) -> Result<(LoopEnd, Option<Vec<ChatMessage>>), SinkClosed> {
+        end.map(|end| (end, None))
     }
 
     /// Relays notes verbatim until one ends the step; a closed sink drops the stream.
@@ -222,15 +254,15 @@ impl ToolLoop {
         }
     }
 
-    /// The tools to offer the harness behind `props`: the registry's, or none when the
+    /// The tools to offer the harness behind `props`: the enabled ones, or none when the
     /// model does not support tools.
-    fn tools_for(&self, props: &Value) -> Vec<Value> {
+    fn tools_for(&self, props: &Value, enabled: &[String]) -> Vec<Value> {
         let supports_tools = props
             .get(Self::SUPPORTS_TOOLS)
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if supports_tools {
-            self.registry.openai_tools()
+            self.registry.openai_tools_for(enabled)
         } else {
             Vec::new()
         }
@@ -376,6 +408,7 @@ mod tests {
     use crate::runtime::policy::ReadOnlyPolicy;
     use crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink, Scripted};
     use crate::runtime::test_tools::TestSource;
+    use crate::runtime::tool::ToolSource;
     use std::time::Duration;
 
     const CAP: usize = 8;
@@ -384,23 +417,34 @@ mod tests {
     struct Fixture {
         tool_loop: ToolLoop,
         registry: Arc<ToolRegistry>,
-        session: RuntimeSession,
+        /// The committed transcript, as the caller of `run` keeps it.
+        transcript: Vec<ChatMessage>,
+        config: TurnConfig,
         sink: RecordingSink,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let registry =
-                Arc::new(ToolRegistry::new(vec![TestSource::echo_boxed()]).expect("registry"));
+            Self::with_sources(vec![TestSource::echo_boxed()], &["echo"])
+        }
+
+        fn with_sources(sources: Vec<Box<dyn ToolSource>>, enabled: &[&str]) -> Self {
+            let registry = Arc::new(ToolRegistry::new(sources).expect("registry"));
             let executor = Arc::new(ToolExecutor::new(
                 registry.clone(),
                 Box::new(ReadOnlyPolicy),
                 Duration::from_secs(5),
             ));
             Self {
-                tool_loop: ToolLoop::new(executor, registry.clone(), CAP),
+                tool_loop: ToolLoop::new(executor, registry.clone()),
                 registry,
-                session: RuntimeSession::new(),
+                transcript: Vec::new(),
+                config: TurnConfig {
+                    step_budget: CAP,
+                    tools: enabled.iter().map(|n| n.to_string()).collect(),
+                    enable_thinking: false,
+                    sampling: SamplingConfig::default(),
+                },
                 sink: RecordingSink::new(),
             }
         }
@@ -410,17 +454,27 @@ mod tests {
             self.run_with(&connector).await
         }
 
-        async fn run_with(&mut self, connector: &FakeConnector) -> Result<LoopEnd, SinkClosed> {
-            self.tool_loop
-                .run(&mut self.session, "q", false, connector, &mut self.sink)
-                .await
+        async fn run_with(&mut self, connector: &dyn TurnLinks) -> Result<LoopEnd, SinkClosed> {
+            let (end, committed) = self
+                .tool_loop
+                .run(
+                    &self.transcript,
+                    "q",
+                    &self.config,
+                    connector,
+                    &mut self.sink,
+                )
+                .await?;
+            if let Some(transcript) = committed {
+                self.transcript = transcript;
+            }
+            Ok(end)
         }
 
         async fn run_thinking(&mut self, link: Arc<FakeLink>) -> Result<LoopEnd, SinkClosed> {
+            self.config.enable_thinking = true;
             let connector = FakeConnector::new(Some(link));
-            self.tool_loop
-                .run(&mut self.session, "q", true, &connector, &mut self.sink)
-                .await
+            self.run_with(&connector).await
         }
 
         /// `messages` rendered through the real Gemma 4 template, as the worker would.
@@ -431,7 +485,7 @@ mod tests {
                     messages,
                     true,
                     enable_thinking,
-                    &self.registry.openai_tools(),
+                    &self.registry.openai_tools_for(&self.config.tools),
                 )
                 .expect("render")
         }
@@ -472,7 +526,7 @@ mod tests {
                 reason: EndReason::Answered
             }
         );
-        let t = f.session.transcript();
+        let t = &f.transcript;
         assert_eq!(t.len(), 2);
         assert_eq!((t[0].role, t[0].content.as_str()), (Role::User, "q"));
         assert_eq!((t[1].role, t[1].content.as_str()), (Role::Assistant, "hi"));
@@ -510,7 +564,7 @@ mod tests {
         let second_start = methods.iter().rposition(|m| *m == "turn_started").unwrap();
         assert!(first_done < result_at && result_at < second_start);
 
-        let t = f.session.transcript();
+        let t = &f.transcript;
         assert_eq!(t.len(), 4);
         assert_eq!(t[0].role, Role::User);
         let calls = t[1].tool_calls.as_ref().expect("calls");
@@ -563,7 +617,7 @@ mod tests {
             params["content"],
             json!({"error": "could not parse tool call: bad"})
         );
-        let t = f.session.transcript();
+        let t = &f.transcript;
         let args = &t[1].tool_calls.as_ref().unwrap()[0].function.arguments;
         assert_eq!(args, &json!({}));
     }
@@ -591,14 +645,14 @@ mod tests {
             .rposition(|m| *m == "turn_done")
             .unwrap();
         assert_eq!(last_done, f.sink.notes.len() - 2);
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
         assert_eq!(f.last().params["reason"], "step_limit");
     }
 
     #[tokio::test]
     async fn window_full_rolls_back() {
         let mut f = Fixture::new();
-        f.session.commit(vec![ChatMessage::new(Role::User, "old")]);
+        f.transcript = vec![ChatMessage::new(Role::User, "old")];
         let link = FakeLink::new(
             true,
             vec![Notes::script(vec![Notes::started(), Notes::rejected(9, 8)])],
@@ -611,7 +665,7 @@ mod tests {
                 reason: EndReason::WindowFull
             }
         );
-        assert_eq!(f.session.transcript().len(), 1);
+        assert_eq!(f.transcript.len(), 1);
         assert_eq!(f.last().params["reason"], "window_full");
         assert!(f.sink.methods().contains(&"turn_rejected"));
     }
@@ -627,7 +681,7 @@ mod tests {
             f.sink.methods(),
             ["turn_started", "turn_error", "loop_done"]
         );
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -643,7 +697,7 @@ mod tests {
         );
         assert_eq!(f.sink.notes.len(), 1);
         assert_eq!(f.last().params, json!({"steps": 0, "reason": "no_harness"}));
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -667,7 +721,7 @@ mod tests {
             f.sink.notes[at].params["message"],
             "worker stream ended unexpectedly"
         );
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -680,7 +734,7 @@ mod tests {
         let at = f.sink.notes.len() - 2;
         assert_eq!(f.sink.notes[at].method, "turn_error");
         assert_eq!(f.sink.notes[at].params["message"], "worker idle");
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -725,7 +779,7 @@ mod tests {
         let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
         let result = f.run(Some(link.clone())).await;
         assert_eq!(result, Err(SinkClosed));
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
         assert_eq!(link.requests().len(), 1);
         assert_eq!(f.sink.notes.len(), 1);
     }
@@ -745,7 +799,7 @@ mod tests {
         let result = f.run(Some(link.clone())).await;
         assert_eq!(result, Err(SinkClosed));
         assert_eq!(link.requests().len(), 1);
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
         assert_eq!(
             f.sink.methods(),
             ["turn_started", "turn_chunk", "tool_call", "turn_done"]
@@ -769,31 +823,29 @@ mod tests {
     #[tokio::test]
     async fn sampling_and_thinking_forwarded() {
         let mut f = Fixture::new();
-        f.session.sampling.temperature = 0.25;
-        f.session.sampling.seed = 7;
+        f.config.sampling.temperature = 0.25;
+        f.config.sampling.seed = 7;
         let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+        f.config.enable_thinking = true;
         let connector = FakeConnector::new(Some(link.clone()));
-        f.tool_loop
-            .run(&mut f.session, "q", true, &connector, &mut f.sink)
-            .await
-            .unwrap();
+        f.run_with(&connector).await.unwrap();
         let req = &link.requests()[0];
         assert!(req.enable_thinking);
-        assert_eq!(req.sampling, f.session.sampling);
+        assert_eq!(req.sampling, f.config.sampling);
         assert_eq!(req.sampling.seed, 7);
     }
 
     #[tokio::test]
     async fn answered_loop_extends_prior_transcript() {
         let mut f = Fixture::new();
-        f.session.commit(vec![
+        f.transcript = vec![
             ChatMessage::new(Role::User, "old"),
             ChatMessage::new(Role::Assistant, "older"),
-        ]);
+        ];
         let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
         f.run(Some(link.clone())).await.unwrap();
         assert_eq!(link.requests()[0].messages.len(), 3);
-        assert_eq!(f.session.transcript().len(), 4);
+        assert_eq!(f.transcript.len(), 4);
     }
 
     #[tokio::test]
@@ -833,7 +885,7 @@ mod tests {
             .map(|c| &c["id"])
             .collect();
         assert_eq!(done_ids, relayed_ids);
-        let t = f.session.transcript();
+        let t = &f.transcript;
         assert_eq!(t[1].tool_calls.as_ref().unwrap()[0].id, "call_1");
         assert_eq!(t[2].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(t[3].tool_calls.as_ref().unwrap()[0].id, "call_2");
@@ -862,7 +914,7 @@ mod tests {
             f.run(Some(link.clone())).await.unwrap().reason,
             EndReason::Answered
         );
-        let t = f.session.transcript();
+        let t = &f.transcript;
         assert_eq!(t.len(), 5);
         assert_eq!(
             (t[1].role, t[1].content.as_str()),
@@ -963,7 +1015,7 @@ mod tests {
         assert_eq!(f.sink.notes[at].method, "turn_error");
         assert_eq!(f.sink.notes[at].params["message"], "no model running");
         assert_eq!(f.last().params, json!({"steps": 1, "reason": "error"}));
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -994,7 +1046,7 @@ mod tests {
         let results = f.tool_results();
         let contents: Vec<&Value> = results.iter().map(|n| &n.params["content"]).collect();
         assert_eq!(contents, [&json!({"text": "a"}), &json!({"text": "b"})]);
-        let t = f.session.transcript();
+        let t = &f.transcript;
         assert_eq!(t.len(), 5);
         assert_eq!(t[2].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(t[2].tool_result, Some(json!({"text": "a"})));
@@ -1011,7 +1063,7 @@ mod tests {
             vec![Fixture::step("", vec![call]), Fixture::step("ok", vec![])],
         );
         f.run(Some(link)).await.unwrap();
-        let args = &f.session.transcript()[1].tool_calls.as_ref().unwrap()[0]
+        let args = &f.transcript[1].tool_calls.as_ref().unwrap()[0]
             .function
             .arguments;
         assert_eq!(args, &json!({}));
@@ -1035,7 +1087,7 @@ mod tests {
         let at = f.sink.notes.len() - 2;
         assert_eq!(f.sink.notes[at].method, "turn_error");
         assert_eq!(f.sink.notes[at].params["message"], ToolLoop::BAD_TURN_DONE);
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -1045,7 +1097,7 @@ mod tests {
         f.sink = RecordingSink::closing_after(3);
         let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
         assert_eq!(f.run(Some(link)).await, Err(SinkClosed));
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -1058,6 +1110,113 @@ mod tests {
             vec![Notes::script(vec![Notes::started(), Notes::chunk()])],
         );
         assert_eq!(f.run(Some(link)).await, Err(SinkClosed));
-        assert!(f.session.transcript().is_empty());
+        assert!(f.transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn step_budget_comes_from_config() {
+        let mut f = Fixture::new();
+        f.config.step_budget = 2;
+        let link = FakeLink::repeating(true, Fixture::step("", vec![Fixture::echo_call("c")]));
+        let end = f.run(Some(link.clone())).await.unwrap();
+        assert_eq!(
+            end,
+            LoopEnd {
+                steps: 2,
+                reason: EndReason::StepLimit
+            }
+        );
+        assert_eq!(link.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn only_enabled_tools_are_sent() {
+        let sources = vec![TestSource::echo_boxed(), TestSource::writer_boxed()];
+        let mut f = Fixture::with_sources(sources, &["echo"]);
+        let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+        f.run(Some(link.clone())).await.unwrap();
+        let requests = link.requests();
+        let names: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["echo"]);
+    }
+
+    #[tokio::test]
+    async fn call_outside_subset_is_refused() {
+        let sources = vec![TestSource::echo_boxed(), TestSource::writer_boxed()];
+        let mut f = Fixture::with_sources(sources, &["echo"]);
+        let call = Notes::call("c", "writer", json!({}));
+        let link = FakeLink::new(
+            true,
+            vec![Fixture::step("", vec![call]), Fixture::step("ok", vec![])],
+        );
+        f.run(Some(link)).await.unwrap();
+        let params = &f.tool_results()[0].params;
+        assert_eq!(params["ok"], false);
+        assert_eq!(
+            params["content"],
+            json!({"error": "tool not enabled for this agent: writer"})
+        );
+    }
+
+    #[tokio::test]
+    async fn system_prompt_renders_in_system_turn() {
+        let mut f = Fixture::new();
+        f.transcript = vec![ChatMessage::new(Role::System, "You are terse.")];
+        let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+        f.run(Some(link.clone())).await.unwrap();
+        let rendered = f.render(&link.requests()[0].messages, false);
+        // The prompt opens the system turn, ahead of the tool declarations, which close it.
+        let system_turn = "<|turn>system
+You are terse.<|tool>declaration:echo{";
+        assert!(rendered.starts_with(system_turn), "{rendered}");
+        let prompt_at = rendered.find("You are terse.").expect("prompt");
+        let tool_end = rendered.find("<tool|><turn|>").expect("system turn end");
+        let user_at = rendered.find("<|turn>user").expect("user turn");
+        assert!(prompt_at < tool_end && tool_end < user_at, "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn run_returns_transcript_only_when_answered() {
+        let f = Fixture::new();
+        let answering = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+        let links = FakeConnector::new(Some(answering));
+        let mut sink = RecordingSink::new();
+        let (end, committed) = f
+            .tool_loop
+            .run(&[], "q", &f.config, &links, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(end.reason, EndReason::Answered);
+        let committed = committed.expect("answered returns the transcript");
+        assert_eq!(committed.len(), 2);
+        assert_eq!(committed[1].content, "hi");
+
+        let looping = FakeLink::repeating(true, Fixture::step("", vec![Fixture::echo_call("c")]));
+        let links = FakeConnector::new(Some(looping));
+        let (end, committed) = f
+            .tool_loop
+            .run(&[], "q", &f.config, &links, &mut RecordingSink::new())
+            .await
+            .unwrap();
+        assert_eq!(end.reason, EndReason::StepLimit);
+        assert!(committed.is_none());
+
+        let (end, committed) = f
+            .tool_loop
+            .run(
+                &[],
+                "q",
+                &f.config,
+                &FakeConnector::new(None),
+                &mut RecordingSink::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end.reason, EndReason::NoHarness);
+        assert!(committed.is_none());
     }
 }

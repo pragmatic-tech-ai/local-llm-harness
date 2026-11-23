@@ -1,4 +1,4 @@
-//! The agent runtime's JSON-RPC websocket server: one `RuntimeSession` per client connection,
+//! The agent runtime's JSON-RPC websocket server: one transcript per client connection,
 //! `send_turn` drives the tool loop and streams its notifications while it runs.
 //!
 //! Requests on one connection run strictly one after another. A client that disconnects during
@@ -14,9 +14,9 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 
 use super::registry::ToolRegistry;
-use super::session::RuntimeSession;
-use super::tool_loop::{LoopSink, SinkClosed, ToolLoop};
-use super::worker::WorkerConnector;
+use super::tool_loop::{LoopSink, SinkClosed, ToolLoop, TurnConfig, TurnLinks};
+use super::worker::{WorkerConnector, WorkerLink};
+use crate::engine::{ChatMessage, SamplingConfig};
 use crate::rpc::{
     Failure, FrameLoop, Frames, Request, RpcDispatch, RpcError, SendTurnParams, SetSamplingParams,
     TokenizeParams, Ws, ERR_METHOD_NOT_FOUND,
@@ -30,7 +30,20 @@ pub struct RuntimeDeps {
     pub tool_loop: Arc<ToolLoop>,
 }
 
-/// Accepts websocket connections forever; each gets its own session.
+/// Scaffolding until the session-based server replaces this module: serves `TurnLinks` from the
+/// old `WorkerConnector`. A connector with no Ready harness is "no model running".
+struct ConnectorLinks(Arc<dyn WorkerConnector>);
+
+#[async_trait]
+impl TurnLinks for ConnectorLinks {
+    async fn link(&self, _step: usize) -> Result<Arc<dyn WorkerLink>, String> {
+        self.0
+            .connect()
+            .ok_or_else(|| ToolLoop::NO_MODEL.to_string())
+    }
+}
+
+/// Accepts websocket connections forever; each gets its own transcript.
 pub struct RuntimeServer;
 
 impl RuntimeServer {
@@ -73,17 +86,21 @@ impl LoopSink for WsSink<'_> {
 /// One client connection. Requests are handled sequentially.
 pub struct RuntimeConnection {
     deps: RuntimeDeps,
-    session: RuntimeSession,
+    // Scaffolding replacing the deleted `RuntimeSession`: the committed transcript and sampling.
+    transcript: Vec<ChatMessage>,
+    sampling: SamplingConfig,
     closed: bool,
 }
 
 impl RuntimeConnection {
+    const STEP_BUDGET: usize = 8;
     const CLIENT_GONE: &'static str = "client connection closed";
 
     pub fn new(deps: RuntimeDeps) -> Self {
         Self {
             deps,
-            session: RuntimeSession::new(),
+            transcript: Vec::new(),
+            sampling: SamplingConfig::default(),
             closed: false,
         }
     }
@@ -112,24 +129,36 @@ impl RuntimeConnection {
             }
             "set_sampling" => {
                 let p: SetSamplingParams = Frames::params(params)?;
-                self.session.sampling = p.config;
+                self.sampling = p.config;
                 Ok(Value::Null)
             }
             "send_turn" => {
                 let p: SendTurnParams = Frames::params(params)?;
+                let config = TurnConfig {
+                    step_budget: Self::STEP_BUDGET,
+                    tools: self
+                        .deps
+                        .registry
+                        .specs()
+                        .into_iter()
+                        .map(|s| s.name)
+                        .collect(),
+                    enable_thinking: p.enable_thinking,
+                    sampling: self.sampling.clone(),
+                };
+                let links = ConnectorLinks(self.deps.connector.clone());
                 let ran = self
                     .deps
                     .tool_loop
-                    .run(
-                        &mut self.session,
-                        &p.content,
-                        p.enable_thinking,
-                        self.deps.connector.as_ref(),
-                        sink,
-                    )
+                    .run(&self.transcript, &p.content, &config, &links, sink)
                     .await;
                 match ran {
-                    Ok(_) => Ok(Value::Null),
+                    Ok((_, committed)) => {
+                        if let Some(transcript) = committed {
+                            self.transcript = transcript;
+                        }
+                        Ok(Value::Null)
+                    }
                     Err(SinkClosed) => {
                         self.closed = true;
                         Err(RpcError::internal(Self::CLIENT_GONE))
@@ -137,7 +166,7 @@ impl RuntimeConnection {
                 }
             }
             "reset" => {
-                self.session.reset();
+                self.transcript.clear();
                 Ok(Value::Null)
             }
             "list_tools" => {
@@ -200,7 +229,7 @@ mod tests {
             let deps = RuntimeDeps {
                 connector: Arc::new(FakeConnector::new(link)),
                 registry: registry.clone(),
-                tool_loop: Arc::new(ToolLoop::new(executor, registry, 8)),
+                tool_loop: Arc::new(ToolLoop::new(executor, registry)),
             };
             Self {
                 connection: RuntimeConnection::new(deps),
@@ -254,7 +283,7 @@ mod tests {
         f.call("send_turn", json!({"content": "q2"})).await.unwrap();
         assert_eq!(link.requests()[1].messages.len(), 3);
         f.call("reset", Value::Null).await.unwrap();
-        assert!(f.connection.session.transcript().is_empty());
+        assert!(f.connection.transcript.is_empty());
     }
 
     #[tokio::test]

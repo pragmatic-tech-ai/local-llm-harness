@@ -9,7 +9,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
-use super::tool_loop::{LoopSink, SinkClosed};
+use super::tool_loop::{LoopSink, SinkClosed, ToolLoop, TurnLinks};
 use super::worker::{GenerateRequest, LinkError, Note, WorkerConnector, WorkerLink};
 
 /// What one `generate` call yields: a stream of items, or an immediate failure.
@@ -179,6 +179,14 @@ impl WorkerConnector for FakeConnector {
             links.front().cloned().expect("non-empty")
         };
         link.map(|l| l as Arc<dyn WorkerLink>)
+    }
+}
+
+#[async_trait]
+impl TurnLinks for FakeConnector {
+    /// A connector with no link reports "no model running", as the production adapter does.
+    async fn link(&self, _step: usize) -> Result<Arc<dyn WorkerLink>, String> {
+        self.connect().ok_or_else(|| ToolLoop::NO_MODEL.to_string())
     }
 }
 

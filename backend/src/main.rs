@@ -60,7 +60,6 @@ struct Config {
 
 impl Config {
     const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
-    const TOOL_STEP_CAP: usize = 8;
 
     /// The runtime's tool registry; a missing or unusable sandbox leaves only the sandbox-free
     /// tools.
@@ -122,11 +121,7 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
         Box::new(ReadOnlyPolicy),
         Config::TOOL_TIMEOUT,
     ));
-    let tool_loop = Arc::new(ToolLoop::new(
-        executor,
-        registry.clone(),
-        Config::TOOL_STEP_CAP,
-    ));
+    let tool_loop = Arc::new(ToolLoop::new(executor, registry.clone()));
     let runtime_listener = Config::bind_runtime(&config.runtime_bind).await;
     let runtime_addr = runtime_listener
         .as_ref()

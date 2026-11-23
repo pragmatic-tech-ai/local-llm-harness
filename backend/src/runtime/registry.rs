@@ -53,7 +53,22 @@ impl ToolRegistry {
 
     /// Tool list in the OpenAI chat-completions `tools` shape.
     pub fn openai_tools(&self) -> Vec<Value> {
-        self.specs()
+        Self::openai_shape(self.specs())
+    }
+
+    /// The `openai_tools` entries for the tools named in `names`, in registry order. Names the
+    /// registry does not know are ignored.
+    pub fn openai_tools_for(&self, names: &[String]) -> Vec<Value> {
+        let specs = self
+            .specs()
+            .into_iter()
+            .filter(|s| names.contains(&s.name))
+            .collect();
+        Self::openai_shape(specs)
+    }
+
+    fn openai_shape(specs: Vec<ToolSpec>) -> Vec<Value> {
+        specs
             .into_iter()
             .map(|s| {
                 json!({
@@ -82,6 +97,26 @@ mod tests {
             Err(e) => assert_eq!(e, RegistryError::Duplicate("echo".into())),
             Ok(_) => panic!("expected duplicate error"),
         }
+    }
+
+    #[test]
+    fn openai_tools_for_filters_in_registry_order() {
+        let sources: Vec<Box<dyn ToolSource>> =
+            vec![TestSource::echo_boxed(), TestSource::writer_boxed()];
+        let reg = ToolRegistry::new(sources).unwrap();
+        let names = |tools: Vec<Value>| -> Vec<String> {
+            tools
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let both = ["writer".to_string(), "echo".to_string()];
+        assert_eq!(names(reg.openai_tools_for(&both)), ["echo", "writer"]);
+        assert_eq!(
+            names(reg.openai_tools_for(&["writer".to_string()])),
+            ["writer"]
+        );
+        assert!(reg.openai_tools_for(&[]).is_empty());
     }
 
     #[test]
