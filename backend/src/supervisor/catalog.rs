@@ -45,6 +45,14 @@ pub enum CatalogError {
     Parse(#[from] toml::de::Error),
 }
 
+/// Agent runtime tool settings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolsConfig {
+    /// Directory the file tools may read; nothing outside it is reachable.
+    pub sandbox: PathBuf,
+}
+
 /// The parsed supervisor catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +65,8 @@ pub struct Catalog {
     pub advertise_host: String,
     #[serde(default = "Catalog::default_worker_port")]
     pub worker_port: u16,
+    #[serde(default)]
+    pub tools: Option<ToolsConfig>,
 }
 
 impl Catalog {
@@ -157,6 +167,32 @@ internal_port = 8080
         assert_eq!(c.advertise_host, "192.168.1.101");
         assert_eq!(c.worker_port, 8777);
         assert!(c.runtimes.is_empty());
+    }
+
+    #[test]
+    fn catalog_parses_tools_sandbox() {
+        let c = Catalog::from_toml(
+            "[tools]
+sandbox = \"C:/llm-harness/sandbox\"
+",
+        )
+        .unwrap();
+        assert_eq!(
+            c.tools,
+            Some(ToolsConfig {
+                sandbox: PathBuf::from("C:/llm-harness/sandbox")
+            })
+        );
+    }
+
+    #[test]
+    fn catalog_without_tools_section_is_none() {
+        let c = Catalog::from_toml(
+            "model_dirs = []
+",
+        )
+        .unwrap();
+        assert_eq!(c.tools, None);
     }
 
     #[test]

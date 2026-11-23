@@ -200,6 +200,7 @@ mod tests {
             model_dirs: dirs,
             advertise_host: "h".to_string(),
             worker_port: 1,
+            tools: None,
         }
     }
 

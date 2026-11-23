@@ -1,5 +1,12 @@
 use backend::engine::{build_engine, EngineConfig, EngineKind};
 use backend::rpc;
+use backend::runtime::builtin::{BuiltinSource, Sandbox};
+use backend::runtime::executor::ToolExecutor;
+use backend::runtime::policy::ReadOnlyPolicy;
+use backend::runtime::registry::ToolRegistry;
+use backend::runtime::server::{RuntimeDeps, RuntimeServer};
+use backend::runtime::tool_loop::ToolLoop;
+use backend::runtime::worker::SupervisorConnector;
 use backend::supervisor::catalog::Catalog;
 use backend::supervisor::control;
 use backend::supervisor::manager::{HarnessManager, ManagerConfig, ProcessLauncher, WsProbe};
@@ -7,6 +14,7 @@ use clap::builder::BoolishValueParser;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 
 /// Local LLM harness backend: JSON-RPC over WebSocket in front of an inference engine.
@@ -45,9 +53,33 @@ struct Config {
     /// Host advertised to clients; overrides the catalog's advertise_host.
     #[arg(long, env = "HARNESS_ADVERTISE_HOST")]
     advertise_host: Option<String>,
+    /// Address:port the supervisor's agent runtime server binds to.
+    #[arg(long, env = "HARNESS_RUNTIME_BIND", default_value = "0.0.0.0:8779")]
+    runtime_bind: String,
 }
 
 impl Config {
+    const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+    const TOOL_STEP_CAP: usize = 8;
+
+    /// The runtime's tool registry; a missing or unusable sandbox leaves only the sandbox-free
+    /// tools.
+    fn tool_registry(catalog: &Catalog) -> Result<ToolRegistry, Box<dyn std::error::Error>> {
+        let sandbox = catalog
+            .tools
+            .as_ref()
+            .and_then(|tools| match Sandbox::new(&tools.sandbox) {
+                Ok(sandbox) => Some(sandbox),
+                Err(e) => {
+                    println!("tools sandbox unavailable: {e}");
+                    None
+                }
+            });
+        Ok(ToolRegistry::new(vec![Box::new(BuiltinSource::new(
+            sandbox,
+        ))])?)
+    }
+
     fn engine_config(&self) -> EngineConfig {
         EngineConfig {
             kind: self.engine,
@@ -70,14 +102,41 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
     if let Some(host) = &config.advertise_host {
         catalog.advertise_host = host.clone();
     }
+    let registry = Arc::new(Config::tool_registry(&catalog)?);
+    let executor = Arc::new(ToolExecutor::new(
+        registry.clone(),
+        Box::new(ReadOnlyPolicy),
+        Config::TOOL_TIMEOUT,
+    ));
+    let tool_loop = Arc::new(ToolLoop::new(
+        executor,
+        registry.clone(),
+        Config::TOOL_STEP_CAP,
+    ));
+    let runtime_listener = TcpListener::bind(&config.runtime_bind).await?;
+    let runtime_addr = runtime_listener.local_addr()?;
     // The manager owns its catalog while the control server shares one via Arc: one clone.
     let shared = Arc::new(catalog.clone());
-    let manager = HarnessManager::new(
+    let manager = Arc::new(HarnessManager::new(
         catalog,
         ProcessLauncher::new(),
         WsProbe,
-        ManagerConfig::default(),
+        ManagerConfig {
+            chat_port: Some(runtime_addr.port()),
+            ..ManagerConfig::default()
+        },
+    ));
+    println!(
+        "runtime listening on ws://{} ({} tools)",
+        runtime_addr,
+        registry.specs().len()
     );
+    let deps = RuntimeDeps {
+        connector: Arc::new(SupervisorConnector::new(manager.clone())),
+        registry,
+        tool_loop,
+    };
+    tokio::spawn(RuntimeServer::serve(runtime_listener, deps));
     let listener = TcpListener::bind(&config.supervisor_bind).await?;
     println!(
         "supervisor listening on ws://{} (advertise {}, {} runtimes, {} model dirs)",
@@ -86,7 +145,7 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
         shared.runtimes.len(),
         shared.model_dirs.len()
     );
-    control::serve(listener, Arc::new(manager), shared).await;
+    control::serve(listener, manager, shared).await;
     Ok(())
 }
 
@@ -160,5 +219,11 @@ mod tests {
         assert_eq!(config.supervisor_bind, "0.0.0.0:9999");
         assert_eq!(config.catalog, Some(PathBuf::from("C:/x/catalog.toml")));
         assert_eq!(config.advertise_host.as_deref(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn runtime_bind_defaults_to_8779() {
+        let config = Config::try_parse_from(["backend", "--supervisor"]).unwrap();
+        assert_eq!(config.runtime_bind, "0.0.0.0:8779");
     }
 }

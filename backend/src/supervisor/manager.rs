@@ -37,6 +37,9 @@ pub struct HarnessInfo {
     pub model: String,
     pub state: HarnessState,
     pub url: Option<String>,
+    /// The agent runtime's websocket, published alongside `url` while Ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_url: Option<String>,
 }
 
 /// Why a manager operation failed.
@@ -277,6 +280,8 @@ pub struct ManagerConfig {
     pub ready_grace: Duration,
     /// How often a Ready harness is checked for a crash.
     pub health_interval: Duration,
+    /// Port of the agent runtime server, advertised as `chat_url`; `None` when none is hosted.
+    pub chat_port: Option<u16>,
 }
 
 impl Default for ManagerConfig {
@@ -286,6 +291,7 @@ impl Default for ManagerConfig {
             poll_interval: Duration::from_millis(250),
             ready_grace: Duration::from_secs(5),
             health_interval: Duration::from_secs(2),
+            chat_port: None,
         }
     }
 }
@@ -318,6 +324,7 @@ impl Shared {
         HarnessInfo {
             state,
             url: None,
+            chat_url: None,
             ..info.clone()
         }
     }
@@ -497,6 +504,7 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
             model: model.to_string(),
             state: HarnessState::Loading,
             url: None,
+            chat_url: None,
         };
         self.shared.publish(info.clone());
 
@@ -527,6 +535,10 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
             "ws://{}:{}",
             self.catalog.advertise_host, self.catalog.worker_port
         ));
+        info.chat_url = self
+            .config
+            .chat_port
+            .map(|port| format!("ws://{}:{}", self.catalog.advertise_host, port));
         self.shared.publish(info.clone());
         self.start_watcher(generation);
         Ok(info)
@@ -918,6 +930,7 @@ mod tests {
             model_dirs: vec![dir.to_path_buf()],
             advertise_host: "192.168.1.101".to_string(),
             worker_port: 8777,
+            tools: None,
         }
     }
 
@@ -927,6 +940,7 @@ mod tests {
             ready_grace: Duration::from_millis(20),
             poll_interval: Duration::from_millis(5),
             health_interval: Duration::from_secs(3600),
+            chat_port: None,
         }
     }
 
@@ -1023,6 +1037,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_info_carries_chat_url() {
+        let cfg = ManagerConfig {
+            chat_port: Some(8779),
+            ..config()
+        };
+        let m = HarnessManager::new(
+            catalog(&model_dir("chat")),
+            FakeLauncher::default(),
+            FakeProbe::new(Mode::Ready),
+            cfg,
+        );
+        let info = m.start("llamacpp", "lla", None).await.unwrap();
+        assert_eq!(info.chat_url.as_deref(), Some("ws://192.168.1.101:8779"));
+        let plain = manager(
+            "nochat",
+            FakeLauncher::default(),
+            FakeProbe::new(Mode::Ready),
+        );
+        let info = plain.start("llamacpp", "lla", None).await.unwrap();
+        assert_eq!(info.chat_url, None);
+    }
+
+    #[tokio::test]
     async fn http_runtime_spawns_two_children() {
         let l = FakeLauncher::default();
         let m = manager("http", l.clone(), FakeProbe::new(Mode::Ready));
@@ -1104,7 +1141,10 @@ mod tests {
         // Explicit → `-c <n>`.
         http.n_ctx = Some(2048);
         let plan = SpawnPlan::build(&http, &model, &cat, None).unwrap();
-        assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "2048"]));
+        assert!(plan.children[0]
+            .args
+            .windows(2)
+            .any(|w| w == ["-c", "2048"]));
     }
 
     #[test]
@@ -1136,7 +1176,10 @@ mod tests {
         http.internal_port = Some(8080);
         http.server_exe = Some(PathBuf::from("llama-server.exe"));
         let plan = SpawnPlan::build(&http, &model, &cat, Some(8192)).unwrap();
-        assert!(plan.children[0].args.windows(2).any(|w| w == ["-c", "8192"]));
+        assert!(plan.children[0]
+            .args
+            .windows(2)
+            .any(|w| w == ["-c", "8192"]));
     }
 
     #[tokio::test]

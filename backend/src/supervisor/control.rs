@@ -347,6 +347,7 @@ mod tests {
             model_dirs: vec![dir.to_path_buf()],
             advertise_host: "192.168.1.101".to_string(),
             worker_port: 8777,
+            tools: None,
         }
     }
 
@@ -357,6 +358,7 @@ mod tests {
             ready_grace: Duration::from_millis(20),
             poll_interval: Duration::from_millis(5),
             health_interval: Duration::from_secs(3600),
+            chat_port: None,
         };
         let manager = HarnessManager::new(cat.clone(), NullLauncher, ReadyProbe, config);
         ControlServer::new(Arc::new(manager), Arc::new(cat))

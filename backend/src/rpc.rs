@@ -26,20 +26,20 @@ use crate::engine::tool_format::{GemmaToolParser, ParseEvent, ParsedCall};
 use crate::engine::{ChatMessage, Engine, ModelProps, SamplingConfig};
 use crate::session::{ChatSession, ContextFill, TurnRejected};
 
-const ERR_PARSE: i64 = -32700;
-const ERR_METHOD_NOT_FOUND: i64 = -32601;
-const ERR_INVALID_PARAMS: i64 = -32602;
-const ERR_INTERNAL: i64 = -32603;
+pub(crate) const ERR_PARSE: i64 = -32700;
+pub(crate) const ERR_METHOD_NOT_FOUND: i64 = -32601;
+pub(crate) const ERR_INVALID_PARAMS: i64 = -32602;
+pub(crate) const ERR_INTERNAL: i64 = -32603;
 
-type Ws = WebSocketStream<TcpStream>;
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type Ws = WebSocketStream<TcpStream>;
+pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Deserialize)]
-struct Request {
-    id: Value,
-    method: String,
+pub(crate) struct Request {
+    pub(crate) id: Value,
+    pub(crate) method: String,
     #[serde(default)]
-    params: Value,
+    pub(crate) params: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,21 +71,43 @@ struct GenerateParams {
 }
 
 #[derive(Debug)]
-struct RpcError {
-    code: i64,
-    message: String,
+pub(crate) struct RpcError {
+    pub(crate) code: i64,
+    pub(crate) message: String,
 }
 
 impl RpcError {
-    fn new(code: i64, message: impl ToString) -> Self {
+    pub(crate) fn new(code: i64, message: impl ToString) -> Self {
         Self {
             code,
             message: message.to_string(),
         }
     }
 
-    fn internal(message: impl ToString) -> Self {
+    pub(crate) fn internal(message: impl ToString) -> Self {
         Self::new(ERR_INTERNAL, message)
+    }
+}
+
+/// Frame construction and writing shared by every JSON-RPC server in the crate.
+pub(crate) struct Frames;
+
+impl Frames {
+    pub(crate) fn result(id: Value, result: Value) -> Value {
+        json!({"id": id, "result": result})
+    }
+
+    pub(crate) fn error(id: Value, err: &RpcError) -> Value {
+        json!({"id": id, "error": {"code": err.code, "message": err.message}})
+    }
+
+    pub(crate) fn notification(method: &str, params: Value) -> Value {
+        json!({"method": method, "params": params})
+    }
+
+    pub(crate) async fn send(ws: &mut Ws, value: Value) -> Result<(), BoxError> {
+        ws.send(Message::text(value.to_string())).await?;
+        Ok(())
     }
 }
 
@@ -163,7 +185,7 @@ impl Connection {
             }
         };
         let frame = match self.dispatch(ws, &request).await {
-            Ok(result) => json!({"id": request.id, "result": result}),
+            Ok(result) => Frames::result(request.id, result),
             Err(Failure::Rpc(err)) => Self::error_frame(request.id, &err),
             Err(Failure::Transport(e)) => return Err(e),
         };
@@ -171,7 +193,7 @@ impl Connection {
     }
 
     fn error_frame(id: Value, err: &RpcError) -> Value {
-        json!({"id": id, "error": {"code": err.code, "message": err.message}})
+        Frames::error(id, err)
     }
 
     async fn dispatch(&mut self, ws: &mut Ws, req: &Request) -> Result<Value, Failure> {
@@ -350,14 +372,13 @@ impl Connection {
     }
 
     async fn notify(ws: &mut Ws, method: &str, params: Value) -> Result<(), Failure> {
-        Self::send_json(ws, json!({"method": method, "params": params}))
+        Self::send_json(ws, Frames::notification(method, params))
             .await
             .map_err(Failure::Transport)
     }
 
     async fn send_json(ws: &mut Ws, value: Value) -> Result<(), BoxError> {
-        ws.send(Message::text(value.to_string())).await?;
-        Ok(())
+        Frames::send(ws, value).await
     }
 }
 
