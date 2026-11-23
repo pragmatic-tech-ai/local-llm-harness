@@ -1,5 +1,6 @@
 pub mod builtin;
 pub mod executor;
+pub mod hub;
 pub mod policy;
 pub mod registry;
 pub mod server;

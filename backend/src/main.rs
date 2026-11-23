@@ -1,14 +1,20 @@
+use backend::agents::dispatcher::{Dispatcher, ExplicitLoadPolicy};
+use backend::agents::host::{LocalSupervisorHost, ModelHost};
+use backend::agents::session_store::SessionStore;
+use backend::agents::template::TemplateRules;
+use backend::agents::template_store::TemplateStore;
 use backend::engine::{build_engine, EngineConfig, EngineKind};
 use backend::rpc;
 use backend::runtime::builtin::{BuiltinSource, Sandbox};
 use backend::runtime::executor::ToolExecutor;
+use backend::runtime::hub::Hub;
 use backend::runtime::policy::ReadOnlyPolicy;
 use backend::runtime::registry::ToolRegistry;
-use backend::runtime::server::{RuntimeDeps, RuntimeServer};
+use backend::runtime::server::{CatalogView, PlacementWatcher, RuntimeDeps, RuntimeServer};
 use backend::runtime::tool_loop::ToolLoop;
-use backend::runtime::worker::SupervisorConnector;
-use backend::supervisor::catalog::Catalog;
+use backend::supervisor::catalog::{Catalog, HostConfigs};
 use backend::supervisor::control;
+use backend::supervisor::discovery::discover;
 use backend::supervisor::manager::{HarnessManager, ManagerConfig, ProcessLauncher, WsProbe};
 use clap::builder::BoolishValueParser;
 use clap::Parser;
@@ -139,17 +145,60 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
         },
     ));
     if let (Some(listener), Some(addr)) = (runtime_listener, runtime_addr) {
-        println!(
-            "runtime listening on ws://{} ({} tools)",
-            addr,
-            registry.specs().len()
-        );
-        let deps = RuntimeDeps {
-            connector: Arc::new(SupervisorConnector::new(manager.clone())),
-            registry,
-            tool_loop,
+        // Interim wiring; the supervisor-wiring task replaces it with the tested builder.
+        let hosts: Vec<Arc<dyn ModelHost>> = HostConfigs::build(&shared)?
+            .into_iter()
+            .map(|h| {
+                Arc::new(LocalSupervisorHost::new(h.name, manager.clone(), &shared))
+                    as Arc<dyn ModelHost>
+            })
+            .collect();
+        let models = discover(&shared);
+        let rules = TemplateRules {
+            runtimes: shared.runtimes.iter().map(|r| r.name.clone()).collect(),
+            models: models
+                .iter()
+                .map(|m| (m.display_name.clone(), m.runtimes.clone()))
+                .collect(),
+            tools: registry.specs().into_iter().map(|s| s.name).collect(),
         };
-        tokio::spawn(RuntimeServer::serve(listener, deps));
+        let catalog = CatalogView {
+            runtimes: shared
+                .runtimes
+                .iter()
+                .map(|r| serde_json::json!({ "name": r.name }))
+                .collect(),
+            models: models
+                .iter()
+                .map(|m| serde_json::json!({ "name": m.display_name, "runtimes": m.runtimes }))
+                .collect(),
+            hosts: hosts.iter().map(|h| h.name().to_string()).collect(),
+        };
+        let data_dir = shared.agents.data_dir();
+        match (
+            TemplateStore::open(&data_dir.join("templates"), rules),
+            SessionStore::open(&data_dir.join("sessions")),
+        ) {
+            (Ok(templates), Ok(sessions)) => {
+                let deps = RuntimeDeps {
+                    templates: Arc::new(templates),
+                    sessions: Arc::new(sessions),
+                    dispatcher: Arc::new(Dispatcher::new(hosts, Box::new(ExplicitLoadPolicy))),
+                    registry,
+                    tool_loop,
+                    catalog,
+                    hub: Arc::new(Hub::new()),
+                };
+                println!(
+                    "runtime listening on ws://{} ({} tools)",
+                    addr,
+                    deps.registry.specs().len()
+                );
+                PlacementWatcher::spawn(&deps);
+                tokio::spawn(RuntimeServer::serve(listener, deps));
+            }
+            (Err(e), _) | (_, Err(e)) => eprintln!("agents data unavailable: {e}"),
+        }
     }
     let listener = TcpListener::bind(&config.supervisor_bind).await?;
     println!(

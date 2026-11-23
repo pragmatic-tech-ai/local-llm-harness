@@ -1,4 +1,5 @@
-//! Fakes shared by runtime tests: a scripted worker link/connector and a recording sink.
+//! Fakes shared by runtime tests: a scripted worker link/connector, a recording sink, a temp
+//! dir and a complete `RuntimeDeps` builder ([`TestRuntime`]).
 //! Import as `crate::runtime::test_support::{FakeConnector, FakeLink, RecordingSink, Notes}`.
 
 use std::collections::VecDeque;
@@ -225,5 +226,118 @@ impl LoopSink for RecordingSink {
         }
         self.notes.push(Notes::note(method, params));
         Ok(())
+    }
+}
+
+/// A unique temp directory, removed on drop.
+pub(crate) struct TempDir(pub(crate) std::path::PathBuf);
+
+impl TempDir {
+    pub(crate) fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        Self(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A complete `RuntimeDeps` over temp-dir stores, one `FakeHost` and a registry holding the test
+/// `echo` tool. The template store seeds its `Default` template (id [`Self::TEMPLATE_ID`]) for
+/// runtime [`Self::RUNTIME`] and model [`Self::MODEL`], which the host serves with `link`.
+pub(crate) struct TestRuntime {
+    pub(crate) deps: super::server::RuntimeDeps,
+    pub(crate) host: Arc<crate::agents::host::FakeHost>,
+    pub(crate) dir: TempDir,
+}
+
+impl TestRuntime {
+    pub(crate) const HOST: &'static str = "hive";
+    pub(crate) const RUNTIME: &'static str = "llamacpp";
+    pub(crate) const MODEL: &'static str = "tiny";
+    pub(crate) const TEMPLATE_ID: &'static str = "default";
+    const TEMPLATES_DIR: &'static str = "templates";
+    const SESSIONS_DIR: &'static str = "sessions";
+    const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub(crate) fn new(tag: &str, link: Arc<FakeLink>) -> Self {
+        use super::executor::ToolExecutor;
+        use super::policy::ReadOnlyPolicy;
+        use super::registry::ToolRegistry;
+        use super::test_tools::TestSource;
+        use crate::agents::dispatcher::{Dispatcher, ExplicitLoadPolicy};
+        use crate::agents::host::{FakeHost, ModelHost};
+        use crate::agents::session_store::SessionStore;
+        use crate::agents::template_store::TemplateStore;
+
+        let dir = TempDir::new(tag);
+        let registry =
+            Arc::new(ToolRegistry::new(vec![TestSource::echo_boxed()]).expect("registry"));
+        let executor = Arc::new(ToolExecutor::new(
+            registry.clone(),
+            Box::new(ReadOnlyPolicy),
+            Self::TOOL_TIMEOUT,
+        ));
+        let host = FakeHost::serving_with_link(Self::HOST, &[(Self::RUNTIME, Self::MODEL)], link);
+        let hosts: Vec<Arc<dyn ModelHost>> = vec![host.clone()];
+        let templates =
+            TemplateStore::open(&dir.0.join(Self::TEMPLATES_DIR), Self::rules(&registry))
+                .expect("template store");
+        let sessions = SessionStore::open(&dir.0.join(Self::SESSIONS_DIR)).expect("session store");
+        let deps = super::server::RuntimeDeps {
+            templates: Arc::new(templates),
+            sessions: Arc::new(sessions),
+            dispatcher: Arc::new(Dispatcher::new(hosts, Box::new(ExplicitLoadPolicy))),
+            registry: registry.clone(),
+            tool_loop: Arc::new(super::tool_loop::ToolLoop::new(executor, registry)),
+            catalog: Self::catalog(),
+            hub: Arc::new(super::hub::Hub::new()),
+        };
+        Self { deps, host, dir }
+    }
+
+    /// Runtime `llamacpp` and model `tiny` (servable by it), plus every registry tool.
+    pub(crate) fn rules(
+        registry: &super::registry::ToolRegistry,
+    ) -> crate::agents::template::TemplateRules {
+        crate::agents::template::TemplateRules {
+            runtimes: vec![Self::RUNTIME.to_string()],
+            models: vec![(Self::MODEL.to_string(), vec![Self::RUNTIME.to_string()])],
+            tools: registry.specs().into_iter().map(|s| s.name).collect(),
+        }
+    }
+
+    pub(crate) fn catalog() -> super::server::CatalogView {
+        super::server::CatalogView {
+            runtimes: vec![json!({"name": Self::RUNTIME})],
+            models: vec![json!({"name": Self::MODEL, "runtimes": [Self::RUNTIME]})],
+            hosts: vec![Self::HOST.to_string()],
+        }
+    }
+
+    /// The seeded template, as stored.
+    pub(crate) fn template(&self) -> crate::agents::template::AgentTemplate {
+        self.deps
+            .templates
+            .get(Self::TEMPLATE_ID)
+            .expect("seed template")
+            .0
+    }
+
+    /// Marks the seeded template's model loaded on the host (firing its signal).
+    pub(crate) fn load(&self) {
+        let t = self.template();
+        self.host.set_state(crate::agents::host::HostState {
+            loaded: Some((t.runtime, t.model, Some(t.n_ctx))),
+            loading: false,
+        });
     }
 }

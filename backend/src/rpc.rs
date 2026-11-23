@@ -54,7 +54,7 @@ pub(crate) struct SetSamplingParams {
     pub(crate) config: SamplingConfig,
 }
 
-/// `send_turn` params, shared by the worker and the agent runtime.
+/// The worker's `send_turn` params.
 #[derive(Debug, Deserialize)]
 pub(crate) struct SendTurnParams {
     pub(crate) content: String,
@@ -119,13 +119,12 @@ impl Frames {
     }
 }
 
-/// Why a request failed: a JSON-RPC error (reported to the client as an error response), a
+/// Why a request failed: a JSON-RPC error (reported to the client as an error response) or a
 /// transport failure (the socket is dead, so the connection ends with that error and no
-/// reply), or the client is gone (the connection ends quietly, no reply).
+/// reply).
 pub(crate) enum Failure {
     Rpc(RpcError),
     Transport(BoxError),
-    Closed,
 }
 
 impl From<RpcError> for Failure {
@@ -142,8 +141,8 @@ pub(crate) trait RpcDispatch: Send {
     async fn dispatch(&mut self, ws: &mut Ws, request: &Request) -> Result<Value, Failure>;
 }
 
-/// The websocket frame loop shared by the worker and the agent runtime: accept, read text
-/// frames, decode the envelope, dispatch, answer.
+/// The worker's websocket frame loop: accept, read text frames, decode the envelope, dispatch,
+/// answer.
 pub(crate) struct FrameLoop;
 
 impl FrameLoop {
@@ -156,35 +155,30 @@ impl FrameLoop {
             let Message::Text(text) = frame? else {
                 continue;
             };
-            if !Self::handle_frame(dispatcher, &mut ws, text.as_str()).await? {
-                break;
-            }
+            Self::handle_frame(dispatcher, &mut ws, text.as_str()).await?;
         }
         Ok(())
     }
 
-    /// Answers one frame; `Ok(false)` means the connection is over.
+    /// Answers one frame.
     async fn handle_frame<D: RpcDispatch>(
         dispatcher: &mut D,
         ws: &mut Ws,
         text: &str,
-    ) -> Result<bool, BoxError> {
+    ) -> Result<(), BoxError> {
         let request: Request = match serde_json::from_str(text) {
             Ok(r) => r,
             Err(e) => {
                 let err = RpcError::new(ERR_PARSE, e);
-                Frames::send(ws, Frames::error(Value::Null, &err)).await?;
-                return Ok(true);
+                return Frames::send(ws, Frames::error(Value::Null, &err)).await;
             }
         };
         let frame = match dispatcher.dispatch(ws, &request).await {
             Ok(result) => Frames::result(request.id, result),
             Err(Failure::Rpc(err)) => Frames::error(request.id, &err),
             Err(Failure::Transport(e)) => return Err(e),
-            Err(Failure::Closed) => return Ok(false),
         };
-        Frames::send(ws, frame).await?;
-        Ok(true)
+        Frames::send(ws, frame).await
     }
 }
 
@@ -663,6 +657,29 @@ pub(crate) mod test_support {
                 notes.push(value);
             }
             panic!("connection closed before the response");
+        }
+
+        /// Reads frames until a notification named `method` arrives; returns every frame read,
+        /// that one included. Fails the test after a few seconds.
+        pub(crate) async fn notes_until(&mut self, method: &str) -> Vec<Value> {
+            const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+            let mut notes = Vec::new();
+            loop {
+                let frame = tokio::time::timeout(WAIT, self.ws.next())
+                    .await
+                    .expect("timed out waiting for a notification")
+                    .expect("connection closed")
+                    .expect("frame");
+                let Message::Text(text) = frame else {
+                    continue;
+                };
+                let value: Value = serde_json::from_str(text.as_str()).expect("json");
+                let done = value["method"] == method;
+                notes.push(value);
+                if done {
+                    return notes;
+                }
+            }
         }
 
         /// The `method` of each notification, in order.
