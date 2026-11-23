@@ -83,11 +83,11 @@ export class ChatViewModel extends Observable
         {
             this.subscriptions.push(
                 client.OnTurnStarted.Subscribe(() => this.OnPassStarted()),
-                client.OnTurnChunk.Subscribe(p => this.segment?.Append(p.text)),
+                client.OnTurnChunk.Subscribe(p => this.OnChunk(p.text)),
                 client.OnTurnDone.Subscribe(() => { this.segment = null }),
                 client.OnTurnError.Subscribe(p => this.ReportFailure(ChatViewModel.Format(ChatViewModel.ErrorFormat, p.message))),
                 client.OnTurnRejected.Subscribe(p => this.ReportFailure(ChatViewModel.Format(ChatViewModel.RejectedFormat, p.needed, p.total))),
-                client.OnToolCall.Subscribe(p => this.Transcript.Add(ChatViewModel.CallMessage(p))),
+                client.OnToolCall.Subscribe(p => this.OnToolCall(p)),
                 client.OnToolResult.Subscribe(p => this.Transcript.Add(new ToolResultMessage(p.name, p.ok, ChatViewModel.Stringify(p.content)))),
                 client.OnLoopDone.Subscribe(p => this.OnLoopDone(p.reason)))
         }
@@ -183,6 +183,28 @@ export class ChatViewModel extends Observable
             this.segment = new AssistantMessage('')
             this.Transcript.Add(this.segment)
         }
+    }
+
+    /** Chunks go to the live segment; after a tool call closed it, the next chunk of the pass opens a new one below the call. */
+    private OnChunk(text: string): void
+    {
+        if (this.segment === null)
+        {
+            if (!this.busy || text.length === 0)
+            {
+                return
+            }
+            this.segment = new AssistantMessage('')
+            this.Transcript.Add(this.segment)
+        }
+        this.segment.Append(text)
+    }
+
+    /** A call block closes the live segment so later text of the same pass renders below it. */
+    private OnToolCall(p: ToolCallNote): void
+    {
+        this.Transcript.Add(ChatViewModel.CallMessage(p))
+        this.segment = null
     }
 
     private ReportFailure(note: string): void

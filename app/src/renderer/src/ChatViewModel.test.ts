@@ -348,6 +348,32 @@ describe('ChatViewModel', () =>
         expect(rig.Count()).toBe(2)
     })
 
+    it('chunks_after_a_call_render_below_the_call_block', () =>
+    {
+        const rig = new Rig(true)
+        rig.Send('time?')
+        rig.Notify('turn_started', { prompt: 'p', prompt_tokens: 1, n_ctx: 8 })
+        rig.Notify('turn_chunk', { text: 'Let me check.', tokens: [], stop: false })
+        rig.Notify('tool_call', { id: 'call_1', name: 'get_time', arguments: {}, raw: 'call:get_time{}' })
+        rig.Notify('turn_chunk', { text: '<|tool_response>', tokens: [], stop: false })
+        rig.Notify('turn_done', {})
+        const items = rig.vm.Transcript.ToArray()
+        expect(items.map(i => i.constructor.name)).toEqual(['UserMessage', 'AssistantMessage', 'ToolCallMessage', 'AssistantMessage'])
+        expect((items[1] as AssistantMessage).Text).toBe('Let me check.')
+        expect((items[3] as AssistantMessage).Text).toBe('<|tool_response>')
+    })
+
+    it('empty_chunk_after_a_call_opens_no_segment', () =>
+    {
+        const rig = new Rig(true)
+        rig.Send('time?')
+        rig.Notify('turn_started', { prompt: 'p', prompt_tokens: 1, n_ctx: 8 })
+        rig.Notify('tool_call', { id: 'call_1', name: 'get_time', arguments: {}, raw: 'call:get_time{}' })
+        rig.Notify('turn_chunk', { text: '', tokens: [], stop: true })
+        rig.Notify('turn_done', {})
+        expect(rig.vm.Transcript.ToArray().map(i => i.constructor.name)).toEqual(['UserMessage', 'AssistantMessage', 'ToolCallMessage'])
+    })
+
     it('tool_call_with_parse_error_shows_raw_and_error', () =>
     {
         const rig = new Rig(true)
