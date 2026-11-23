@@ -153,7 +153,8 @@ export class ChatViewModel extends Observable
         this.Panel.ClearWarning()
         // Apply the knobs to THIS turn (set_sampling lands before send_turn on the single ws stream).
         client.SetSampling(this.Panel.Config).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
-        client.SendTurn(draft, this.Panel.EnableThinking).then(
+        client.SetThinking(this.Panel.EnableThinking).catch((e: Error) => this.Panel.ReportSamplingError(e.message))
+        client.SendTurn(draft).then(
             () => this.Settle(token),
             (e: Error) =>
             {

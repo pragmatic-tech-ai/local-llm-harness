@@ -1,6 +1,14 @@
-import type { SamplingConfig } from './RuntimeClient'
-
 /** Wire shapes of the runtime's template and session protocol. Fields keep the wire's snake_case. */
+
+export interface SamplingConfig
+{
+    temperature: number
+    top_p: number
+    top_k: number
+    repeat_penalty: number
+    seed: number
+    max_tokens: number
+}
 
 export interface AgentTemplate
 {

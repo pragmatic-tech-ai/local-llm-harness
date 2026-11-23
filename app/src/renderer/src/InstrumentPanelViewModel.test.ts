@@ -76,7 +76,7 @@ describe('InstrumentPanelViewModel', () =>
         const sent = rig.SamplingSent()
         expect(sent.map(c => c.temperature)).toEqual([0.8, 1.5])
         // set_sampling lands before each send_turn
-        expect(rig.Methods().filter(m => m !== 'model_props')).toEqual(['set_sampling', 'send_turn', 'set_sampling', 'send_turn'])
+        expect(rig.Methods().filter(m => m !== 'model_props')).toEqual(['set_sampling', 'set_thinking', 'send_turn', 'set_sampling', 'set_thinking', 'send_turn'])
     })
 
     it('ForwardsThinkingToggleOnSend', () =>
@@ -84,8 +84,9 @@ describe('InstrumentPanelViewModel', () =>
         const rig = new Rig()
         rig.vm.Panel.EnableThinking = true
         rig.Send('one')
-        const turn = rig.socket.sent.map(f => JSON.parse(f)).find(f => f.method === 'send_turn')
-        expect(turn.params.enable_thinking).toBe(true)
+        const frames = rig.socket.sent.map(f => JSON.parse(f))
+        expect(frames.find(f => f.method === 'set_thinking').params).toEqual({ enable: true })
+        expect(frames.find(f => f.method === 'send_turn').params).toEqual({ content: 'one' })
     })
 
     it('KnobSetterAssignsBeforeNotifying', () =>

@@ -86,7 +86,7 @@ describe('RuntimeClient', () =>
     it('RejectsImmediatelyWhenNeverConnected', async () =>
     {
         const client = new RuntimeClient()
-        await expect(client.SendTurn('hi', false)).rejects.toThrow('not connected')
+        await expect(client.SendTurn('hi')).rejects.toThrow('not connected')
     })
 
     it('QueuesWhileConnectingThenFlushesOnOpen', () =>
@@ -108,7 +108,7 @@ describe('RuntimeClient', () =>
         const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
-        const inFlight = client.SendTurn('hi', false)
+        const inFlight = client.SendTurn('hi')
         socket.Close()
         await expect(inFlight).rejects.toThrow('not connected')
         await expect(client.ModelProps()).rejects.toThrow('not connected')
@@ -147,7 +147,7 @@ describe('RuntimeClient', () =>
         const client = new RuntimeClient(() => socket)
         client.Connect('ws://x')
         socket.Open()
-        const inFlight = client.SendTurn('hi', false)
+        const inFlight = client.SendTurn('hi')
         client.Disconnect()
         await expect(inFlight).rejects.toThrow('not connected')
         expect(socket.closeCalls).toBe(1)
@@ -225,28 +225,42 @@ describe('RuntimeClient', () =>
     {
         const template = { name: 'T' } as AgentTemplate
         const sampling = { temperature: 1, top_p: 1, top_k: 1, repeat_penalty: 1, seed: 1, max_tokens: 1 }
-        const table: { call: (c: RuntimeClient) => Promise<unknown>, method: string, params: unknown }[] = [
-            { call: c => c.ListTemplates(), method: 'list_templates', params: {} },
-            { call: c => c.GetTemplate('a'), method: 'get_template', params: { id: 'a' } },
-            { call: c => c.SaveTemplate('a', 'g', template), method: 'save_template', params: { id: 'a', path: 'g', template } },
-            { call: c => c.SaveTemplate(undefined, undefined, template), method: 'save_template', params: { template } },
-            { call: c => c.DeleteTemplate('a'), method: 'delete_template', params: { id: 'a' } },
-            { call: c => c.CreateGroup('g'), method: 'create_group', params: { path: 'g' } },
-            { call: c => c.RenameGroup('g', 'h'), method: 'rename_group', params: { path: 'g', new_name: 'h' } },
-            { call: c => c.DeleteGroup('g'), method: 'delete_group', params: { path: 'g' } },
-            { call: c => c.MoveTemplate('a', 'g'), method: 'move_template', params: { id: 'a', path: 'g' } },
-            { call: c => c.ListCatalog(), method: 'list_catalog', params: {} },
-            { call: c => c.ListAllTools(), method: 'list_all_tools', params: {} },
-            { call: c => c.ListSessions(), method: 'list_sessions', params: {} },
-            { call: c => c.CreateSession('t'), method: 'create_session', params: { template_id: 't' } },
-            { call: c => c.AttachSession('s'), method: 'attach_session', params: { id: 's' } },
-            { call: c => c.RenameSession('s', 'x'), method: 'rename_session', params: { id: 's', title: 'x' } },
-            { call: c => c.DeleteSession('s'), method: 'delete_session', params: { id: 's' } },
-            { call: c => c.LoadSessionModel('s'), method: 'load_session_model', params: { id: 's' } },
-            { call: c => c.UnloadSessionModel('s'), method: 'unload_session_model', params: { id: 's' } },
-            { call: c => c.SetThinking(true), method: 'set_thinking', params: { enable: true } },
-            { call: c => c.SetSampling(sampling), method: 'set_sampling', params: { config: sampling } },
-            { call: c => c.Reset(), method: 'reset', params: {} }
+        const placement = { state: 'needs_load', host: 'h', evicts: null }
+        const summary = { id: 's', title: 't', template_id: 'a', template_name: 'T', runtime: 'r', model: 'm', updated: 7, placement, busy: false }
+        const attached = { summary, snapshot: template, transcript: [{ role: 'user', content: 'hi' }], sampling, enable_thinking: true, placement }
+        const nodes = [{ kind: 'template', id: 'a', path: '', name: 'T', runtime: 'r', model: 'm', error: null }]
+        const record = { id: 'a', path: 'g', template }
+        const catalog = { runtimes: [{ name: 'r' }], models: [{ name: 'm' }], hosts: ['h'] }
+        const specs = [{ name: 'echo', description: 'd', parameters: {}, side_effects: false }]
+        const props = { n_ctx: 4096, model_name: 'm' }
+        const tokens = { tokens: [1, 2], count: 2 }
+        // reply is the wire result; result is what the method must resolve to (defaults to the reply).
+        const table: { call: (c: RuntimeClient) => Promise<unknown>, method: string, params: unknown, reply: unknown, result?: unknown }[] = [
+            { call: c => c.ListTemplates(), method: 'list_templates', params: {}, reply: nodes },
+            { call: c => c.GetTemplate('a'), method: 'get_template', params: { id: 'a' }, reply: record },
+            { call: c => c.SaveTemplate('a', 'g', template), method: 'save_template', params: { id: 'a', path: 'g', template }, reply: { id: 'a' }, result: 'a' },
+            { call: c => c.SaveTemplate(undefined, undefined, template), method: 'save_template', params: { template }, reply: { id: 'new' }, result: 'new' },
+            { call: c => c.DeleteTemplate('a'), method: 'delete_template', params: { id: 'a' }, reply: null, result: undefined },
+            { call: c => c.CreateGroup('g'), method: 'create_group', params: { path: 'g' }, reply: null, result: undefined },
+            { call: c => c.RenameGroup('g', 'h'), method: 'rename_group', params: { path: 'g', new_name: 'h' }, reply: null, result: undefined },
+            { call: c => c.DeleteGroup('g'), method: 'delete_group', params: { path: 'g' }, reply: null, result: undefined },
+            { call: c => c.MoveTemplate('a', 'g'), method: 'move_template', params: { id: 'a', path: 'g' }, reply: null, result: undefined },
+            { call: c => c.ListCatalog(), method: 'list_catalog', params: {}, reply: catalog },
+            { call: c => c.ListAllTools(), method: 'list_all_tools', params: {}, reply: specs },
+            { call: c => c.ListTools(), method: 'list_tools', params: {}, reply: specs },
+            { call: c => c.ListSessions(), method: 'list_sessions', params: {}, reply: [summary] },
+            { call: c => c.CreateSession('t'), method: 'create_session', params: { template_id: 't' }, reply: summary },
+            { call: c => c.AttachSession('s'), method: 'attach_session', params: { id: 's' }, reply: attached },
+            { call: c => c.RenameSession('s', 'x'), method: 'rename_session', params: { id: 's', title: 'x' }, reply: null, result: undefined },
+            { call: c => c.DeleteSession('s'), method: 'delete_session', params: { id: 's' }, reply: null, result: undefined },
+            { call: c => c.LoadSessionModel('s'), method: 'load_session_model', params: { id: 's' }, reply: { state: 'ready', host: 'h' } },
+            { call: c => c.UnloadSessionModel('s'), method: 'unload_session_model', params: { id: 's' }, reply: null, result: undefined },
+            { call: c => c.SetThinking(true), method: 'set_thinking', params: { enable: true }, reply: null, result: undefined },
+            { call: c => c.SetSampling(sampling), method: 'set_sampling', params: { config: sampling }, reply: null, result: undefined },
+            { call: c => c.Reset(), method: 'reset', params: {}, reply: null, result: undefined },
+            { call: c => c.SendTurn('hi'), method: 'send_turn', params: { content: 'hi' }, reply: null, result: undefined },
+            { call: c => c.ModelProps(), method: 'model_props', params: {}, reply: props },
+            { call: c => c.Tokenize('abc'), method: 'tokenize', params: { text: 'abc' }, reply: tokens }
         ]
         for (const row of table)
         {
@@ -258,8 +272,9 @@ describe('RuntimeClient', () =>
             const frame = JSON.parse(socket.sent[0])
             expect(frame.method).toBe(row.method)
             expect(frame.params).toEqual(row.params)
-            client.HandleFrame(JSON.stringify({ id: frame.id, result: row.method === 'save_template' ? { id: 'a' } : null }))
-            await pending
+            client.HandleFrame(JSON.stringify({ id: frame.id, result: row.reply }))
+            const expected = 'result' in row ? row.result : row.reply
+            await expect(pending, row.method).resolves.toEqual(expected)
         }
     })
 

@@ -9,22 +9,15 @@ import type {
     SessionLoading,
     SessionSummary,
     TemplateNode,
+    SamplingConfig,
     TemplateRecord,
     ToolSpec
 } from './agents'
 
+export type { SamplingConfig }
+
 export { TypedSignal }
 export type { IHarnessSocket, HarnessSocketFactory, IDisposable } from './JsonRpcConnection'
-
-export interface SamplingConfig
-{
-    temperature: number
-    top_p: number
-    top_k: number
-    repeat_penalty: number
-    seed: number
-    max_tokens: number
-}
 
 export interface ModelProps
 {
@@ -92,13 +85,6 @@ export interface LoopDone
 {
     steps: number
     reason: string
-}
-
-export interface ToolInfo
-{
-    name: string
-    description: string
-    side_effects: boolean
 }
 
 /** JSON-RPC client for the agent runtime: templates, sessions, catalog and the attached session chat stream. */
@@ -172,15 +158,15 @@ export class RuntimeClient extends JsonRpcConnection
     }
 
     /** The agent runtime's tool catalogue (a plain worker rejects this). */
-    public ListTools(): Promise<ToolInfo[]>
+    public ListTools(): Promise<ToolSpec[]>
     {
-        return this.Request<ToolInfo[]>(RuntimeClient.MethodListTools, {})
+        return this.Request<ToolSpec[]>(RuntimeClient.MethodListTools, {})
     }
 
     /** Resolves when the send_turn response arrives, i.e. after the stream's terminal notification. */
-    public async SendTurn(content: string, enableThinking: boolean): Promise<void>
+    public async SendTurn(content: string): Promise<void>
     {
-        await this.Request<null>(RuntimeClient.MethodSendTurn, { content, enable_thinking: enableThinking })
+        await this.Request<null>(RuntimeClient.MethodSendTurn, { content })
     }
 
     public ListTemplates(): Promise<TemplateNode[]>
@@ -239,7 +225,7 @@ export class RuntimeClient extends JsonRpcConnection
         return this.Request<CatalogInfo>(RuntimeClient.MethodListCatalog, {})
     }
 
-    /** Every tool in the runtime registry (ListTools is the attached session own subset). */
+    /** Every tool in the runtime registry (ListTools is the attached session's own subset). */
     public ListAllTools(): Promise<ToolSpec[]>
     {
         return this.Request<ToolSpec[]>(RuntimeClient.MethodListAllTools, {})

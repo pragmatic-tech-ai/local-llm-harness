@@ -1,5 +1,6 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { RuntimeClient, TypedSignal, type IDisposable, type ModelProps, type SamplingConfig } from './RuntimeClient'
+import { RuntimeClient, TypedSignal, type IDisposable, type ModelProps } from './RuntimeClient'
+import type { SamplingConfig } from './agents'
 import { LogprobVM } from './LogprobVM'
 
 /** Low-level state of the model: sampling knobs, raw prompt, context fill, logprobs, tokenization. */
