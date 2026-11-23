@@ -276,7 +276,6 @@ pub(crate) struct FakeHost {
 }
 
 #[cfg(test)]
-#[allow(dead_code)] // used by the dispatcher tests (next task)
 impl FakeHost {
     /// A host that serves nothing, with an empty (tool-less) `FakeLink`.
     pub(crate) fn new(name: &str) -> Arc<Self> {
@@ -298,6 +297,15 @@ impl FakeHost {
         link: Arc<crate::runtime::test_support::FakeLink>,
     ) -> Arc<Self> {
         Self::build(name, &[], link)
+    }
+
+    /// A host serving each `(runtime, model)` that hands out `link`.
+    pub(crate) fn serving_with_link(
+        name: &str,
+        serves: &[(&str, &str)],
+        link: Arc<crate::runtime::test_support::FakeLink>,
+    ) -> Arc<Self> {
+        Self::build(name, serves, link)
     }
 
     fn build(
