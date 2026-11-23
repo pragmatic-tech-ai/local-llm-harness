@@ -348,6 +348,8 @@ mod tests {
             advertise_host: "192.168.1.101".to_string(),
             worker_port: 8777,
             tools: None,
+            agents: Default::default(),
+            hosts: Vec::new(),
         }
     }
 

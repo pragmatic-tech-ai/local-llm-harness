@@ -201,6 +201,8 @@ mod tests {
             advertise_host: "h".to_string(),
             worker_port: 1,
             tools: None,
+            agents: Default::default(),
+            hosts: Vec::new(),
         }
     }
 

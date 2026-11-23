@@ -53,6 +53,63 @@ pub struct ToolsConfig {
     pub sandbox: PathBuf,
 }
 
+/// Agent templates and sessions settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsConfig {
+    /// Root of the agent data (templates, sessions); defaults to `AgentsConfig::DEFAULT_DATA_DIR`.
+    #[serde(default)]
+    pub data_dir: Option<PathBuf>,
+}
+
+impl AgentsConfig {
+    const DEFAULT_DATA_DIR: &'static str = "C:\\llm-harness\\agent-data";
+
+    /// The configured agent data directory, or the default.
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(Self::DEFAULT_DATA_DIR))
+    }
+}
+
+/// One `[[host]]` entry: a machine that serves models.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfig {
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub local: bool,
+}
+
+/// Validation of the `[[host]]` list.
+pub struct HostConfigs;
+
+impl HostConfigs {
+    const KIND_SUPERVISOR: &'static str = "supervisor";
+    const IMPLICIT_NAME: &'static str = "hive";
+    const ERR_UNSUPPORTED: &'static str = "host kind not supported yet";
+
+    /// The catalog's hosts: the implicit local `hive` supervisor when none are listed; any
+    /// entry that is not a local `supervisor` is rejected for now.
+    pub fn build(catalog: &Catalog) -> Result<Vec<HostConfig>, String> {
+        if catalog.hosts.is_empty() {
+            return Ok(vec![HostConfig {
+                name: Self::IMPLICIT_NAME.to_string(),
+                kind: Self::KIND_SUPERVISOR.to_string(),
+                local: true,
+            }]);
+        }
+        for host in &catalog.hosts {
+            if host.kind != Self::KIND_SUPERVISOR || !host.local {
+                return Err(format!("{}: {}", Self::ERR_UNSUPPORTED, host.kind));
+            }
+        }
+        Ok(catalog.hosts.clone())
+    }
+}
+
 /// The parsed supervisor catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +124,10 @@ pub struct Catalog {
     pub worker_port: u16,
     #[serde(default)]
     pub tools: Option<ToolsConfig>,
+    #[serde(default)]
+    pub agents: AgentsConfig,
+    #[serde(default, rename = "host")]
+    pub hosts: Vec<HostConfig>,
 }
 
 impl Catalog {
@@ -193,6 +254,85 @@ sandbox = \"C:/llm-harness/sandbox\"
         )
         .unwrap();
         assert_eq!(c.tools, None);
+    }
+
+    #[test]
+    fn host_config_defaults_to_local_hive() {
+        let c = Catalog::from_toml(
+            "model_dirs = []
+",
+        )
+        .unwrap();
+        assert_eq!(
+            HostConfigs::build(&c).unwrap(),
+            vec![HostConfig {
+                name: "hive".into(),
+                kind: "supervisor".into(),
+                local: true
+            }]
+        );
+    }
+
+    #[test]
+    fn host_config_accepts_local_supervisor() {
+        let c = Catalog::from_toml(
+            "[[host]]
+name = \"box\"
+kind = \"supervisor\"
+local = true
+",
+        )
+        .unwrap();
+        let hosts = HostConfigs::build(&c).unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "box");
+    }
+
+    #[test]
+    fn rejects_unsupported_host_kind() {
+        let c = Catalog::from_toml(
+            "[[host]]
+name = \"x\"
+kind = \"api\"
+",
+        )
+        .unwrap();
+        assert_eq!(
+            HostConfigs::build(&c),
+            Err("host kind not supported yet: api".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_non_local_supervisor() {
+        let c = Catalog::from_toml(
+            "[[host]]
+name = \"x\"
+kind = \"supervisor\"
+",
+        )
+        .unwrap();
+        assert!(HostConfigs::build(&c).is_err());
+    }
+
+    #[test]
+    fn agents_data_dir_parses_and_defaults() {
+        let c = Catalog::from_toml(
+            "[agents]
+data_dir = \"D:/data\"
+",
+        )
+        .unwrap();
+        assert_eq!(c.agents.data_dir(), PathBuf::from("D:/data"));
+        let d = Catalog::from_toml(
+            "model_dirs = []
+",
+        )
+        .unwrap();
+        assert_eq!(
+            d.agents.data_dir(),
+            PathBuf::from("C:\\llm-harness\\agent-data")
+        );
     }
 
     #[test]

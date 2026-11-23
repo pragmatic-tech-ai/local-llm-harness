@@ -40,6 +40,10 @@ pub struct HarnessInfo {
     /// The agent runtime's websocket, published alongside `url` while Ready.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_url: Option<String>,
+    /// The explicit context override this harness was started with; `None` when started
+    /// without one (the engine then picked its own default, which is not recorded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n_ctx: Option<u32>,
 }
 
 /// Why a manager operation failed.
@@ -404,6 +408,11 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
         self.shared.current().into_iter().collect()
     }
 
+    /// The current harness (if any) in whatever state it is in.
+    pub fn current(&self) -> Option<HarnessInfo> {
+        self.shared.current()
+    }
+
     /// The local worker URL while the current harness is Ready; `None` otherwise.
     pub fn ready_worker_url(&self) -> Option<String> {
         let info = self.shared.current()?;
@@ -505,6 +514,7 @@ impl<L: WorkerLauncher, P: ReadinessProbe> HarnessManager<L, P> {
             state: HarnessState::Loading,
             url: None,
             chat_url: None,
+            n_ctx: n_ctx_override,
         };
         self.shared.publish(info.clone());
 
@@ -931,6 +941,8 @@ mod tests {
             advertise_host: "192.168.1.101".to_string(),
             worker_port: 8777,
             tools: None,
+            agents: Default::default(),
+            hosts: Vec::new(),
         }
     }
 
@@ -1184,6 +1196,16 @@ mod tests {
         assert!(matches!(err, ManagerError::Incompatible { .. }));
         assert!(events(&l).is_empty());
         assert!(m.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_records_n_ctx_in_info() {
+        let m = manager("nctx", FakeLauncher::default(), FakeProbe::new(Mode::Ready));
+        let info = m.start("llamacpp", "lla", Some(4096)).await.unwrap();
+        assert_eq!(info.n_ctx, Some(4096));
+        assert_eq!(m.current().unwrap().n_ctx, Some(4096));
+        let info = m.start("llamacpp", "lla", None).await.unwrap();
+        assert_eq!(info.n_ctx, None);
     }
 
     #[tokio::test]
