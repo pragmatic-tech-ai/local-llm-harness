@@ -38,7 +38,7 @@ candle-cuda = ["candle", "candle-core/cuda", "candle-nn/cuda", "candle-transform
 
 # Windows Job Object FFI (pure Rust, no C toolchain) so workers die with the supervisor.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Time"] }
 
 [dev-dependencies]
 wiremock = "0.6"

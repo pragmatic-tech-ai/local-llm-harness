@@ -81,10 +81,31 @@ impl Sandbox {
 pub struct CivilTime;
 
 impl CivilTime {
+    const SECS_PER_DAY: i64 = 86_400;
+
     /// Formats Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (days-to-civil algorithm).
     pub fn utc_iso8601(unix_secs: u64) -> String {
-        let days = (unix_secs / 86400) as i64;
-        let rem = unix_secs % 86400;
+        format!("{}Z", Self::civil(unix_secs as i64))
+    }
+
+    /// Formats Unix seconds shifted by `offset_minutes` east of UTC as
+    /// `YYYY-MM-DDTHH:MM:SS+HH:MM` (the wall-clock time in that zone).
+    pub fn local_iso8601(unix_secs: u64, offset_minutes: i32) -> String {
+        let local = unix_secs as i64 + i64::from(offset_minutes) * 60;
+        let sign = if offset_minutes < 0 { '-' } else { '+' };
+        let abs = offset_minutes.unsigned_abs();
+        format!(
+            "{}{sign}{:02}:{:02}",
+            Self::civil(local),
+            abs / 60,
+            abs % 60
+        )
+    }
+
+    /// `YYYY-MM-DDTHH:MM:SS` for signed Unix seconds.
+    fn civil(secs: i64) -> String {
+        let days = secs.div_euclid(Self::SECS_PER_DAY);
+        let rem = secs.rem_euclid(Self::SECS_PER_DAY);
         let z = days + 719_468;
         let era = z.div_euclid(146_097);
         let doe = z.rem_euclid(146_097);
@@ -95,7 +116,7 @@ impl CivilTime {
         let month = if mp < 10 { mp + 3 } else { mp - 9 };
         let year = yoe + era * 400 + i64::from(month <= 2);
         format!(
-            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
             rem / 3600,
             (rem % 3600) / 60,
             rem % 60
@@ -103,7 +124,43 @@ impl CivilTime {
     }
 }
 
-/// `get_time`: current UTC time.
+/// The machine's current UTC offset, daylight saving included.
+pub struct LocalOffset;
+
+impl LocalOffset {
+    #[cfg(windows)]
+    const TIME_ZONE_ID_STANDARD: u32 = 1;
+    #[cfg(windows)]
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+
+    /// Minutes east of UTC; 0 when the zone cannot be read.
+    #[cfg(windows)]
+    pub fn current_minutes() -> i32 {
+        use windows_sys::Win32::System::Time::{
+            GetDynamicTimeZoneInformation, DYNAMIC_TIME_ZONE_INFORMATION, TIME_ZONE_ID_INVALID,
+        };
+        // SAFETY: DYNAMIC_TIME_ZONE_INFORMATION is plain data (integers and u16 arrays), so the
+        // all-zero value is valid; the call only writes into the struct we own.
+        let mut info: DYNAMIC_TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+        let id = unsafe { GetDynamicTimeZoneInformation(&mut info) };
+        // UTC = local + bias, in minutes; the extra bias depends on which period is in effect.
+        let extra = match id {
+            TIME_ZONE_ID_INVALID => return 0,
+            Self::TIME_ZONE_ID_STANDARD => info.StandardBias,
+            Self::TIME_ZONE_ID_DAYLIGHT => info.DaylightBias,
+            _ => 0,
+        };
+        -(info.Bias + extra)
+    }
+
+    /// Minutes east of UTC; this build only knows UTC.
+    #[cfg(not(windows))]
+    pub fn current_minutes() -> i32 {
+        0
+    }
+}
+
+/// `get_time`: current time, UTC and local.
 pub struct GetTimeTool;
 
 #[async_trait]
@@ -111,7 +168,7 @@ impl Tool for GetTimeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "get_time".into(),
-            description: "Get the current date and time in UTC.".into(),
+            description: "Get the current date and time, in UTC and in the local time zone.".into(),
             parameters: json!({"type": "object", "properties": {}}),
             side_effects: false,
         }
@@ -122,7 +179,13 @@ impl Tool for GetTimeTool {
             Ok(d) => d.as_secs(),
             Err(_) => return ToolOutcome::Err("system clock is before the Unix epoch".to_string()),
         };
-        ToolOutcome::Ok(json!({"utc": CivilTime::utc_iso8601(secs), "unix": secs}))
+        let offset = LocalOffset::current_minutes();
+        ToolOutcome::Ok(json!({
+            "utc": CivilTime::utc_iso8601(secs),
+            "local": CivilTime::local_iso8601(secs, offset),
+            "utc_offset_minutes": offset,
+            "unix": secs,
+        }))
     }
 }
 
@@ -407,6 +470,30 @@ mod tests {
         assert!((1..=12).contains(&num(5..7)));
         assert!((1..=31).contains(&num(8..10)));
         assert!(num(11..13) < 24 && num(14..16) < 60 && num(17..19) < 60);
+
+        let offset = v["utc_offset_minutes"].as_i64().unwrap() as i32;
+        assert!((-14 * 60..=14 * 60).contains(&offset), "{offset}");
+        assert_eq!(offset, LocalOffset::current_minutes());
+        assert_eq!(v["local"], CivilTime::local_iso8601(unix, offset));
+    }
+
+    #[test]
+    fn local_time_formats_offsets() {
+        assert_eq!(CivilTime::local_iso8601(0, 0), "1970-01-01T00:00:00+00:00");
+        assert_eq!(CivilTime::local_iso8601(0, 60), "1970-01-01T01:00:00+01:00");
+        assert_eq!(
+            CivilTime::local_iso8601(0, -330),
+            "1969-12-31T18:30:00-05:30"
+        );
+        // 2026-11-23T13:05:00Z
+        assert_eq!(
+            CivilTime::local_iso8601(1_795_439_100, 60),
+            "2026-11-23T14:05:00+01:00"
+        );
+        assert_eq!(
+            CivilTime::utc_iso8601(1_795_439_100),
+            "2026-11-23T13:05:00Z"
+        );
     }
 
     #[tokio::test]
