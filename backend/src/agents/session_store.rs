@@ -114,7 +114,7 @@ impl SessionStore {
     ) -> Result<SessionRecord, SessionError> {
         let mut map = self.lock();
         let n = 1 + Self::highest_number(map.values(), template_id, &template.name);
-        let title = format!("{} #{n}", template.name);
+        let title = format!("{}{TITLE_SEP}{n}", template.name);
         let mut id = self.next_id();
         // Never reuse an id whose file exists on disk (e.g. a skipped corrupt file).
         while map.contains_key(&id) || self.file_for(&id).exists() {
