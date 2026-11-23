@@ -36,10 +36,15 @@ class Rig
     /** Ends the turn the way the runtime does: answers the latest send_turn (after its terminal notifications). */
     public async FinishTurn(): Promise<void>
     {
+        this.client.HandleFrame(JSON.stringify({ id: this.IdOf('send_turn'), result: null }))
+        await this.Flush()
+    }
+
+    /** Id of the most recent frame sent with this method. */
+    public IdOf(method: string): number
+    {
         const frames = this.socket.sent.map(f => JSON.parse(f) as { id: number, method: string })
-        const last = frames.filter(f => f.method === 'send_turn').pop()
-        this.client.HandleFrame(JSON.stringify({ id: last?.id, result: null }))
-        await new Promise(r => setTimeout(r, 0))
+        return frames.filter(f => f.method === method).pop()?.id ?? -1
     }
 
     /** Sampling configs sent so far, in order. */
@@ -156,7 +161,8 @@ describe('InstrumentPanelViewModel', () =>
     {
         const rig = new Rig()
         rig.Send('one')
-        rig.client.HandleFrame(JSON.stringify({ id: 2, error: { code: 1, message: 'bad config' } }))
+        expect(rig.Methods().filter(m => m === 'model_props').length).toBe(1)
+        rig.client.HandleFrame(JSON.stringify({ id: rig.IdOf('set_sampling'), error: { code: 1, message: 'bad config' } }))
         await rig.Flush()
         expect(rig.vm.Panel.Warning).toContain('bad config')
     })
