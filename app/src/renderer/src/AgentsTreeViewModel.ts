@@ -23,9 +23,7 @@ export class AgentsTreeViewModel extends Observable
     public readonly Roots = new ObservableCollection<TemplateTreeNodeViewModel>()
     /** The user picked a node in the tree; the owner decides (Select or KeepSelection). */
     public readonly OnSelectRequested = new TypedSignal<TemplateTreeNodeViewModel>()
-    /** The selected node disappeared from the tree (deleted, or its group renamed). */
-    public readonly OnSelectionLost = new TypedSignal<TemplateTreeNodeViewModel>()
-    /** A refresh was applied to the tree. */
+    /** A refresh was applied to the tree (a selected node that disappeared is already deselected). */
     public readonly OnRefreshed = new TypedSignal<void>()
     /** New template, in the group path carried. */
     public readonly OnNewTemplateRequested = new TypedSignal<string>()
@@ -238,7 +236,6 @@ export class AgentsTreeViewModel extends Observable
         if (selected !== null && !this.Contains(selected))
         {
             this.Select(null)
-            this.OnSelectionLost.Raise(selected)
         }
         const pending = this.pendingSelectId
         if (pending !== null)

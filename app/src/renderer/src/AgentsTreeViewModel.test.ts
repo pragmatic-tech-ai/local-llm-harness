@@ -11,7 +11,6 @@ class Rig
     public readonly client = new RuntimeClient(() => this.socket)
     public readonly tree = new AgentsTreeViewModel()
     public readonly requested: TemplateTreeNodeViewModel[] = []
-    public readonly lost: TemplateTreeNodeViewModel[] = []
 
     constructor()
     {
@@ -19,7 +18,6 @@ class Rig
         this.socket.Open()
         this.tree.Bind(this.client)
         this.tree.OnSelectRequested.Subscribe(node => this.requested.push(node))
-        this.tree.OnSelectionLost.Subscribe(node => this.lost.push(node))
     }
 
     public static readonly Researcher: TemplateNode = { kind: 'template', id: 't1', path: 'Examples', name: 'Researcher', runtime: 'llamacpp', model: 'gemma-4', error: null }
@@ -95,10 +93,9 @@ describe('AgentsTreeViewModel', () =>
         expect(researcher.Path).toBe('')
         expect(rig.tree.Selected).toBe(researcher)
         expect(rig.requested).toEqual([])
-        expect(rig.lost).toEqual([])
     })
 
-    it('selection_lost_when_the_selected_template_disappears', async () =>
+    it('selection_is_cleared_when_the_selected_template_disappears', async () =>
     {
         const rig = new Rig()
         await rig.Load()
@@ -107,7 +104,6 @@ describe('AgentsTreeViewModel', () =>
         void rig.tree.Refresh()
         await rig.Respond('list_templates', [Rig.Tree[0]])
         expect(rig.tree.Selected).toBeNull()
-        expect(rig.lost).toEqual([loose])
     })
 
     it('user_selection_is_a_request_the_owner_grants', async () =>

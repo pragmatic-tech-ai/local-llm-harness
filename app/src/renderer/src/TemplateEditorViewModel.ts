@@ -13,7 +13,8 @@ import { TextFormat } from './TextFormat'
  * that does not parse gets a field error and disables Save. Runtime / model / host come from `list_catalog`, the
  * models filtered by the runtime; a value the catalog lacks stays as a marked choice. A template file that fails to
  * load opens with its error in ErrorText and the fields seeded from the defaults (plus what the tree node carries),
- * so Save repairs it. Validation errors from `save_template` show in ErrorText.
+ * so Save repairs it. Validation errors from `save_template` show in ErrorText; a catalog failure shows in
+ * CatalogError until a retry (EnsureCatalog, on the next open or refresh) succeeds.
  */
 export class TemplateEditorViewModel extends Observable implements IToolChoiceOwner
 {
@@ -32,6 +33,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly TemperatureInvalid = 'Temperature must be a number of 0 or more, or blank.'
     private static readonly TopPInvalid = 'Top P must be a number from 0 to 1, or blank.'
     private static readonly CatalogFailedFormat = 'catalog unavailable: {0}'
+    private static readonly DeletedText = 'This template was deleted; Save recreates it.'
+    /** The worker sampling defaults (backend SamplingConfig::default), sent for a blank field. */
+    private static readonly DefaultTemperature = 0.8
+    private static readonly DefaultTopP = 0.95
     private static readonly Whole = /^\d+$/
     private static readonly Decimal = /^[+-]?(\d+\.?\d*|\.\d+)$/
     private static readonly PropName = 'Name'
@@ -45,9 +50,14 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly PropTopPText = 'TopPText'
     private static readonly PropHost = 'Host'
     private static readonly PropPath = 'Path'
-    private static readonly FieldProps = ['Name', 'SystemPrompt', 'StepBudgetText', 'Runtime', 'Model', 'ContextSizeText',
-        'EnableThinking', 'TemperatureText', 'TopPText', 'Host', 'Path', 'TemplateId']
-    private static readonly DerivedProps = ['HasTemplate', 'IsEmpty', 'IsNew', 'IsDirty', 'CanSave', 'HeaderText', 'ErrorText',
+    private static readonly PropTemplateId = 'TemplateId'
+    private static readonly FieldProps = [TemplateEditorViewModel.PropName, TemplateEditorViewModel.PropSystemPrompt,
+        TemplateEditorViewModel.PropStepBudgetText, TemplateEditorViewModel.PropRuntime, TemplateEditorViewModel.PropModel,
+        TemplateEditorViewModel.PropContextSizeText, TemplateEditorViewModel.PropEnableThinking,
+        TemplateEditorViewModel.PropTemperatureText, TemplateEditorViewModel.PropTopPText, TemplateEditorViewModel.PropHost,
+        TemplateEditorViewModel.PropPath, TemplateEditorViewModel.PropTemplateId]
+    private static readonly DerivedProps = ['HasTemplate', 'IsEmpty', 'IsNew', 'IsDirty', 'CanSave', 'CanRevert', 'IsLoading',
+        'IsEditable', 'CatalogError', 'HasCatalogError', 'HeaderText', 'ErrorText',
         'HasErrorText', 'NameError', 'HasNameError', 'StepBudgetError', 'HasStepBudgetError', 'ContextSizeError',
         'HasContextSizeError', 'TemperatureError', 'HasTemperatureError', 'TopPError', 'HasTopPError', 'RuntimeChoice',
         'ModelChoice', 'HostChoice']
@@ -71,6 +81,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     /** Opened from the defaults because the file did not load: Save (which repairs it) is allowed while clean. */
     private broken = false
     private saving = false
+    /** `get_template` for the shown template is in flight. */
+    private loading = false
+    private catalogLoading = false
+    private catalogError = ''
     /** What the form was last filled from (Revert goes back to it). */
     private loaded: AgentTemplate | null = null
     /** The form's fingerprint when it was filled or saved: anything else is an unsaved edit. */
@@ -97,7 +111,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.client = client
         this.saveCommand = new RelayCommand(() => void this.Save(), () => this.CanSave)
         this.revertCommand = new RelayCommand(() => this.Revert(), () => this.CanRevert)
-        this.Fill(this.Defaults('', '', ''))
+        this.Fill(this.Defaults('', '', '', false))
     }
 
     public get SaveCommand(): ICommand
@@ -151,12 +165,35 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
 
     public get CanSave(): boolean
     {
-        return this.open && !this.saving && (this.IsDirty || this.broken) && !this.HasFieldErrors
+        return this.open && !this.saving && !this.loading && (this.IsDirty || this.broken) && !this.HasFieldErrors
     }
 
     public get CanRevert(): boolean
     {
-        return this.open && !this.saving && this.Fingerprint() !== this.baseline
+        return this.open && !this.saving && !this.loading && this.Fingerprint() !== this.baseline
+    }
+
+    /** The shown template's `get_template` is in flight: the form is read-only until it lands. */
+    public get IsLoading(): boolean
+    {
+        return this.loading
+    }
+
+    /** The form accepts edits (a template is shown and not loading or saving). */
+    public get IsEditable(): boolean
+    {
+        return this.open && !this.loading && !this.saving
+    }
+
+    /** Why the catalog is unknown (kept until a retry succeeds), or "". */
+    public get CatalogError(): string
+    {
+        return this.catalogError
+    }
+
+    public get HasCatalogError(): boolean
+    {
+        return this.catalogError.length > 0
     }
 
     public get HeaderText(): string
@@ -392,18 +429,28 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     /** Reads the catalog (runtime / model / host choices) and the whole tool registry (the tool checkboxes). */
     public async LoadCatalog(): Promise<void>
     {
+        this.catalogLoading = true
         try
         {
             const [catalog, registry] = await Promise.all([this.client.ListCatalog(), this.client.ListAllTools()])
             const pristine = this.Fingerprint() === this.baseline
             this.catalog = catalog
             this.registry = registry
+            this.catalogError = ''
             const loaded = this.loaded
-            if (this.open && pristine && loaded !== null && (this.isNew || this.broken) && (loaded.runtime === '' || loaded.model === ''))
+            if (this.open && pristine && loaded !== null && !this.loading)
             {
-                // A draft or broken template seeded before the catalog arrived: complete its runtime and model.
-                this.Fill(this.Defaults(loaded.name, loaded.runtime, loaded.model))
-                return
+                if (this.isNew)
+                {
+                    // A draft started before the catalog arrived: complete its runtime, model and tools.
+                    this.Fill(this.Defaults(loaded.name, loaded.runtime, loaded.model, true))
+                    return
+                }
+                if (this.broken && (loaded.runtime === '' || loaded.model === ''))
+                {
+                    this.Fill(this.Defaults(loaded.name, loaded.runtime, loaded.model, false))
+                    return
+                }
             }
             this.RebuildChoices()
             this.RebuildTools()
@@ -411,27 +458,49 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         }
         catch (e)
         {
-            this.SetError(TextFormat.Format(TemplateEditorViewModel.CatalogFailedFormat, TextFormat.Message(e)))
+            this.catalogError = TextFormat.Format(TemplateEditorViewModel.CatalogFailedFormat, TextFormat.Message(e))
+            this.RebuildChoices()
+            this.Changed()
+        }
+        finally
+        {
+            this.catalogLoading = false
         }
     }
 
-    /** Shows a template from the tree (its fields from `get_template`; a broken one from the defaults). */
+    /** Retries the catalog when it is still unknown (after a failure); a no-op once it is known or while loading. */
+    public EnsureCatalog(): void
+    {
+        if (this.catalog === null && !this.catalogLoading)
+        {
+            void this.LoadCatalog()
+        }
+    }
+
+    /**
+     * Shows a template from the tree. The id is recorded at once (the form goes read-only until `get_template`
+     * replies), so a refresh landing meanwhile targets this template; a broken one opens from the defaults.
+     */
     public async Open(node: TemplateTreeNodeViewModel): Promise<void>
     {
+        this.EnsureCatalog()
         await this.Load(node, false)
     }
 
-    /** Re-reads the shown template (it changed on the server); dropped when edits started meanwhile. */
+    /**
+     * Re-reads the shown template (it changed on the server). Ignored for another template than the one last
+     * requested, and dropped when edits started before the reply.
+     */
     public async Reload(node: TemplateTreeNodeViewModel): Promise<void>
     {
-        if (this.IsDirty)
+        if (node.TemplateId === null || node.TemplateId !== this.templateId || this.IsDirty)
         {
             return
         }
         await this.Load(node, true)
     }
 
-    /** Starts an unsaved `Untitled` draft in the group. */
+    /** Starts an unsaved `Untitled` draft in the group, with every registry tool enabled. */
     public OpenNew(path: string): void
     {
         this.openToken++
@@ -440,8 +509,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.path = path
         this.isNew = true
         this.broken = false
+        this.loading = false
         this.errorText = ''
-        this.Fill(this.Defaults(TemplateEditorViewModel.DefaultName, '', ''))
+        this.Fill(this.Defaults(TemplateEditorViewModel.DefaultName, '', '', true))
+        this.EnsureCatalog()
     }
 
     /** Back to the empty state (nothing shown). */
@@ -453,8 +524,24 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.path = ''
         this.isNew = false
         this.broken = false
+        this.loading = false
         this.errorText = ''
-        this.Fill(this.Defaults('', '', ''))
+        this.Fill(this.Defaults('', '', '', false))
+    }
+
+    /**
+     * The shown template was deleted elsewhere while it had unsaved edits: keep them as an unsaved draft in the same
+     * group (Save recreates it), with a notice.
+     */
+    public Orphan(): void
+    {
+        this.openToken++
+        this.templateId = null
+        this.isNew = true
+        this.broken = false
+        this.loading = false
+        this.errorText = TemplateEditorViewModel.DeletedText
+        this.RaiseAll()
     }
 
     /** The shown template moved to another group (a save goes to where it is now). */
@@ -543,15 +630,27 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
             this.Seed(node, id, node.Error)
             return
         }
+        if (!onlyIfClean)
+        {
+            // Record the request now: the tree shows this template, so must everything that asks the editor.
+            this.open = true
+            this.templateId = id
+            this.path = node.Path
+            this.isNew = false
+            this.broken = false
+            this.errorText = ''
+        }
+        this.loading = true
+        this.RaiseAll()
         try
         {
             const record = await this.client.GetTemplate(id)
-            if (token !== this.openToken || (onlyIfClean && this.IsDirty))
+            if (token !== this.openToken || record.id !== this.templateId || (onlyIfClean && this.IsDirty))
             {
                 return
             }
+            this.loading = false
             this.open = true
-            this.templateId = record.id
             this.path = record.path
             this.isNew = false
             this.broken = false
@@ -565,6 +664,14 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
                 this.Seed(node, id, TextFormat.Message(e))
             }
         }
+        finally
+        {
+            if (token === this.openToken && this.loading)
+            {
+                this.loading = false
+                this.Changed()
+            }
+        }
     }
 
     /** Opens a template whose file cannot be read: the defaults, overlaid with what the tree node carries. */
@@ -576,12 +683,16 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.path = node.Path
         this.isNew = false
         this.broken = true
+        this.loading = false
         this.errorText = error
-        this.Fill(this.Defaults(node.Name, leaf?.runtime ?? '', leaf?.model ?? ''))
+        this.Fill(this.Defaults(node.Name, leaf?.runtime ?? '', leaf?.model ?? '', false))
     }
 
-    /** A fresh template: the given name / runtime / model, else the catalog's first runtime and a model it serves. */
-    private Defaults(name: string, runtime: string, model: string): AgentTemplate
+    /**
+     * A fresh template: the given name / runtime / model, else the catalog's first runtime and a model it serves;
+     * with `allTools` every registry tool is enabled (as in the seeded Default).
+     */
+    private Defaults(name: string, runtime: string, model: string, allTools: boolean): AgentTemplate
     {
         const catalog = this.catalog
         const chosenRuntime = runtime.length > 0 ? runtime : catalog?.runtimes[0]?.name ?? ''
@@ -591,7 +702,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         return {
             name,
             system_prompt: '',
-            tools: [],
+            tools: allTools ? (this.registry ?? []).map(t => t.name) : [],
             step_budget: TemplateEditorViewModel.DefaultStepBudget,
             runtime: chosenRuntime,
             model: chosenModel,
@@ -643,21 +754,15 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
             n_ctx: contextSize,
             enable_thinking: this.enableThinking,
         }
-        if (temperature !== undefined || topP !== undefined)
+        if (this.sampling !== undefined || temperature !== undefined || topP !== undefined)
         {
-            // The knobs this editor does not show (top_k, seed, ...) are kept as loaded.
-            const sampling: Partial<SamplingConfig> = { ...this.sampling }
-            delete sampling.temperature
-            delete sampling.top_p
-            if (temperature !== undefined)
-            {
-                sampling.temperature = temperature
+            // Every knob the editor does not show (top_k, seed, ...) is kept as loaded. The backend sampling fields
+            // are not optional, so a blank field sends the worker default rather than removing the knob.
+            template.sampling = {
+                ...this.sampling,
+                temperature: temperature ?? TemplateEditorViewModel.DefaultTemperature,
+                top_p: topP ?? TemplateEditorViewModel.DefaultTopP,
             }
-            if (topP !== undefined)
-            {
-                sampling.top_p = topP
-            }
-            template.sampling = sampling
         }
         if (this.host.length > 0)
         {
@@ -671,16 +776,22 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         return this.HasNameError || this.HasStepBudgetError || this.HasContextSizeError || this.HasTemperatureError || this.HasTopPError
     }
 
-    /** Rebuilds the runtime / model / host lists for the current values (a value the catalog lacks stays, marked). */
+    /**
+     * Rebuilds the runtime / model / host lists for the current values. A value missing from them stays as a marked
+     * choice: "(not in catalog)", or for a catalog model the runtime cannot load "(not served by {runtime})". While
+     * the catalog is unknown nothing is marked.
+     */
     private RebuildChoices(): void
     {
         const catalog = this.catalog
         const runtimes = (catalog?.runtimes ?? []).map(r => new ChoiceItem(r.name))
         const models = (catalog?.models ?? []).filter(m => m.runtimes.includes(this.runtime)).map(m => new ChoiceItem(m.name))
         const hosts = [new ChoiceItem('', TemplateEditorViewModel.AnyHostLabel), ...(catalog?.hosts ?? []).map(h => new ChoiceItem(h))]
-        TemplateEditorViewModel.Replace(this.RuntimeChoices, TemplateEditorViewModel.WithValue(runtimes, this.runtime))
-        TemplateEditorViewModel.Replace(this.ModelChoices, TemplateEditorViewModel.WithValue(models, this.model))
-        TemplateEditorViewModel.Replace(this.HostChoices, TemplateEditorViewModel.WithValue(hosts, this.host))
+        const modelInCatalog = catalog?.models.some(m => m.name === this.model) === true
+        TemplateEditorViewModel.Replace(this.RuntimeChoices, this.WithValue(runtimes, this.runtime, ChoiceItem.Missing(this.runtime)))
+        TemplateEditorViewModel.Replace(this.ModelChoices, this.WithValue(models, this.model,
+            modelInCatalog ? ChoiceItem.NotServed(this.model, this.runtime) : ChoiceItem.Missing(this.model)))
+        TemplateEditorViewModel.Replace(this.HostChoices, this.WithValue(hosts, this.host, ChoiceItem.Missing(this.host)))
     }
 
     /** One checkbox per registry tool, then any enabled tool the registry lacks (so it can be seen and unticked). */
@@ -706,10 +817,14 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         })
     }
 
-    /** The offered choices plus the current value when it is not among them. */
-    private static WithValue(choices: ChoiceItem[], value: string): ChoiceItem[]
+    /** The offered choices plus the current value when it is not among them (marked, unless the catalog is unknown). */
+    private WithValue(choices: ChoiceItem[], value: string, marked: ChoiceItem): ChoiceItem[]
     {
-        return value.length === 0 || choices.some(c => c.Value === value) ? choices : [...choices, ChoiceItem.Missing(value)]
+        if (value.length === 0 || choices.some(c => c.Value === value))
+        {
+            return choices
+        }
+        return [...choices, this.catalog === null ? new ChoiceItem(value) : marked]
     }
 
     /** Replaces a choice list's items, keeping it unchanged (no notification) when the values and labels match. */
@@ -773,12 +888,6 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         }
         assign()
         this.RaisePropertyChanged(prop, old, value)
-        this.Changed()
-    }
-
-    private SetError(text: string): void
-    {
-        this.errorText = text
         this.Changed()
     }
 

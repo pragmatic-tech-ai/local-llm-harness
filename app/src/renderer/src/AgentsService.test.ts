@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { Observable, type IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
+import { Observable, RelayCommand, type IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/services/content-host-service.js'
-import { DialogService, NavigationService, type ConfirmOptions, type DialogOptions } from '@pragmatic-tech-ai/mural/framework'
+import { Capability, DialogService, NavigationDestination, NavigationService, type ConfirmOptions, type DialogOptions } from '@pragmatic-tech-ai/mural/framework'
 import { AgentsService } from './AgentsService'
 import { SessionsService } from './SessionsService'
 import { RuntimeClient, TypedSignal } from './RuntimeClient'
@@ -336,6 +336,102 @@ describe('AgentsService', () =>
         rig.navigation.Switch(Rig.SessionsItem, Rig.OtherService)
         await Rig.Flush()
         expect(rig.dialogs.confirms.length).toBe(2)
+    })
+
+    it('rail_cancel_reactivates_the_agents_destination', async () =>
+    {
+        const rig = new Rig()
+        await rig.Ready()
+        const agents = new NavigationDestination(new Capability())
+        let activations = 0
+        agents.ActivateCommand = new RelayCommand(() => { activations++ })
+        rig.navigation.Switch(agents, rig.service)
+        await rig.OpenResearcher()
+        rig.service.Editor.Name = 'Edited'
+        rig.dialogs.ConfirmResult = false
+        rig.navigation.Switch(Rig.SessionsItem, Rig.OtherService)
+        await Rig.Flush()
+        // NavigationService's click tracking is pointed back at Agents, so the next Sessions click is a plain switch.
+        expect(rig.navigation.SelectedItem).toBe(agents)
+        expect(activations).toBe(1)
+    })
+
+    it('deleting_the_dirty_open_template_asks_discard_first', async () =>
+    {
+        const rig = new Rig()
+        await rig.Ready()
+        await rig.OpenResearcher()
+        rig.service.Editor.Name = 'Edited'
+        rig.dialogs.ConfirmResult = false
+        rig.Panel.DeleteCommand.Execute(undefined)
+        await Rig.Flush()
+        expect(rig.dialogs.confirms.map(c => c.ConfirmLabel)).toEqual(['Discard'])
+        expect(rig.Methods()).not.toContain('delete_template')
+        expect(rig.service.Editor.Name).toBe('Edited')
+        rig.dialogs.ConfirmResult = true
+        rig.Panel.DeleteCommand.Execute(undefined)
+        await Rig.Flush()
+        expect(rig.dialogs.confirms.map(c => c.ConfirmLabel)).toEqual(['Discard', 'Discard', 'Delete'])
+        expect(rig.Frames().pop()).toMatchObject({ method: 'delete_template', params: { id: 't1' } })
+    })
+
+    it('a_dirty_template_deleted_elsewhere_becomes_an_unsaved_draft', async () =>
+    {
+        const rig = new Rig()
+        await rig.Ready()
+        await rig.OpenResearcher()
+        const editor = rig.service.Editor
+        editor.Name = 'Edited'
+        rig.client.HandleFrame(JSON.stringify({ method: 'templates_changed', params: {} }))
+        await rig.Respond('list_templates', [{ kind: 'group', name: 'Examples', path: 'Examples', children: [] }, Rig.Loose])
+        expect(editor.HasTemplate).toBe(true)
+        expect(editor.IsNew).toBe(true)
+        expect(editor.TemplateId).toBeNull()
+        expect(editor.Path).toBe('Examples')
+        expect(editor.Name).toBe('Edited')
+        expect(editor.ErrorText).toBe('This template was deleted; Save recreates it.')
+        editor.SaveCommand.Execute(undefined)
+        const save = rig.Frames().pop()!
+        expect(save.method).toBe('save_template')
+        expect(save.params.id).toBeUndefined()
+        expect(save.params.path).toBe('Examples')
+    })
+
+    it('refresh_racing_an_open_shows_the_selected_template', async () =>
+    {
+        const rig = new Rig()
+        await rig.Ready()
+        await rig.OpenResearcher()
+        // A refresh is in flight when the user picks Loose.
+        rig.client.HandleFrame(JSON.stringify({ method: 'templates_changed', params: {} }))
+        rig.Panel.Selected = rig.LooseNode()
+        await Rig.Flush()
+        const reads = () => rig.Frames().filter(f => f.method === 'get_template')
+        const open = reads().pop()!
+        expect(open.params).toEqual({ id: 't3' })
+        await rig.Respond('list_templates', Rig.Tree)
+        // The refresh targets the template last requested (t3), never the one shown before (t1).
+        expect(reads().slice(1).map(f => f.params.id)).toEqual(['t3', 't3'])
+        for (const frame of reads().slice(1))
+        {
+            rig.client.HandleFrame(JSON.stringify({ id: frame.id, result: { id: 't3', path: '', template: { ...Rig.Template, name: 'Loose' } } }))
+        }
+        await Rig.Flush()
+        expect(rig.Panel.Selected).toBe(rig.LooseNode())
+        expect(rig.service.Editor.TemplateId).toBe('t3')
+        expect(rig.service.Editor.Name).toBe('Loose')
+        expect(rig.service.Editor.IsEditable).toBe(true)
+    })
+
+    it('a_tree_refresh_retries_an_unknown_catalog', async () =>
+    {
+        const rig = new Rig()
+        await rig.Respond('list_templates', Rig.Tree)
+        await rig.Fail('list_catalog', 'down')
+        expect(rig.service.Editor.HasCatalogError).toBe(true)
+        rig.Panel.RefreshCommand.Execute(undefined)
+        await rig.Respond('list_templates', Rig.Tree)
+        expect(rig.Methods().filter(m => m === 'list_catalog').length).toBe(2)
     })
 
     it('new_template_opens_a_draft_that_saves_into_the_selected_group', async () =>

@@ -1,7 +1,7 @@
 import { RelayCommand, ServiceBase, ServiceKey } from '@pragmatic-tech-ai/mural/runtime'
 import type { IServiceProvider } from '@pragmatic-tech-ai/mural/runtime'
 import { ContentHostService } from '@pragmatic-tech-ai/mural/framework/shell/services/content-host-service.js'
-import { ButtonVariant, DialogAction, DialogService, NavigationService, type IActivatable } from '@pragmatic-tech-ai/mural/framework'
+import { ButtonVariant, DialogAction, DialogService, NavigationDestination, NavigationService, type IActivatable } from '@pragmatic-tech-ai/mural/framework'
 import type { IDisposable } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
 import { SessionsService } from './SessionsService'
@@ -72,7 +72,7 @@ export class AgentsService extends ServiceBase implements IActivatable
         this.subscriptions.push(
             sessions.OnConnectionChanged.Subscribe(state => this.ApplyConnection(state)),
             this.Panel.OnSelectRequested.Subscribe(node => void this.RequestSelect(node)),
-            this.Panel.OnRefreshed.Subscribe(() => this.SyncEditor()),
+            this.Panel.OnRefreshed.Subscribe(() => this.OnTreeRefreshed()),
             this.Panel.OnNewTemplateRequested.Subscribe(path => void this.NewTemplate(path)),
             this.Panel.OnNewGroupRequested.Subscribe(path => void this.NewGroup(path)),
             this.Panel.OnRenameRequested.Subscribe(node => void this.Rename(node)),
@@ -125,9 +125,13 @@ export class AgentsService extends ServiceBase implements IActivatable
         void this.Editor.Open(node)
     }
 
-    /** After a refresh: the open template follows a move, reloads when clean, and closes when it is gone. */
-    private SyncEditor(): void
+    /**
+     * After a refresh: retry an unknown catalog; the open template follows a move and reloads when clean. When it is
+     * gone, a clean editor closes and a dirty one keeps its edits as an unsaved draft (Save recreates it).
+     */
+    private OnTreeRefreshed(): void
     {
+        this.Editor.EnsureCatalog()
         const id = this.Editor.TemplateId
         if (id === null || this.Editor.IsNew)
         {
@@ -136,7 +140,14 @@ export class AgentsService extends ServiceBase implements IActivatable
         const node = this.Panel.Find(id)
         if (node === undefined)
         {
-            this.Editor.Clear()
+            if (this.Editor.IsDirty)
+            {
+                this.Editor.Orphan()
+            }
+            else
+            {
+                this.Editor.Clear()
+            }
             return
         }
         this.Editor.SetPath(node.Path)
@@ -232,6 +243,11 @@ export class AgentsService extends ServiceBase implements IActivatable
         const dialogs = this.Provider.get(DialogService.Key)
         const id = node.TemplateId
         if (dialogs === undefined)
+        {
+            return
+        }
+        // Deleting the open template with unsaved edits: those are discarded first (or the delete is cancelled).
+        if (id !== null && id === this.Editor.TemplateId && !(await this.MayDiscardEdits()))
         {
             return
         }
@@ -334,7 +350,8 @@ export class AgentsService extends ServiceBase implements IActivatable
 
     /**
      * Follows the rail. Arriving records the rail item; leaving with unsaved edits asks Discard / Cancel, and Cancel
-     * switches the rail back to Agents.
+     * switches the rail back to Agents and re-activates its rail item, so NavigationService's click tracking points at
+     * Agents again (otherwise the next click on the other item would count as a re-click and hide the side pane).
      */
     private OnActiveServiceChanged(navigation: NavigationService): void
     {
@@ -360,6 +377,10 @@ export class AgentsService extends ServiceBase implements IActivatable
             if (!(await this.MayDiscardEdits()))
             {
                 navigation.SelectedItem = back
+                if (back instanceof NavigationDestination)
+                {
+                    back.ActivateCommand?.Execute(undefined)
+                }
             }
         }
         finally

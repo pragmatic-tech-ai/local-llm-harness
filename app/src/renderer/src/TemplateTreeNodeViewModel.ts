@@ -11,9 +11,15 @@ export class TemplateTreeNodeViewModel extends Observable
 {
     private static readonly KindGroup = 'group'
     private static readonly PropIsExpanded = 'IsExpanded'
+    private static readonly PropNode = 'Node'
+    private static readonly PropName = 'Name'
+    private static readonly PropPath = 'Path'
+    private static readonly PropError = 'Error'
+    private static readonly PropHasError = 'HasError'
     private static readonly GroupKeyPrefix = 'group:'
     private static readonly TemplateKeyPrefix = 'template:'
-    private static readonly NodeProps = ['Node', 'Name', 'Path', 'Error', 'HasError']
+    private static readonly NodeProps = [TemplateTreeNodeViewModel.PropNode, TemplateTreeNodeViewModel.PropName,
+        TemplateTreeNodeViewModel.PropPath, TemplateTreeNodeViewModel.PropError, TemplateTreeNodeViewModel.PropHasError]
 
     private node: TemplateNode
     private readonly children: ObservableCollection<TemplateTreeNodeViewModel> | undefined

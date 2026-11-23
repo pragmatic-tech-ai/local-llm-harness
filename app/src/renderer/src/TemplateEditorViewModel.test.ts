@@ -120,7 +120,7 @@ describe('TemplateEditorViewModel', () =>
             path: 'Examples',
             template: {
                 name: 'Researcher 2', system_prompt: 'read', tools: ['read_file', 'get_time'], step_budget: 4, runtime: 'llamacpp',
-                model: 'gemma-4', n_ctx: 8192, enable_thinking: true, sampling: { temperature: 0.5 }, host: 'hive',
+                model: 'gemma-4', n_ctx: 8192, enable_thinking: true, sampling: { temperature: 0.5, top_p: 0.95 }, host: 'hive',
             },
         })
         await rig.Respond('save_template', { id: 't1' })
@@ -150,9 +150,9 @@ describe('TemplateEditorViewModel', () =>
         expect(e.ModelChoices.ToArray().map(c => c.Label)).toEqual(['gemma-4', 'tiny'])
         e.RuntimeChoice = e.RuntimeChoices.Get(1)!
         expect(e.Runtime).toBe('candle')
-        // The template's model is kept, marked, rather than silently changed.
+        // The template's model is kept, marked (it is in the catalog, just not for candle), rather than silently changed.
         expect(e.Model).toBe('gemma-4')
-        expect(e.ModelChoices.ToArray().map(c => c.Label)).toEqual(['tiny', 'phi', 'gemma-4 (not in catalog)'])
+        expect(e.ModelChoices.ToArray().map(c => c.Label)).toEqual(['tiny', 'phi', 'gemma-4 (not served by candle)'])
         expect(e.ModelChoice?.Value).toBe('gemma-4')
         e.ModelChoice = e.ModelChoices.Get(1)!
         expect(e.Model).toBe('phi')
@@ -224,10 +224,11 @@ describe('TemplateEditorViewModel', () =>
         const template = rig.Frames().pop()!.params.template as AgentTemplate
         expect(template.step_budget).toBe(3)
         expect(template.n_ctx).toBe(4096)
-        expect(template.sampling).toEqual({ top_p: 0.9 })
+        // A blank temperature sends the worker default (the backend sampling fields are not optional).
+        expect(template.sampling).toEqual({ temperature: 0.8, top_p: 0.9 })
     })
 
-    it('blank_sampling_sends_no_sampling_and_keeps_other_knobs', async () =>
+    it('blank_sampling_fields_keep_the_other_knobs', async () =>
     {
         const rig = new Rig()
         await rig.Open({ ...Rig.Researcher, sampling: { temperature: 0.7, top_p: 0.9, top_k: 20, repeat_penalty: 1.1, seed: 3, max_tokens: -1 } })
@@ -239,7 +240,65 @@ describe('TemplateEditorViewModel', () =>
         e.TemperatureText = ''
         e.TopPText = ''
         e.SaveCommand.Execute(undefined)
+        // Both fields blank: the hand-set knobs stay, the two shown ones go back to the worker defaults.
+        expect((rig.Frames().pop()!.params.template as AgentTemplate).sampling).toEqual({ temperature: 0.8, top_p: 0.95, top_k: 20, repeat_penalty: 1.1, seed: 3, max_tokens: -1 })
+    })
+
+    it('no_sampling_is_sent_when_none_was_loaded_and_both_fields_are_blank', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open()
+        rig.editor.Name = 'Other'
+        rig.editor.SaveCommand.Execute(undefined)
         expect('sampling' in (rig.Frames().pop()!.params.template as AgentTemplate)).toBe(false)
+    })
+
+    it('a_later_open_wins_over_a_late_reply_for_an_earlier_one', async () =>
+    {
+        const rig = new Rig()
+        await rig.LoadCatalog()
+        void rig.editor.Open(new TemplateTreeNodeViewModel(Rig.Leaf))
+        const first = rig.Frames().pop()!
+        void rig.editor.Open(new TemplateTreeNodeViewModel({ ...Rig.Leaf, id: 't3', path: '', name: 'Loose' }))
+        // The request is recorded at once, and the form is read-only until its reply.
+        expect(rig.editor.TemplateId).toBe('t3')
+        expect(rig.editor.Path).toBe('')
+        expect(rig.editor.IsEditable).toBe(false)
+        expect(rig.editor.SaveCommand.CanExecute(undefined)).toBe(false)
+        rig.client.HandleFrame(JSON.stringify({ id: first.id, result: { id: 't1', path: 'Examples', template: Rig.Researcher } }))
+        await new Promise(r => setTimeout(r, 0))
+        expect(rig.editor.TemplateId).toBe('t3')
+        expect(rig.editor.IsLoading).toBe(true)
+        // A reload for the earlier template is ignored too.
+        void rig.editor.Reload(new TemplateTreeNodeViewModel(Rig.Leaf))
+        expect(rig.Frames().filter(f => f.method === 'get_template').length).toBe(2)
+        await rig.Respond('get_template', { id: 't3', path: '', template: { ...Rig.Researcher, name: 'Loose' } })
+        expect(rig.editor.Name).toBe('Loose')
+        expect(rig.editor.IsEditable).toBe(true)
+    })
+
+    it('catalog_failure_stays_visible_and_is_retried_on_the_next_open', async () =>
+    {
+        const rig = new Rig()
+        void rig.editor.LoadCatalog()
+        await rig.Fail('list_catalog', 'down')
+        expect(rig.editor.CatalogError).toBe('catalog unavailable: down')
+        expect(rig.editor.HasCatalogError).toBe(true)
+        void rig.editor.Open(new TemplateTreeNodeViewModel(Rig.Leaf))
+        const retried = rig.Frames().filter(f => f.method === 'list_catalog').length
+        expect(retried).toBe(2)
+        await rig.Respond('get_template', { id: 't1', path: 'Examples', template: { ...Rig.Researcher, model: 'gone-model' } })
+        // The catalog is still unknown: the error stays, and nothing is marked as missing from it.
+        expect(rig.editor.CatalogError).toBe('catalog unavailable: down')
+        expect(rig.editor.ModelChoices.ToArray().map(c => c.Label)).toEqual(['gone-model'])
+        expect(rig.editor.RuntimeChoices.ToArray().map(c => c.Label)).toEqual(['llamacpp'])
+        await rig.Respond('list_catalog', Rig.Catalog)
+        await rig.Respond('list_all_tools', Rig.Tools)
+        expect(rig.editor.CatalogError).toBe('')
+        expect(rig.editor.ModelChoices.ToArray().map(c => c.Label)).toEqual(['gemma-4', 'tiny', 'gone-model (not in catalog)'])
+        // Once known, no further retry.
+        rig.editor.EnsureCatalog()
+        expect(rig.Frames().filter(f => f.method === 'list_catalog').length).toBe(2)
     })
 
     it('revert_restores_the_loaded_fields', async () =>
@@ -263,6 +322,8 @@ describe('TemplateEditorViewModel', () =>
         const e = rig.editor
         e.OpenNew('Examples')
         expect(e.Name).toBe('Untitled')
+        // Every registry tool starts enabled, as in the seeded Default.
+        expect(e.Tools.ToArray().map(t => t.Enabled)).toEqual([true, true])
         expect(e.IsNew).toBe(true)
         expect(e.IsDirty).toBe(true)
         expect(e.Runtime).toBe('llamacpp')
@@ -271,6 +332,7 @@ describe('TemplateEditorViewModel', () =>
         const save = rig.Frames().pop()!
         expect(save.params.id).toBeUndefined()
         expect(save.params.path).toBe('Examples')
+        expect((save.params.template as AgentTemplate).tools).toEqual(['read_file', 'get_time'])
         await rig.Respond('save_template', { id: 'untitled' })
         expect(e.TemplateId).toBe('untitled')
         expect(e.IsNew).toBe(false)
