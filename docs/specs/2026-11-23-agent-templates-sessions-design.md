@@ -1,7 +1,7 @@
 # Agent Templates, Sessions and the Dispatcher — Design
 
 **Date:** 2026-11-23
-**Status:** approved 2026-11-23
+**Status:** approved 2026-11-23; shipped and live-proven on the hive 2026-11-24 (main @af5e1b17). Protocol proof: a Researcher template with only read_file answered from notes.txt with a load on the first message, and a candle + gemma-3 session evicted gemma-4 with the placement changes announced. The owner confirmed the Agents and Sessions UI and the restart persistence.
 **Roadmap:** step 1 of `docs/roadmap.md` (agent definitions)
 **Builds on:** `2026-11-23-tool-calling-runtime-design.md` (Agent Runtime, tool loop),
 `2026-11-18-harness-supervisor-design.md` (harness lifecycle),
