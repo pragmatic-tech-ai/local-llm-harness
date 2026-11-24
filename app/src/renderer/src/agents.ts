@@ -289,3 +289,70 @@ export interface TraceWarning
     id: string
     message: string
 }
+
+/** How a repository serves its models (the wire `kind`). */
+export enum RepositoryKind
+{
+    Pragmatic = 'pragmatic',
+    OpenRouter = 'openrouter',
+}
+
+/** What a repository's provider can do (the wire `capabilities`). */
+export interface ProviderCapabilities
+{
+    measure_prompt: 'exact' | 'estimated'
+    tokenize: boolean
+    raw_prompt: boolean
+    logprobs: boolean
+    load_unload: boolean
+}
+
+/** One `list_repositories` row. The key itself never travels; `key_hint` is its last 4 characters. */
+export interface RepositorySummary
+{
+    name: string
+    kind: RepositoryKind
+    editable: boolean
+    capabilities: ProviderCapabilities
+    model_count: number
+    has_key?: boolean
+    key_hint?: string
+    id_prefixes?: string[]
+    /** Unix seconds of the last model-list fetch. */
+    fetched_at?: number
+    error?: string
+}
+
+/** One OpenRouter model. Prices are USD per million tokens. */
+export interface OpenRouterModelInfo
+{
+    id: string
+    name: string
+    context_length: number
+    prompt_price: number
+    completion_price: number
+    reasoning: boolean
+}
+
+/** A `list_repository_models` result: a Pragmatic repository lists catalog models, an OpenRouter one its served list. */
+export interface RepositoryModels
+{
+    models: (CatalogModel | OpenRouterModelInfo)[]
+    fetched_at: number | null
+    error?: string
+}
+
+/** `save_repository` params: an omitted `api_key` keeps the stored one; `previous_name` names the one updated. */
+export interface SaveRepositoryParams
+{
+    name: string
+    previous_name?: string
+    id_prefixes: string[]
+    api_key?: string
+}
+
+export interface SaveRepositoryResult
+{
+    name: string
+    fetch_error?: string
+}

@@ -12,6 +12,10 @@ import SessionsModule from "./views/SessionsModule.mu.js"
 import SessionsService from "./SessionsService.js"
 import AgentsModule from "./views/AgentsModule.mu.js"
 import AgentsService from "./AgentsService.js"
+import ModelsPanelResources from "./views/ModelsPanel.mu.js"
+import RepositoryEditorResources from "./views/RepositoryEditor.mu.js"
+import ModelsModule from "./views/ModelsModule.mu.js"
+import ModelsService from "./ModelsService.js"
 import HarnessSettingsStore from "./HarnessSettingsStore.js"
 import SettingsResources from "./views/SettingsResources.mu.js"
 import HarnessSettingsContribution from "./settings/HarnessSettingsContribution.js"
@@ -32,6 +36,7 @@ Application [ Theme = Pragmatic, Scheme = PragmaticDark ] {
     .modules: {
         SessionsModule
         AgentsModule
+        ModelsModule
     }
     resources: {
         merge RuntimeIcons
@@ -45,10 +50,15 @@ Application [ Theme = Pragmatic, Scheme = PragmaticDark ] {
         merge TextPromptResources
         merge AgentsPanelResources
         merge TemplateEditorResources
+        merge ModelsPanelResources
+        merge RepositoryEditorResources
         DataTemplate [ DataType = SessionsService ] {
             ContentPresenter [ Content = $Panel ]
         }
         DataTemplate [ DataType = AgentsService ] {
+            ContentPresenter [ Content = $Panel ]
+        }
+        DataTemplate [ DataType = ModelsService ] {
             ContentPresenter [ Content = $Panel ]
         }
         EditorShell x:root { }

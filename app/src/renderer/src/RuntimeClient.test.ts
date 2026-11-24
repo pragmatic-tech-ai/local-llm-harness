@@ -227,6 +227,9 @@ describe('RuntimeClient', () =>
         const step = { v: 1, kind: 'step', turn: 3, step: 1, at: 1, prompt_tokens: 10, n_ctx: 8192, out_tokens: 5, think_tokens: 0, load_ms: null, ttft_ms: 9, gen_ms: 8, end: 'tool_calls', tools: [{ name: 'read_file', id: 'c1', ok: true, ms: 4, bytes: 26 }], error: null }
         const summaryRecord = { v: 1, kind: 'turn', turn: 3, at: 2, steps: 1, reason: 'answered', total_ms: 20, out_tokens: 5, think_tokens: 0, peak_fill: 0.4, committed: true, user: 'hi' }
         const page = { turns: [{ turn: 3, steps: [step], summary: summaryRecord, reset_before: false }, { turn: 2, steps: [], summary: null, reset_before: true }], more: false, reset_pending: false }
+        const capabilities = { measure_prompt: 'estimated', tokenize: false, raw_prompt: false, logprobs: false, load_unload: false }
+        const repositories = [{ name: 'or', kind: 'openrouter', editable: true, capabilities, model_count: 1, has_key: true, key_hint: '7f2a', id_prefixes: [], fetched_at: 5 }]
+        const repositoryModels = { models: [{ id: 'a/b', name: 'B', context_length: 1000, prompt_price: 1, completion_price: 2, reasoning: false }], fetched_at: 5 }
         // reply is the wire result; result is what the method must resolve to (defaults to the reply).
         const table: { call: (c: RuntimeClient) => Promise<unknown>, method: string, params: unknown, reply: unknown, result?: unknown }[] = [
             { call: c => c.ListTemplates(), method: 'list_templates', params: {}, reply: nodes },
@@ -254,7 +257,15 @@ describe('RuntimeClient', () =>
             { call: c => c.ModelProps(), method: 'model_props', params: {}, reply: props },
             { call: c => c.Tokenize('abc'), method: 'tokenize', params: { text: 'abc' }, reply: tokens },
             { call: c => c.GetTrace('s'), method: 'get_trace', params: { id: 's' }, reply: page },
-            { call: c => c.GetTrace('s', 3, 20), method: 'get_trace', params: { id: 's', before: 3, limit: 20 }, reply: page }
+            { call: c => c.GetTrace('s', 3, 20), method: 'get_trace', params: { id: 's', before: 3, limit: 20 }, reply: page },
+            { call: c => c.ListRepositories(), method: 'list_repositories', params: {}, reply: repositories },
+            { call: c => c.ListRepositoryModels('or', true), method: 'list_repository_models', params: { name: 'or', refresh: true }, reply: repositoryModels },
+            { call: c => c.SaveRepository({ name: 'or', id_prefixes: ['a/'] }), method: 'save_repository', params: { name: 'or', id_prefixes: ['a/'] }, reply: { name: 'or' } },
+            {
+                call: c => c.SaveRepository({ name: 'or2', previous_name: 'or', id_prefixes: [], api_key: 'k' }), method: 'save_repository',
+                params: { name: 'or2', previous_name: 'or', id_prefixes: [], api_key: 'k' }, reply: { name: 'or2', fetch_error: 'openrouter: 401 no' },
+            },
+            { call: c => c.DeleteRepository('or'), method: 'delete_repository', params: { name: 'or' }, reply: {}, result: undefined }
         ]
         for (const row of table)
         {
@@ -288,6 +299,15 @@ describe('RuntimeClient', () =>
         client.HandleFrame(JSON.stringify({ method: 'session_loading', params: { id: 's' } }))
         client.HandleFrame(JSON.stringify({ method: 'session_busy', params: { id: 's', busy: true } }))
         expect(seen).toEqual(['sessions', 'templates', placement, { id: 's' }, { id: 's', busy: true }])
+    })
+
+    it('repositories_changed_raises_its_signal', () =>
+    {
+        const client = new RuntimeClient()
+        let raised = 0
+        client.OnRepositoriesChanged.Subscribe(() => raised++)
+        client.HandleFrame(JSON.stringify({ method: 'repositories_changed', params: {} }))
+        expect(raised).toBe(1)
     })
 
     it('trace_notifications_raise_signals', () =>

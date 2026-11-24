@@ -7,7 +7,11 @@ import type {
     NotesResult,
     Placement,
     PlacementChanged,
+    RepositoryModels,
+    RepositorySummary,
     SamplingConfig,
+    SaveRepositoryParams,
+    SaveRepositoryResult,
     SessionBusy,
     SessionLoading,
     SessionSummary,
@@ -120,6 +124,11 @@ export class RuntimeClient extends JsonRpcConnection
     private static readonly MethodSetThinking = 'set_thinking'
     private static readonly MethodGetTrace = 'get_trace'
     private static readonly MethodGetNotes = 'get_notes'
+    private static readonly MethodListRepositories = 'list_repositories'
+    private static readonly MethodListRepositoryModels = 'list_repository_models'
+    private static readonly MethodSaveRepository = 'save_repository'
+    private static readonly MethodDeleteRepository = 'delete_repository'
+    private static readonly NoteRepositoriesChanged = 'repositories_changed'
     private static readonly NoteNotesChanged = 'notes_changed'
     private static readonly NoteTraceStep = 'trace_step'
     private static readonly NoteTraceTurn = 'trace_turn'
@@ -155,6 +164,8 @@ export class RuntimeClient extends JsonRpcConnection
     public readonly OnTraceTurn = new TypedSignal<TraceTurnNote>()
     public readonly OnTraceWarning = new TypedSignal<TraceWarning>()
     public readonly OnNotesChanged = new TypedSignal<NotesChanged>()
+    /** A repository was saved or deleted, or its model list refreshed. */
+    public readonly OnRepositoriesChanged = new TypedSignal<Record<string, never>>()
 
     public ModelProps(): Promise<ModelProps>
     {
@@ -303,6 +314,38 @@ export class RuntimeClient extends JsonRpcConnection
         return this.Request<NotesResult>(RuntimeClient.MethodGetNotes, { id })
     }
 
+    /** Every repository (Pragmatic first, then OpenRouter in file order); never a key, only `key_hint`. */
+    public ListRepositories(): Promise<RepositorySummary[]>
+    {
+        return this.Request<RepositorySummary[]>(RuntimeClient.MethodListRepositories, {})
+    }
+
+    /** A repository's models; `refresh` refetches an OpenRouter list. */
+    public ListRepositoryModels(name: string, refresh: boolean): Promise<RepositoryModels>
+    {
+        return this.Request<RepositoryModels>(RuntimeClient.MethodListRepositoryModels, { name, refresh })
+    }
+
+    /** Creates, updates or renames an OpenRouter repository. Only the fields set are sent (no `api_key` keeps the stored key). */
+    public SaveRepository(params: SaveRepositoryParams): Promise<SaveRepositoryResult>
+    {
+        const sent: SaveRepositoryParams = { name: params.name, id_prefixes: params.id_prefixes }
+        if (params.previous_name !== undefined)
+        {
+            sent.previous_name = params.previous_name
+        }
+        if (params.api_key !== undefined)
+        {
+            sent.api_key = params.api_key
+        }
+        return this.Request<SaveRepositoryResult>(RuntimeClient.MethodSaveRepository, sent)
+    }
+
+    public async DeleteRepository(name: string): Promise<void>
+    {
+        await this.Request<null>(RuntimeClient.MethodDeleteRepository, { name })
+    }
+
     protected Dispatch(method: string, params: unknown): void
     {
         switch (method)
@@ -312,6 +355,9 @@ export class RuntimeClient extends JsonRpcConnection
                 break
             case RuntimeClient.NoteTemplatesChanged:
                 this.OnTemplatesChanged.Raise({})
+                break
+            case RuntimeClient.NoteRepositoriesChanged:
+                this.OnRepositoriesChanged.Raise({})
                 break
             case RuntimeClient.NotePlacementChanged:
                 this.OnPlacementChanged.Raise(params as PlacementChanged)
