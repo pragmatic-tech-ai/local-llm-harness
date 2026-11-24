@@ -1,6 +1,6 @@
 # Context compaction
 
-**Status:** draft 2026-11-24, awaiting owner approval
+**Status:** approved 2026-11-24 (owner "go"); implemented on feat/context-compaction
 **Roadmap:** step 3, memory and context (`docs/roadmap.md`)
 **Builds on:**
 - `docs/specs/2026-11-23-agent-templates-sessions-design.md`: templates, sessions and the runtime on :8779
