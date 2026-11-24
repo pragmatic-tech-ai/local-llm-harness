@@ -257,11 +257,11 @@ pub struct ToolLoop {
 
 impl ToolLoop {
     const M_TOOL_CALL: &'static str = "tool_call";
-    const M_TURN_STARTED: &'static str = "turn_started";
-    const M_TURN_CHUNK: &'static str = "turn_chunk";
-    const M_TURN_DONE: &'static str = "turn_done";
-    const M_TURN_REJECTED: &'static str = "turn_rejected";
-    const M_TURN_ERROR: &'static str = "turn_error";
+    pub(crate) const M_TURN_STARTED: &'static str = "turn_started";
+    pub(crate) const M_TURN_CHUNK: &'static str = "turn_chunk";
+    pub(crate) const M_TURN_DONE: &'static str = "turn_done";
+    pub(crate) const M_TURN_REJECTED: &'static str = "turn_rejected";
+    pub(crate) const M_TURN_ERROR: &'static str = "turn_error";
     const M_TOOL_RESULT: &'static str = "tool_result";
     const M_LOOP_DONE: &'static str = "loop_done";
     const STREAM_ENDED: &'static str = "worker stream ended unexpectedly";
