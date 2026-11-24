@@ -3,6 +3,8 @@ import type {
     AgentTemplate,
     AttachedSession,
     CatalogInfo,
+    NotesChanged,
+    NotesResult,
     Placement,
     PlacementChanged,
     SamplingConfig,
@@ -13,8 +15,6 @@ import type {
     TemplateRecord,
     ToolSpec,
     TracePage,
-    NotesChanged,
-    NotesResult,
     TraceStepNote,
     TraceTurnNote,
     TraceWarning

@@ -196,7 +196,7 @@ export interface ToolTiming
     ok: boolean
     ms: number
     bytes: number
-    /** Set when the call repeated one that already failed twice. */
+    /** Set when the call repeated a call that just failed the same way. */
     repeat_failure?: boolean
 }
 

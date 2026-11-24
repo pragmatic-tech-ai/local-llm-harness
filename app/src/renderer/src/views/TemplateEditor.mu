@@ -79,6 +79,7 @@ resources TemplateEditorResources {
                             ComboBox [ ItemsSource = $WorkspaceChoices, SelectedItem = $WorkspaceChoice, HorizontalAlignment = Stretch ]
                             TextBox [ Text = $WorkspaceName, IsEnabled = $IsWorkspaceNameEnabled, HorizontalAlignment = Stretch,
                                       Placeholder = "Workspace name", Margin = (0,4,0,0) ]
+                            TextBlock [ Text = $WorkspaceNameError, Style = @BodySm, Foreground = @StateDanger, Visibility = $HasWorkspaceNameError << ToVisibility ]
 
                             DockPanel [ LastChildFill = true, Margin = (0,8,0,0) ] {
                                 TextBlock [ DockPanel.Dock = Left, Text = "Thinking", Margin = (0,0,8,0), VerticalAlignment = Center ]

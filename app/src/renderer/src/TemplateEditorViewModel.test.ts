@@ -235,6 +235,52 @@ describe('TemplateEditorViewModel', () =>
         expect((rig.Frames().pop()!.params.template as AgentTemplate).workspace).toEqual({ mode: 'shared' })
     })
 
+    it('named_workspace_needs_a_valid_name', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open()
+        const e = rig.editor
+        expect(e.HasWorkspaceNameError).toBe(false)
+        e.Workspace = 'named'
+        for (const blank of ['', '   '])
+        {
+            e.WorkspaceName = blank
+            expect(e.WorkspaceNameError).toBe('workspace name is required for named mode')
+            expect(e.CanSave).toBe(false)
+        }
+        for (const bad of ['two words', 'a/b', 'x'.repeat(65), 'café'])
+        {
+            e.WorkspaceName = bad
+            expect(e.HasWorkspaceNameError).toBe(true)
+            expect(e.WorkspaceNameError).toBe('workspace name must be 1-64 letters, digits, _ or -')
+            expect(e.CanSave).toBe(false)
+        }
+        for (const good of ['notes', 'A_b-9', 'x'.repeat(64), '  padded  '])
+        {
+            e.WorkspaceName = good
+            expect(e.HasWorkspaceNameError).toBe(false)
+            expect(e.CanSave).toBe(true)
+        }
+        // Any other mode ignores the name.
+        e.WorkspaceName = 'two words'
+        e.Workspace = 'shared'
+        expect(e.HasWorkspaceNameError).toBe(false)
+        expect(e.CanSave).toBe(true)
+    })
+
+    it('workspace_name_counts_toward_dirty_only_when_named', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open({ ...Rig.Researcher, workspace: { mode: 'shared' } })
+        const e = rig.editor
+        e.WorkspaceName = 'ignored'
+        expect(e.IsDirty).toBe(false)
+        e.Workspace = 'named'
+        expect(e.IsDirty).toBe(true)
+        e.Workspace = 'shared'
+        expect(e.IsDirty).toBe(false)
+    })
+
     it('compact_at_out_of_range_blocks_save', async () =>
     {
         const rig = new Rig()

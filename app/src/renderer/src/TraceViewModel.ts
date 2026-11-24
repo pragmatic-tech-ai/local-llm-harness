@@ -55,7 +55,7 @@ export class TraceToolViewModel extends Observable
         this.repeated = repeated
     }
 
-    /** `repeated failure` when the call repeated one that already failed twice, else ''. */
+    /** `repeated failure` when the call repeated a call that just failed the same way, else ''. */
     public get RepeatText(): string
     {
         return this.repeated ? TraceToolViewModel.RepeatLabel : ''

@@ -287,4 +287,56 @@ describe('SessionViewModel', () =>
         expect(rig.view.Notes.Count).toBe(0)
         expect(rig.view.HasNotes).toBe(false)
     })
+
+    it('notes_change_raises_has_notes_only', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
+        const raised: string[] = []
+        for (const name of ['HasNotes', 'HeaderText', 'PlacementText', 'CanLoad'])
+        {
+            rig.view.PropertyChanged(name).subscribe(() => { raised.push(name) })
+        }
+        await rig.Respond('get_notes', { notes: ['plan A'] })
+        expect(raised).toEqual(['HasNotes'])
+    })
+
+    it('notes_expander_toggles_and_notifies', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
+        let raised = 0
+        rig.view.PropertyChanged('IsNotesExpanded').subscribe(() => { raised++ })
+        expect(rig.view.IsNotesExpanded).toBe(true)
+        rig.view.IsNotesExpanded = false
+        expect(rig.view.IsNotesExpanded).toBe(false)
+        expect(raised).toBe(1)
+        // Setting the same value again is not a change.
+        rig.view.IsNotesExpanded = false
+        expect(raised).toBe(1)
+        rig.view.IsNotesExpanded = true
+        expect(rig.view.IsNotesExpanded).toBe(true)
+        expect(raised).toBe(2)
+    })
+
+    it('switching_sessions_clears_notes_at_once', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
+        await rig.Respond('get_notes', { notes: ['plan A'] })
+        expect(rig.view.HasNotes).toBe(true)
+        let raised = 0
+        rig.view.PropertyChanged('HasNotes').subscribe(() => { raised++ })
+        const done = rig.view.Attach('s2')
+        // Reset on the switch: the old session's notes are gone before the new attach lands.
+        expect(rig.view.Notes.Count).toBe(0)
+        expect(rig.view.HasNotes).toBe(false)
+        expect(raised).toBeGreaterThan(0)
+        const attached = Rig.Attached({ state: PlacementState.Ready, host: 'local' })
+        await rig.Respond('attach_session', { ...attached, summary: { ...attached.summary, id: 's2' } })
+        await done
+        expect(rig.Frame('get_notes')?.params).toEqual({ id: 's2' })
+        await rig.Respond('get_notes', { notes: ['plan B'] })
+        expect(rig.view.Notes.ToArray()).toEqual(['1. plan B'])
+    })
 })

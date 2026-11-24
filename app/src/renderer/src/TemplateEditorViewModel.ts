@@ -62,6 +62,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly PropWorkspaceName = 'WorkspaceName'
     private static readonly WorkspaceNamed: WorkspaceMode = 'named'
     private static readonly DefaultWorkspace: WorkspaceMode = 'session'
+    /** The backend's workspace name rule (WorkspaceConfig::validate), with its messages verbatim. */
+    private static readonly WorkspaceNamePattern = /^[A-Za-z0-9_-]{1,64}$/
+    private static readonly WorkspaceNameRequired = 'workspace name is required for named mode'
+    private static readonly WorkspaceNameInvalid = 'workspace name must be 1-64 letters, digits, _ or -'
     private static readonly WorkspaceModes: readonly (readonly [WorkspaceMode, string])[] = [['session', 'Session'], ['shared', 'Shared'], ['named', 'Named']]
     private static readonly PropPath = 'Path'
     private static readonly PropTemplateId = 'TemplateId'
@@ -77,7 +81,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         'IsEditable', 'CatalogError', 'HasCatalogError', 'HeaderText', 'ErrorText',
         'HasErrorText', 'NameError', 'HasNameError', 'StepBudgetError', 'HasStepBudgetError', 'ContextSizeError',
         'HasContextSizeError', 'CompactAtError', 'HasCompactAtError', 'ContextChoice', 'TemperatureError', 'HasTemperatureError', 'TopPError', 'HasTopPError', 'RuntimeChoice',
-        'ModelChoice', 'HostChoice', 'WorkspaceChoice', 'IsWorkspaceNameEnabled']
+        'ModelChoice', 'HostChoice', 'WorkspaceChoice', 'IsWorkspaceNameEnabled', 'WorkspaceNameError', 'HasWorkspaceNameError']
 
     public readonly RuntimeChoices = new ObservableCollection<ChoiceItem>()
     public readonly ModelChoices = new ObservableCollection<ChoiceItem>()
@@ -416,6 +420,26 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     public get IsWorkspaceNameEnabled(): boolean
     {
         return this.workspace === TemplateEditorViewModel.WorkspaceNamed
+    }
+
+    /** A Named workspace needs a valid name; any other mode ignores the name. */
+    public get WorkspaceNameError(): string
+    {
+        if (!this.open || !this.IsWorkspaceNameEnabled)
+        {
+            return ''
+        }
+        const name = this.workspaceName.trim()
+        if (name.length === 0)
+        {
+            return TemplateEditorViewModel.WorkspaceNameRequired
+        }
+        return TemplateEditorViewModel.WorkspaceNamePattern.test(name) ? '' : TemplateEditorViewModel.WorkspaceNameInvalid
+    }
+
+    public get HasWorkspaceNameError(): boolean
+    {
+        return this.WorkspaceNameError.length > 0
     }
 
     public get Context(): ContextStrategy
@@ -909,6 +933,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private get HasFieldErrors(): boolean
     {
         return this.HasNameError || this.HasStepBudgetError || this.HasContextSizeError || this.HasCompactAtError || this.HasTemperatureError || this.HasTopPError
+            || this.HasWorkspaceNameError
     }
 
     /**
@@ -1020,11 +1045,12 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         return TemplateEditorViewModel.Decimal.test(trimmed) ? Number(trimmed) : null
     }
 
-    /** What the form holds, as one comparable string (the tool set order-free). */
+    /** What the form holds, as one comparable string (the tool set order-free; the workspace name only when Named, as only then is it saved). */
     private Fingerprint(): string
     {
+        const workspaceName = this.IsWorkspaceNameEnabled ? this.workspaceName : ''
         return JSON.stringify([this.name, this.systemPrompt, this.stepBudgetText, this.runtime, this.model, this.contextSizeText,
-            this.context, this.compactAtText, this.enableThinking, this.temperatureText, this.topPText, this.host, this.workspace, this.workspaceName, [...this.enabled].sort()])
+            this.context, this.compactAtText, this.enableThinking, this.temperatureText, this.topPText, this.host, this.workspace, workspaceName, [...this.enabled].sort()])
     }
 
     private SetField<T>(prop: string, old: T, value: T, assign: () => void): void

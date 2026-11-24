@@ -33,6 +33,7 @@ export class SessionViewModel extends Observable
     private static readonly EmptyText = 'Select a session, or start a new one.'
     private static readonly NoteFormat = '{0}. {1}'
     private static readonly PropIsNotesExpanded = 'IsNotesExpanded'
+    private static readonly PropHasNotes = 'HasNotes'
     private static readonly Props = ['HasNotes', 'HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
 
     public readonly Chat = new ChatViewModel()
@@ -294,14 +295,16 @@ export class SessionViewModel extends Observable
         }
     }
 
+    /** Replaces the shown notes; only HasNotes derives from them, so only it is raised. */
     private ShowNotes(notes: string[]): void
     {
+        const hadNotes = this.HasNotes
         this.Notes.Batch(() =>
         {
             this.Notes.Clear()
             notes.forEach((text, i) => this.Notes.Add(TextFormat.Format(SessionViewModel.NoteFormat, i + 1, text)))
         })
-        this.Update(() => { })
+        this.RaisePropertyChanged(SessionViewModel.PropHasNotes, hadNotes, this.HasNotes)
     }
 
     /**
