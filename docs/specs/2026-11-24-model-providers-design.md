@@ -1,6 +1,6 @@
 # Model providers and repositories
 
-**Status:** draft 2026-11-24.
+**Status:** shipped 2026-11-25 (main @fe4989ef, deployed on the hive). Owner-confirmed live: an OpenRouter repository added in the Models rail with a key, and OpenRouter turns run. Key scan of all 904 files under `C:\llm-harness` (excluding build output, vendor and model files), the supervisor log included: the key appears only in `repositories.toml`. Live finding: with Max tokens -1 the request omits `max_tokens`, so OpenRouter reserves credit for the model's full output limit (65536 on Gemini); a key with a low credit limit gets a 402 until Max tokens is set (e.g. 1024).
 **Roadmap:** inserted before step 5 (planning) at the owner's request.
 **Builds on:**
 - `docs/specs/2026-11-23-agent-templates-sessions-design.md`: templates, sessions, the dispatcher and `ModelHost`

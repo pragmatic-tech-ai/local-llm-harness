@@ -30,6 +30,8 @@ policy seam stays, unused.
 4. **Longer tasks.** *Shipped 2026-11-24* (`docs/specs/2026-11-24-longer-tasks-design.md`: per-template workspaces, write tools, a notes scratchpad that survives compaction, a retry hint). Per-agent step budgets, a scratchpad/notes tool, and write tools in
    the sandbox. The agent's tool list is its permission list, so no approval UI is needed.
    The agent can recover from tool errors.
+4a. **Model providers and repositories.** *Shipped 2026-11-25* (`docs/specs/2026-11-24-model-providers-design.md`): the local path is the Pragmatic provider behind a `Provider` seam; OpenRouter runs inside the runtime over HTTPS; templates name a repository; a Models rail item configures repositories; the trace shows cost and estimates.
+
 5. **Planning.** A plan/todo tool and a plan-then-execute loop, with the plan visible in
    the UI.
 6. **Multiple agents.** A coordinator hands subtasks to specialist agents on the same
