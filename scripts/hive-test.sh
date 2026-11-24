@@ -25,14 +25,21 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 if [ "$RESTORE" = 1 ]; then
-    printf '@echo off\r\ncd /d %s\r\ngit checkout -- backend\r\ngit clean -fd backend/src backend/tests\r\ngit status --short backend\r\necho RESTORED\r\n' "$CLONE_WIN" > "$TMP/restore.cmd"
+    printf '@echo off\r\ncd /d %s\r\ngit checkout -- backend\r\ngit clean -fd backend/src backend/tests backend/vendor\r\ngit status --short backend\r\necho RESTORED\r\n' "$CLONE_WIN" > "$TMP/restore.cmd"
     scp -q "$TMP/restore.cmd" "$HOST:$CLONE_FWD/../harness-build/restore.cmd" || exit 1
     ssh "$HOST" "cmd /c ${BUILD_DIR}\restore.cmd" 2>&1 | grep -v '^\*\*'
     exit "${PIPESTATUS[0]}"
 fi
 
 # Ship the working tree: tar locally, scp, extract on the hive.
-(cd "$REPO_ROOT" && tar -cf "$TMP/src.tar" backend/src backend/tests backend/Cargo.toml) || exit 1
+# Cargo.lock and the vendored crates are needed for the offline build. The hive clone sits at
+# origin/main, so ship only the vendor files that differ from it (changed/added + untracked).
+# Stale crate dirs left on the hive are harmless; --restore cleans what was shipped.
+(cd "$REPO_ROOT" && {
+    git diff --name-only --diff-filter=d origin/main -- backend/vendor
+    git ls-files -o --exclude-standard backend/vendor
+} > "$TMP/vendor-files.txt" &&
+    tar -cf "$TMP/src.tar" backend/src backend/tests backend/Cargo.toml backend/Cargo.lock -T "$TMP/vendor-files.txt") || exit 1
 scp -q "$TMP/src.tar" "$HOST:$CLONE_FWD/../harness-build/src.tar" || exit 1
 
 FEATURE_ARGS=""
