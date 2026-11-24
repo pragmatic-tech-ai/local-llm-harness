@@ -7,6 +7,7 @@ pub mod registry;
 pub mod server;
 pub mod tool;
 pub mod tool_loop;
+pub mod trace;
 pub mod worker;
 
 #[cfg(test)]

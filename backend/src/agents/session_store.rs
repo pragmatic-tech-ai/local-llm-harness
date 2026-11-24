@@ -487,6 +487,23 @@ mod tests {
     }
 
     #[test]
+    fn session_store_ignores_trace_files() {
+        let d = TempDir::new("trace");
+        let s = d.store();
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        drop(s);
+        fs::write(
+            d.0.join("sessions").join("s-1-0.trace.jsonl"),
+            "{\"v\":1,\"kind\":\"reset\",\"at\":1}\n",
+        )
+        .unwrap();
+        let s = d.store();
+        assert_eq!(s.list().len(), 1);
+        assert!(s.get(&rec.id).is_some());
+        assert!(s.get("s-1-0").is_none());
+    }
+
+    #[test]
     fn rename_delete_list_and_unknown_ids() {
         let d = TempDir::new("misc");
         let s = d.store();
