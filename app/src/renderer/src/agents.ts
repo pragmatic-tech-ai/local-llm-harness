@@ -13,6 +13,16 @@ export interface SamplingConfig
 /** How a session keeps its prompt inside the window: nothing, trim old results and turns, or summarize them. */
 export type ContextStrategy = 'off' | 'trim' | 'summarize'
 
+/** Where a session's file tools write: its own folder, one shared folder, or a named folder. */
+export type WorkspaceMode = 'session' | 'shared' | 'named'
+
+export interface WorkspaceConfig
+{
+    mode: WorkspaceMode
+    /** Only with `named`. */
+    name?: string
+}
+
 export interface AgentTemplate
 {
     name: string
@@ -29,6 +39,8 @@ export interface AgentTemplate
     compact_at_pct?: number
     /** Optional sampling defaults; a missing field takes the worker default. */
     sampling?: Partial<SamplingConfig>
+    /** Absent in a template saved before workspaces existed: read as `session`. */
+    workspace?: WorkspaceConfig
     host?: string
 }
 
@@ -147,6 +159,17 @@ export interface ToolSpec
     side_effects: boolean
 }
 
+export interface NotesResult
+{
+    notes: string[]
+}
+
+export interface NotesChanged
+{
+    id: string
+    notes: string[]
+}
+
 export interface PlacementChanged
 {
     id: string
@@ -173,6 +196,8 @@ export interface ToolTiming
     ok: boolean
     ms: number
     bytes: number
+    /** Set when the call repeated one that already failed twice. */
+    repeat_failure?: boolean
 }
 
 /** What compaction did to a step's prompt. Present on a step only when compaction ran. */

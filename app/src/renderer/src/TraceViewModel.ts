@@ -43,12 +43,27 @@ export class TraceNumbers
 /** One tool run of a step, as one sub-row: `└ {name}  ok|failed  {ms} ms  {bytes} B`. */
 export class TraceToolViewModel extends Observable
 {
-    private readonly text: string
+    private static readonly RepeatLabel = 'repeated failure'
 
-    constructor(text: string)
+    private readonly text: string
+    private readonly repeated: boolean
+
+    constructor(text: string, repeated = false)
     {
         super()
         this.text = text
+        this.repeated = repeated
+    }
+
+    /** `repeated failure` when the call repeated one that already failed twice, else ''. */
+    public get RepeatText(): string
+    {
+        return this.repeated ? TraceToolViewModel.RepeatLabel : ''
+    }
+
+    public get HasRepeat(): boolean
+    {
+        return this.repeated
     }
 
     public get Text(): string
@@ -92,7 +107,7 @@ export class TraceStepViewModel extends Observable
         super()
         this.record = record
         this.tools = record.tools.map(t => new TraceToolViewModel(TextFormat.Format(TraceStepViewModel.ToolFormat, t.name,
-            t.ok ? TraceStepViewModel.ToolOk : TraceStepViewModel.ToolFailed, TraceNumbers.Thousands(t.ms), TraceNumbers.Thousands(t.bytes))))
+            t.ok ? TraceStepViewModel.ToolOk : TraceStepViewModel.ToolFailed, TraceNumbers.Thousands(t.ms), TraceNumbers.Thousands(t.bytes)), t.repeat_failure === true))
     }
 
     public get Step(): number

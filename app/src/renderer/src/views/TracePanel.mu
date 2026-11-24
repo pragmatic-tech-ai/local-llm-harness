@@ -51,7 +51,11 @@ resources TracePanelResources {
 
     // A tool sub-row of a step.
     DataTemplate [ DataType = TraceToolViewModel ] {
-        TextBlock [ Text = $Text, Style = @BodySm, FontFamily = "Consolas" ]
+        StackPanel [ Orientation = Horizontal ] {
+            TextBlock [ Text = $Text, Style = @BodySm, FontFamily = "Consolas" ]
+            TextBlock [ Text = $RepeatText, Style = @BodySm, Foreground = @StateDanger, FontFamily = "Consolas",
+                        Margin = (8,0,0,0), Visibility = $HasRepeat << ToVisibility ]
+        }
     }
 
     // A step: fill text + bar (the context-bar style, smaller), then out/think/load/ttft/gen/rate, the compaction line, tool rows, error.

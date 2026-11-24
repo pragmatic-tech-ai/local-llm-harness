@@ -378,6 +378,17 @@ describe('TraceViewModel', () =>
         expect(rig.trace.HasMore).toBe(false)
     })
 
+    it('repeat_failure_tool_line_shows_tag', () =>
+    {
+        const tool = (over: object) => ({ name: 'fetch', id: 'c1', ok: false, ms: 5, bytes: 9, ...over })
+        const step = new TraceStepViewModel(Rig.Step(1, 1, { tools: [tool({ repeat_failure: true }), tool({})] }))
+        const [repeated, plain] = step.Tools
+        expect(repeated.HasRepeat).toBe(true)
+        expect(repeated.RepeatText).toBe('repeated failure')
+        expect(plain.HasRepeat).toBe(false)
+        expect(plain.RepeatText).toBe('')
+    })
+
     it('compaction_text_formats_each_variant', () =>
     {
         const base: CompactionRecord = {

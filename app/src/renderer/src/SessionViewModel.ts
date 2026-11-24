@@ -1,4 +1,4 @@
-import { Observable, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
+import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import type { IDisposable } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
 import { PlacementState, type AgentTemplate, type AttachedSession, type Placement } from './agents'
@@ -31,11 +31,16 @@ export class SessionViewModel extends Observable
     private static readonly ToolsPrefix = 'tools: '
     private static readonly ToolsSeparator = ', '
     private static readonly EmptyText = 'Select a session, or start a new one.'
-    private static readonly Props = ['HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
+    private static readonly NoteFormat = '{0}. {1}'
+    private static readonly PropIsNotesExpanded = 'IsNotesExpanded'
+    private static readonly Props = ['HasNotes', 'HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
 
     public readonly Chat = new ChatViewModel()
     /** The shown session's agent trace, hosted by the instrument panel below its context bar. */
     public readonly Trace = new TraceViewModel()
+
+    /** The session's working notes, each shown as `{n}. {text}`. */
+    public readonly Notes = new ObservableCollection<string>()
 
     private readonly client: RuntimeClient
     private readonly loadCommand: RelayCommand
@@ -56,6 +61,9 @@ export class SessionViewModel extends Observable
     private attachToken = 0
     /** Counts `placement_changed` for the shown session, so a reply computed before one does not overwrite it. */
     private placementNotes = 0
+    /** Counts `notes_changed` for the shown session, so a get_notes reply computed before one does not overwrite it. */
+    private notesChanges = 0
+    private notesExpanded = true
 
     constructor(client: RuntimeClient)
     {
@@ -77,6 +85,14 @@ export class SessionViewModel extends Observable
                 if (p.id === this.shownId)
                 {
                     this.Update(() => { this.turnLoading = true })
+                }
+            }),
+            client.OnNotesChanged.Subscribe(n =>
+            {
+                if (n.id === this.shownId)
+                {
+                    this.notesChanges++
+                    this.ShowNotes(n.notes)
                 }
             }),
             client.OnTurnStarted.Subscribe(() => this.EndTurnLoading()),
@@ -182,6 +198,28 @@ export class SessionViewModel extends Observable
         return tools.length > 0 ? SessionViewModel.ToolsPrefix + tools.join(SessionViewModel.ToolsSeparator) : SessionViewModel.ToolsOff
     }
 
+    /** The notes panel shows only while the session has notes. */
+    public get HasNotes(): boolean
+    {
+        return this.Notes.Count > 0
+    }
+
+    /** The notes panel is open (the default) or folded to its header. */
+    public get IsNotesExpanded(): boolean
+    {
+        return this.notesExpanded
+    }
+
+    public set IsNotesExpanded(value: boolean)
+    {
+        if (this.notesExpanded !== value)
+        {
+            const old = this.notesExpanded
+            this.notesExpanded = value
+            this.RaisePropertyChanged(SessionViewModel.PropIsNotesExpanded, old, value)
+        }
+    }
+
     public get LoadCommand(): ICommand
     {
         return this.loadCommand
@@ -235,6 +273,35 @@ export class SessionViewModel extends Observable
         // Attach, switch and re-attach after a reconnect all reload the trace's first page; a busy session's newest
         // unfinished turn shows as running.
         void this.Trace.ShowSession(this.client, id, attached.summary.busy)
+        void this.LoadNotes(id, token)
+    }
+
+    /** Fetches the session's notes; a `notes_changed` that arrived meanwhile is newer than the reply. */
+    private async LoadNotes(id: string, token: number): Promise<void>
+    {
+        const changesBefore = this.notesChanges
+        try
+        {
+            const result = await this.client.GetNotes(id)
+            if (token === this.attachToken && id === this.shownId && this.notesChanges === changesBefore)
+            {
+                this.ShowNotes(result.notes)
+            }
+        }
+        catch
+        {
+            // The panel stays as it was; the next notes_changed refreshes it.
+        }
+    }
+
+    private ShowNotes(notes: string[]): void
+    {
+        this.Notes.Batch(() =>
+        {
+            this.Notes.Clear()
+            notes.forEach((text, i) => this.Notes.Add(TextFormat.Format(SessionViewModel.NoteFormat, i + 1, text)))
+        })
+        this.Update(() => { })
     }
 
     /**
@@ -278,6 +345,8 @@ export class SessionViewModel extends Observable
     {
         this.Chat.Clear()
         void this.Trace.ShowSession(null, null)
+        this.notesChanges++
+        this.Notes.Clear()
         this.Update(() =>
         {
             this.snapshot = null

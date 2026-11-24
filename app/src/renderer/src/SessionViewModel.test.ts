@@ -253,4 +253,38 @@ describe('SessionViewModel', () =>
         rig.Notify('session_busy', { id: 's1', busy: false })
         expect(rig.view.Trace.Turns.Get(0)!.HeaderText).toBe('Turn 3 · incomplete')
     })
+
+    it('session_loads_notes_on_open', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
+        expect(rig.view.HasNotes).toBe(false)
+        expect(rig.Frame('get_notes')?.params).toEqual({ id: 's1' })
+        await rig.Respond('get_notes', { notes: ['plan A', 'plan B'] })
+        expect(rig.view.HasNotes).toBe(true)
+        expect(rig.view.IsNotesExpanded).toBe(true)
+        expect(rig.view.Notes.ToArray()).toEqual(['1. plan A', '2. plan B'])
+    })
+
+    it('notes_changed_for_other_session_is_ignored', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
+        await rig.Respond('get_notes', { notes: ['plan A'] })
+        rig.Notify('notes_changed', { id: 'other', notes: ['x', 'y'] })
+        expect(rig.view.Notes.ToArray()).toEqual(['1. plan A'])
+    })
+
+    it('notes_changed_replaces_list_and_empty_hides_panel', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
+        await rig.Respond('get_notes', { notes: ['plan A'] })
+        rig.Notify('notes_changed', { id: 's1', notes: ['a', 'b', 'c'] })
+        expect(rig.view.Notes.ToArray()).toEqual(['1. a', '2. b', '3. c'])
+        expect(rig.view.HasNotes).toBe(true)
+        rig.Notify('notes_changed', { id: 's1', notes: [] })
+        expect(rig.view.Notes.Count).toBe(0)
+        expect(rig.view.HasNotes).toBe(false)
+    })
 })

@@ -1,7 +1,7 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import { TypedSignal } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
-import type { AgentTemplate, CatalogInfo, ContextStrategy, SamplingConfig, TemplateLeafNode, ToolSpec } from './agents'
+import type { AgentTemplate, CatalogInfo, ContextStrategy, SamplingConfig, TemplateLeafNode, ToolSpec, WorkspaceMode } from './agents'
 import type { TemplateTreeNodeViewModel } from './TemplateTreeNodeViewModel'
 import { ChoiceItem } from './ChoiceItem'
 import { ToolChoice, type IToolChoiceOwner } from './ToolChoice'
@@ -58,6 +58,11 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly PropTemperatureText = 'TemperatureText'
     private static readonly PropTopPText = 'TopPText'
     private static readonly PropHost = 'Host'
+    private static readonly PropWorkspace = 'Workspace'
+    private static readonly PropWorkspaceName = 'WorkspaceName'
+    private static readonly WorkspaceNamed: WorkspaceMode = 'named'
+    private static readonly DefaultWorkspace: WorkspaceMode = 'session'
+    private static readonly WorkspaceModes: readonly (readonly [WorkspaceMode, string])[] = [['session', 'Session'], ['shared', 'Shared'], ['named', 'Named']]
     private static readonly PropPath = 'Path'
     private static readonly PropTemplateId = 'TemplateId'
     private static readonly StrategyChoices: readonly (readonly [ContextStrategy, string])[] = [['off', 'Off'], ['trim', 'Trim'], ['summarize', 'Summarize']]
@@ -66,18 +71,21 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         TemplateEditorViewModel.PropContextSizeText, TemplateEditorViewModel.PropContext, TemplateEditorViewModel.PropCompactAtText,
         TemplateEditorViewModel.PropEnableThinking,
         TemplateEditorViewModel.PropTemperatureText, TemplateEditorViewModel.PropTopPText, TemplateEditorViewModel.PropHost,
+        TemplateEditorViewModel.PropWorkspace, TemplateEditorViewModel.PropWorkspaceName,
         TemplateEditorViewModel.PropPath, TemplateEditorViewModel.PropTemplateId]
     private static readonly DerivedProps = ['HasTemplate', 'IsEmpty', 'IsNew', 'IsDirty', 'CanSave', 'CanRevert', 'IsLoading',
         'IsEditable', 'CatalogError', 'HasCatalogError', 'HeaderText', 'ErrorText',
         'HasErrorText', 'NameError', 'HasNameError', 'StepBudgetError', 'HasStepBudgetError', 'ContextSizeError',
         'HasContextSizeError', 'CompactAtError', 'HasCompactAtError', 'ContextChoice', 'TemperatureError', 'HasTemperatureError', 'TopPError', 'HasTopPError', 'RuntimeChoice',
-        'ModelChoice', 'HostChoice']
+        'ModelChoice', 'HostChoice', 'WorkspaceChoice', 'IsWorkspaceNameEnabled']
 
     public readonly RuntimeChoices = new ObservableCollection<ChoiceItem>()
     public readonly ModelChoices = new ObservableCollection<ChoiceItem>()
     public readonly HostChoices = new ObservableCollection<ChoiceItem>()
     /** Off, Trim, Summarize: what the session does when the prompt nears the window. */
     public readonly ContextChoices = new ObservableCollection<ChoiceItem>()
+    /** Session, Shared, Named: which folder the file tools write to. */
+    public readonly WorkspaceChoices = new ObservableCollection<ChoiceItem>()
     public readonly Tools = new ObservableCollection<ToolChoice>()
     /** A save succeeded; carries the template id (new for a draft). */
     public readonly OnSaved = new TypedSignal<string>()
@@ -119,6 +127,8 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private temperatureText = ''
     private topPText = ''
     private host = ''
+    private workspace: WorkspaceMode = TemplateEditorViewModel.DefaultWorkspace
+    private workspaceName = ''
     private sampling: Partial<SamplingConfig> | undefined = undefined
     private enabled = new Set<string>()
 
@@ -129,6 +139,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         for (const choice of TemplateEditorViewModel.StrategyChoices)
         {
             this.ContextChoices.Add(new ChoiceItem(choice[0], choice[1]))
+        }
+        for (const choice of TemplateEditorViewModel.WorkspaceModes)
+        {
+            this.WorkspaceChoices.Add(new ChoiceItem(choice[0], choice[1]))
         }
         this.saveCommand = new RelayCommand(() => void this.Save(), () => this.CanSave)
         this.revertCommand = new RelayCommand(() => this.Revert(), () => this.CanRevert)
@@ -363,6 +377,45 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     public get HasContextSizeError(): boolean
     {
         return this.ContextSizeError.length > 0
+    }
+
+    public get Workspace(): WorkspaceMode
+    {
+        return this.workspace
+    }
+
+    public set Workspace(value: WorkspaceMode)
+    {
+        this.SetField(TemplateEditorViewModel.PropWorkspace, this.workspace, value, () => { this.workspace = value })
+    }
+
+    public get WorkspaceChoice(): ChoiceItem | null
+    {
+        return TemplateEditorViewModel.FindChoice(this.WorkspaceChoices, this.workspace)
+    }
+
+    public set WorkspaceChoice(choice: ChoiceItem | null)
+    {
+        if (choice instanceof ChoiceItem)
+        {
+            this.Workspace = choice.Value as WorkspaceMode
+        }
+    }
+
+    public get WorkspaceName(): string
+    {
+        return this.workspaceName
+    }
+
+    public set WorkspaceName(value: string)
+    {
+        this.SetField(TemplateEditorViewModel.PropWorkspaceName, this.workspaceName, value, () => { this.workspaceName = value })
+    }
+
+    /** The name box is live only for a Named workspace. */
+    public get IsWorkspaceNameEnabled(): boolean
+    {
+        return this.workspace === TemplateEditorViewModel.WorkspaceNamed
     }
 
     public get Context(): ContextStrategy
@@ -800,6 +853,8 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.temperatureText = template.sampling?.temperature !== undefined ? String(template.sampling.temperature) : ''
         this.topPText = template.sampling?.top_p !== undefined ? String(template.sampling.top_p) : ''
         this.host = template.host ?? ''
+        this.workspace = template.workspace?.mode ?? TemplateEditorViewModel.DefaultWorkspace
+        this.workspaceName = template.workspace?.name ?? ''
         this.enabled = new Set(template.tools)
         this.RebuildChoices()
         this.RebuildTools()
@@ -841,6 +896,9 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
                 top_p: topP ?? TemplateEditorViewModel.DefaultTopP,
             }
         }
+        template.workspace = this.workspace === TemplateEditorViewModel.WorkspaceNamed
+            ? { mode: this.workspace, name: this.workspaceName.trim() }
+            : { mode: this.workspace }
         if (this.host.length > 0)
         {
             template.host = this.host
@@ -875,7 +933,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private RebuildTools(): void
     {
         const registry = this.registry
-        const choices = (registry ?? []).map(t => new ToolChoice(this, t.name, t.description, this.enabled.has(t.name)))
+        const choices = (registry ?? []).map(t => new ToolChoice(this, t.name, t.description, this.enabled.has(t.name), t.side_effects))
         const missingDescription = registry === null ? '' : TemplateEditorViewModel.NotInRegistry
         for (const name of this.enabled)
         {
@@ -966,7 +1024,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private Fingerprint(): string
     {
         return JSON.stringify([this.name, this.systemPrompt, this.stepBudgetText, this.runtime, this.model, this.contextSizeText,
-            this.context, this.compactAtText, this.enableThinking, this.temperatureText, this.topPText, this.host, [...this.enabled].sort()])
+            this.context, this.compactAtText, this.enableThinking, this.temperatureText, this.topPText, this.host, this.workspace, this.workspaceName, [...this.enabled].sort()])
     }
 
     private SetField<T>(prop: string, old: T, value: T, assign: () => void): void

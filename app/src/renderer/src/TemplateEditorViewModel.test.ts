@@ -77,6 +77,18 @@ class Rig
 
 describe('TemplateEditorViewModel', () =>
 {
+    it('tool_choice_marks_writing_tools', async () =>
+    {
+        const rig = new Rig()
+        rig.client.ListAllTools = () => Promise.resolve([
+            { name: 'read_file', description: 'Read', parameters: {}, side_effects: false },
+            { name: 'write_file', description: 'Write', parameters: {}, side_effects: true },
+        ])
+        await rig.Open({ ...Rig.Researcher, tools: ['read_file', 'write_file', 'gone'] })
+        const writes = rig.editor.Tools.ToArray().map(t => t.Writes)
+        expect(writes).toEqual([false, true, false])
+    })
+
     it('opens_a_template_into_its_fields', async () =>
     {
         const rig = new Rig()
@@ -121,7 +133,7 @@ describe('TemplateEditorViewModel', () =>
             template: {
                 name: 'Researcher 2', system_prompt: 'read', tools: ['read_file', 'get_time'], step_budget: 4, runtime: 'llamacpp',
                 model: 'gemma-4', n_ctx: 8192, enable_thinking: true, context_strategy: 'off', compact_at_pct: 75,
-                sampling: { temperature: 0.5, top_p: 0.95 }, host: 'hive',
+                sampling: { temperature: 0.5, top_p: 0.95 }, host: 'hive', workspace: { mode: 'session' },
             },
         })
         await rig.Respond('save_template', { id: 't1' })
@@ -166,6 +178,61 @@ describe('TemplateEditorViewModel', () =>
         expect(template.context_strategy).toBe('trim')
         expect(template.compact_at_pct).toBe(80)
         expect(template.sampling).toEqual({ top_k: 40, seed: 7, temperature: 0.8, top_p: 0.95 })
+    })
+
+    it('editor_loads_and_saves_workspace', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open({ ...Rig.Researcher, workspace: { mode: 'named', name: 'notes' } })
+        const e = rig.editor
+        expect(e.Workspace).toBe('named')
+        expect(e.WorkspaceChoice?.Label).toBe('Named')
+        expect(e.WorkspaceChoices.ToArray().map(c => c.Label)).toEqual(['Session', 'Shared', 'Named'])
+        expect(e.WorkspaceName).toBe('notes')
+        expect(e.IsDirty).toBe(false)
+        e.WorkspaceChoice = e.WorkspaceChoices.ToArray().find(c => c.Value === 'shared')!
+        e.WorkspaceName = 'other'
+        expect(e.IsDirty).toBe(true)
+        e.Revert()
+        expect(e.Workspace).toBe('named')
+        expect(e.WorkspaceName).toBe('notes')
+        expect(e.IsDirty).toBe(false)
+        e.WorkspaceName = '  other  '
+        e.SaveCommand.Execute(undefined)
+        expect((rig.Frames().pop()!.params.template as AgentTemplate).workspace).toEqual({ mode: 'named', name: 'other' })
+    })
+
+    it('named_name_enabled_only_for_named', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open()
+        const e = rig.editor
+        expect(e.IsWorkspaceNameEnabled).toBe(false)
+        e.Workspace = 'shared'
+        expect(e.IsWorkspaceNameEnabled).toBe(false)
+        e.Workspace = 'named'
+        expect(e.IsWorkspaceNameEnabled).toBe(true)
+        e.Workspace = 'session'
+        expect(e.IsWorkspaceNameEnabled).toBe(false)
+    })
+
+    it('old_template_without_workspace_shows_session', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open()
+        expect(rig.editor.Workspace).toBe('session')
+        expect(rig.editor.WorkspaceChoice?.Label).toBe('Session')
+        expect(rig.editor.WorkspaceName).toBe('')
+        expect(rig.editor.IsDirty).toBe(false)
+    })
+
+    it('switching_from_named_drops_name_on_save', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open({ ...Rig.Researcher, workspace: { mode: 'named', name: 'notes' } })
+        rig.editor.Workspace = 'shared'
+        rig.editor.SaveCommand.Execute(undefined)
+        expect((rig.Frames().pop()!.params.template as AgentTemplate).workspace).toEqual({ mode: 'shared' })
     })
 
     it('compact_at_out_of_range_blocks_save', async () =>

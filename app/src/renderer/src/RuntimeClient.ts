@@ -13,6 +13,8 @@ import type {
     TemplateRecord,
     ToolSpec,
     TracePage,
+    NotesChanged,
+    NotesResult,
     TraceStepNote,
     TraceTurnNote,
     TraceWarning
@@ -117,6 +119,8 @@ export class RuntimeClient extends JsonRpcConnection
     private static readonly MethodUnloadSessionModel = 'unload_session_model'
     private static readonly MethodSetThinking = 'set_thinking'
     private static readonly MethodGetTrace = 'get_trace'
+    private static readonly MethodGetNotes = 'get_notes'
+    private static readonly NoteNotesChanged = 'notes_changed'
     private static readonly NoteTraceStep = 'trace_step'
     private static readonly NoteTraceTurn = 'trace_turn'
     private static readonly NoteTraceWarning = 'trace_warning'
@@ -150,6 +154,7 @@ export class RuntimeClient extends JsonRpcConnection
     public readonly OnTraceStep = new TypedSignal<TraceStepNote>()
     public readonly OnTraceTurn = new TypedSignal<TraceTurnNote>()
     public readonly OnTraceWarning = new TypedSignal<TraceWarning>()
+    public readonly OnNotesChanged = new TypedSignal<NotesChanged>()
 
     public ModelProps(): Promise<ModelProps>
     {
@@ -292,6 +297,12 @@ export class RuntimeClient extends JsonRpcConnection
         return this.Request<TracePage>(RuntimeClient.MethodGetTrace, params)
     }
 
+    /** The session's working notes (needs no attach). */
+    public GetNotes(id: string): Promise<NotesResult>
+    {
+        return this.Request<NotesResult>(RuntimeClient.MethodGetNotes, { id })
+    }
+
     protected Dispatch(method: string, params: unknown): void
     {
         switch (method)
@@ -310,6 +321,9 @@ export class RuntimeClient extends JsonRpcConnection
                 break
             case RuntimeClient.NoteSessionBusy:
                 this.OnSessionBusy.Raise(params as SessionBusy)
+                break
+            case RuntimeClient.NoteNotesChanged:
+                this.OnNotesChanged.Raise(params as NotesChanged)
                 break
             case RuntimeClient.NoteTraceStep:
                 this.OnTraceStep.Raise(params as TraceStepNote)

@@ -13,15 +13,18 @@ export class ToolChoice extends Observable
 
     public readonly Name: string
     public readonly Description: string
+    /** The tool changes things (writes files): the view tags it. */
+    public readonly Writes: boolean
     private readonly owner: IToolChoiceOwner
     private _enabled: boolean
 
-    constructor(owner: IToolChoiceOwner, name: string, description: string, enabled: boolean)
+    constructor(owner: IToolChoiceOwner, name: string, description: string, enabled: boolean, writes = false)
     {
         super()
         this.owner = owner
         this.Name = name
         this.Description = description
+        this.Writes = writes
         this._enabled = enabled
     }
 

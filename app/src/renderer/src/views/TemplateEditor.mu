@@ -15,7 +15,11 @@ resources TemplateEditorResources {
         DockPanel [ LastChildFill = true, Margin = (0,0,0,4) ] {
             Checkbox [ DockPanel.Dock = Left, IsChecked = $Enabled, VerticalAlignment = Center, Margin = (0,0,8,0) ]
             StackPanel [ Orientation = Vertical ] {
-                TextBlock [ Text = $Name, Foreground = @Fg1 ]
+                StackPanel [ Orientation = Horizontal ] {
+                    TextBlock [ Text = $Name, Foreground = @Fg1 ]
+                    TextBlock [ Text = "writes", Style = @BodySm, Foreground = @StateDanger, Margin = (8,0,0,0),
+                                VerticalAlignment = Center, Visibility = $Writes << ToVisibility ]
+                }
                 TextBlock [ Text = $Description, Style = @BodySm, Foreground = @Fg2, TextWrapping = Wrap ]
             }
         }
@@ -70,6 +74,11 @@ resources TemplateEditorResources {
                             TextBlock [ Text = "Compact at %", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
                             TextBox [ Text = $CompactAtText, HorizontalAlignment = Stretch ]
                             TextBlock [ Text = $CompactAtError, Style = @BodySm, Foreground = @StateDanger, Visibility = $HasCompactAtError << ToVisibility ]
+
+                            TextBlock [ Text = "Workspace", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
+                            ComboBox [ ItemsSource = $WorkspaceChoices, SelectedItem = $WorkspaceChoice, HorizontalAlignment = Stretch ]
+                            TextBox [ Text = $WorkspaceName, IsEnabled = $IsWorkspaceNameEnabled, HorizontalAlignment = Stretch,
+                                      Placeholder = "Workspace name", Margin = (0,4,0,0) ]
 
                             DockPanel [ LastChildFill = true, Margin = (0,8,0,0) ] {
                                 TextBlock [ DockPanel.Dock = Left, Text = "Thinking", Margin = (0,0,8,0), VerticalAlignment = Center ]

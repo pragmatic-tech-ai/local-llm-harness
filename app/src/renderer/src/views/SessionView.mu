@@ -23,6 +23,13 @@ resources SessionViewResources {
                         }
                     }
                 }
+                StackPanel [ DockPanel.Dock = Top, Orientation = Vertical, Margin = (12,8,12,0),
+                             Visibility = $HasNotes << ToVisibility ] {
+                    ToggleButton [ Variant = Text, IsChecked = $IsNotesExpanded, HorizontalAlignment = Left ] {
+                        TextBlock [ Text = "Notes", Style = @BodySm, Foreground = @Fg2 ]
+                    }
+                    ItemsControl [ ItemsSource = $Notes, Visibility = $IsNotesExpanded << ToVisibility ]
+                }
                 ContentControl [ Content = $Chat ]
             }
         }
