@@ -130,11 +130,14 @@ describe('RepositoryEditorViewModel', () =>
         await second
         // The typed key is dropped once saved; the next save (a rename back) carries none.
         expect(rig.editor.NewKey).toBe('')
+        // A neutral marker until the server's hint arrives with the next listing; never derived from the key here.
+        expect(rig.editor.KeyHint).toBe('••••')
+        rig.editor.Reload({ ...EditorRig.Router, name: 'router2', key_hint: '9999', id_prefixes: ['anthropic/'] })
+        await rig.Respond('list_repository_models', { models: [], fetched_at: 1 })
+        expect(rig.editor.KeyHint).toBe('••••9999')
         rig.editor.Name = 'openrouter'
         void rig.editor.Save()
         expect(rig.Frames('save_repository')[2].params).toEqual({ name: 'openrouter', previous_name: 'router2', id_prefixes: ['anthropic/'] })
-        // The hint is the new key's last 4 characters, never the key.
-        expect(rig.editor.KeyHint).toBe('••••9999')
     })
 
     it('a_new_draft_saves_without_previous_name', async () =>
@@ -166,7 +169,7 @@ describe('RepositoryEditorViewModel', () =>
         expect(rig.Frames('save_repository')[0].params).toEqual({ name: 'openrouter', id_prefixes: [], api_key: 'sk-or-v1-abcd' })
         await rig.Respond('save_repository', { name: 'openrouter' })
         expect(rig.editor.NewKey).toBe('')
-        expect(rig.editor.KeyHint).toBe('••••abcd')
+        expect(rig.editor.KeyHint).toBe('••••')
         expect(rig.editor.HasNoKeyWarning).toBe(false)
         expect(rig.editor.IsDirty).toBe(false)
     })
@@ -259,6 +262,41 @@ describe('RepositoryEditorViewModel', () =>
         expect(rig.editor.HasCapabilities).toBe(false)
         rig.editor.Clear()
         expect(formTexts()).toEqual(['', ''])
+    })
+
+    it('texts_change_only_while_their_part_is_shown', async () =>
+    {
+        // HiddenTextRule: a part being shown is raised visible before its texts; one being hidden after them.
+        const rig = new EditorRig()
+        const order: string[] = []
+        for (const name of ['IsOpenRouter', 'HasRepository', 'FilterText', 'KeyHint', 'Name', 'FetchedText', 'HeaderText'])
+        {
+            rig.editor.PropertyChanged(name).subscribe(() => order.push(name + '=' + String((rig.editor as unknown as Record<string, unknown>)[name])))
+        }
+        const at = (entry: string) => order.indexOf(entry)
+        await rig.OpenRouter()
+        // Shown from empty: the form appears before its texts are written.
+        expect(at('HasRepository=true')).toBeLessThan(at('HeaderText=openrouter  OpenRouter'))
+        expect(at('IsOpenRouter=true')).toBeLessThan(at('FilterText=anthropic/, google/'))
+        expect(at('IsOpenRouter=true')).toBeLessThan(at('KeyHint=••••7f2a'))
+
+        order.length = 0
+        rig.editor.Open(EditorRig.Hive)
+        // Hidden for a Pragmatic repository: the texts are cleared while the form is still shown.
+        expect(at('FilterText=')).toBeGreaterThanOrEqual(0)
+        expect(at('FilterText=')).toBeLessThan(at('IsOpenRouter=false'))
+        expect(at('KeyHint=')).toBeLessThan(at('IsOpenRouter=false'))
+        expect(at('Name=hive')).toBeLessThan(at('IsOpenRouter=false'))
+
+        order.length = 0
+        rig.editor.OpenNew([])
+        expect(at('IsOpenRouter=true')).toBeLessThan(at('FilterText='))
+        expect(at('IsOpenRouter=true')).toBeLessThan(at('KeyHint=not set'))
+        expect(at('IsOpenRouter=true')).toBeLessThan(at('FetchedText=not fetched yet'))
+
+        order.length = 0
+        rig.editor.Clear()
+        expect(at('HeaderText=')).toBeLessThan(at('HasRepository=false'))
     })
 
     it('a_late_model_list_for_an_earlier_repository_is_dropped', async () =>

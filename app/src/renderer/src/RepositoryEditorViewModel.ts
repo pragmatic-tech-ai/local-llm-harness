@@ -15,10 +15,11 @@ import { TextFormat } from './TextFormat'
  * tokens). Server errors (a refused save or delete, a failed fetch) show in ErrorText. Delete is only a request
  * (OnDeleteRequested): the service confirms, then calls Delete.
  *
- * HiddenTextRule: mural keeps showing a TextBlock's old render when its text changed while an ancestor was collapsed
- * and the same text is set again once shown. So every text inside a part that can collapse (the whole form when empty,
- * the OpenRouter part for a Pragmatic repository) reads "" while hidden and is never "" while shown (or the TextBlock
- * collapses itself when it is ""): a hidden-then-shown text always differs, so the binding pushes it.
+ * HiddenTextRule: mural keeps showing a TextBlock's / TextBox's old render when its text changed while an ancestor was
+ * collapsed (see the task-7 report, "mural follow-up"). So no bound text ever changes while its part is collapsed:
+ * Changed raises, in this order, the visibility props that are now true (parts being shown appear first), then every
+ * text and field, then the visibility props that are now false (parts being hidden disappear last). Every text is
+ * therefore written while its part is visible. This ordering is the one place the workaround lives.
  */
 export class RepositoryEditorViewModel extends Observable
 {
@@ -39,8 +40,6 @@ export class RepositoryEditorViewModel extends Observable
     private static readonly RawPromptLabel = 'raw prompt'
     private static readonly LogprobsLabel = 'logprobs'
     private static readonly LoadUnloadLabel = 'load/unload'
-    /** How many trailing key characters the server's `key_hint` shows. */
-    private static readonly KeyHintLength = 4
     private static readonly PrefixSeparator = ','
     private static readonly PrefixJoin = ', '
     private static readonly FingerprintSeparator = '\u0000'
@@ -50,14 +49,16 @@ export class RepositoryEditorViewModel extends Observable
     private static readonly PropName = 'Name'
     private static readonly PropNewKey = 'NewKey'
     private static readonly PropFilterText = 'FilterText'
-    private static readonly FieldProps = [RepositoryEditorViewModel.PropName, RepositoryEditorViewModel.PropNewKey, RepositoryEditorViewModel.PropFilterText]
-    private static readonly DerivedProps = ['HasRepository', 'IsEmpty', 'IsNew', 'IsPragmatic', 'IsOpenRouter', 'IsEditable',
-        'IsDirty', 'CanSave', 'HeaderText', 'KeyHint', 'HasNoKeyWarning', 'FetchedText', 'ErrorText', 'HasErrorText',
-        'NameError', 'HasNameError', 'ModelsHeader', 'CapabilitiesText', 'HasCapabilities']
+    private static readonly FieldProps: readonly (keyof RepositoryEditorViewModel)[] = [RepositoryEditorViewModel.PropName,
+        RepositoryEditorViewModel.PropNewKey, RepositoryEditorViewModel.PropFilterText]
+    /** Bound to a Visibility (true = shown); raised around the texts per HiddenTextRule. */
+    private static readonly VisibilityProps: readonly (keyof RepositoryEditorViewModel)[] = ['HasRepository', 'IsEmpty',
+        'IsOpenRouter', 'IsPragmatic', 'HasErrorText', 'HasNoKeyWarning', 'HasNameError', 'HasCapabilities']
+    private static readonly TextProps: readonly (keyof RepositoryEditorViewModel)[] = ['HeaderText', 'KeyHint', 'FetchedText',
+        'ErrorText', 'NameError', 'ModelsHeader', 'CapabilitiesText']
+    private static readonly StateProps: readonly (keyof RepositoryEditorViewModel)[] = ['IsNew', 'IsEditable', 'IsDirty', 'CanSave']
 
     public readonly Models = new ObservableCollection<RepositoryModelRowViewModel>()
-    /** A save succeeded; carries the saved name. */
-    public readonly OnSaved = new TypedSignal<string>()
     /** Delete was asked for; the owner confirms, then calls Delete. */
     public readonly OnDeleteRequested = new TypedSignal<string>()
 
@@ -71,8 +72,10 @@ export class RepositoryEditorViewModel extends Observable
     private kind: RepositoryKind = RepositoryKind.OpenRouter
     /** The repository's listed state (null for a draft or when empty). */
     private summary: RepositorySummary | null = null
-    /** The stored key's last characters ("" when no key is stored). */
+    /** The stored key's last characters, from the server's `key_hint` ("" when unknown or none). */
     private keyHint = ''
+    /** A key was just saved; its hint comes with the next listing (Reload). */
+    private keySaved = false
     /** The name it is saved under (a rename sends it as `previous_name`). */
     private savedName = ''
     private savedPrefixes: string[] = []
@@ -241,7 +244,11 @@ export class RepositoryEditorViewModel extends Observable
             // Hidden: "" (see HiddenTextRule), never a value the shown form can have.
             return ''
         }
-        return this.keyHint.length > 0 ? RepositoryEditorViewModel.KeyMask + this.keyHint : RepositoryEditorViewModel.KeyNotSet
+        if (this.keyHint.length > 0)
+        {
+            return RepositoryEditorViewModel.KeyMask + this.keyHint
+        }
+        return this.keySaved ? RepositoryEditorViewModel.KeyMask : RepositoryEditorViewModel.KeyNotSet
     }
 
     /** A new key (the password field); empty keeps the stored one. */
@@ -258,7 +265,7 @@ export class RepositoryEditorViewModel extends Observable
     /** No key is stored and none is typed: the models can be listed but not run. */
     public get HasNoKeyWarning(): boolean
     {
-        return this.IsOpenRouter && this.keyHint.length === 0 && this.newKey.trim().length === 0
+        return this.IsOpenRouter && this.keyHint.length === 0 && !this.keySaved && this.newKey.trim().length === 0
     }
 
     public get NoKeyWarning(): string
@@ -349,6 +356,7 @@ export class RepositoryEditorViewModel extends Observable
         this.kind = RepositoryKind.OpenRouter
         this.summary = null
         this.keyHint = ''
+        this.keySaved = false
         this.savedName = ''
         this.savedPrefixes = []
         this.name = RepositoryEditorViewModel.UniqueName(taken)
@@ -369,6 +377,7 @@ export class RepositoryEditorViewModel extends Observable
         this.isNew = false
         this.summary = null
         this.keyHint = ''
+        this.keySaved = false
         this.savedName = ''
         this.savedPrefixes = []
         this.name = ''
@@ -423,8 +432,9 @@ export class RepositoryEditorViewModel extends Observable
             this.savedPrefixes = params.id_prefixes
             if (key.length > 0)
             {
-                // The stored key is now the typed one (repositories_changed then brings the server's hint).
-                this.keyHint = key.slice(-RepositoryEditorViewModel.KeyHintLength)
+                // A key is stored now; its hint is the server's to give (repositories_changed -> Reload).
+                this.keyHint = ''
+                this.keySaved = true
             }
             if (this.newKey.trim() === key)
             {
@@ -432,7 +442,6 @@ export class RepositoryEditorViewModel extends Observable
             }
             this.baseline = this.Fingerprint()
             this.errorText = saved.fetch_error ?? ''
-            this.OnSaved.Raise(saved.name)
             return true
         }
         catch (e)
@@ -506,6 +515,7 @@ export class RepositoryEditorViewModel extends Observable
         this.kind = summary.kind
         this.summary = summary
         this.keyHint = summary.has_key === true ? summary.key_hint ?? '' : ''
+        this.keySaved = false
         this.savedName = summary.name
         this.savedPrefixes = summary.id_prefixes ?? []
         this.name = summary.name
@@ -574,9 +584,16 @@ export class RepositoryEditorViewModel extends Observable
     }
 
     /** Raises everything derived from the form and refreshes the commands. */
-    private Changed(): void
+    private Changed(withFields: boolean = false): void
     {
-        this.RaiseNamed(RepositoryEditorViewModel.DerivedProps)
+        this.RaiseVisibility(true)
+        if (withFields)
+        {
+            this.RaiseNamed(RepositoryEditorViewModel.FieldProps)
+        }
+        this.RaiseNamed(RepositoryEditorViewModel.TextProps)
+        this.RaiseNamed(RepositoryEditorViewModel.StateProps)
+        this.RaiseVisibility(false)
         this.saveCommand.RaiseCanExecuteChanged()
         this.revertCommand.RaiseCanExecuteChanged()
         this.deleteCommand.RaiseCanExecuteChanged()
@@ -585,15 +602,20 @@ export class RepositoryEditorViewModel extends Observable
 
     private RaiseAll(): void
     {
-        this.RaiseNamed(RepositoryEditorViewModel.FieldProps)
-        this.Changed()
+        this.Changed(true)
     }
 
-    private RaiseNamed(names: readonly string[]): void
+    /** Raises the visibility props whose value is `shown` (HiddenTextRule). */
+    private RaiseVisibility(shown: boolean): void
+    {
+        this.RaiseNamed(RepositoryEditorViewModel.VisibilityProps.filter(name => Boolean(this[name]) === shown))
+    }
+
+    private RaiseNamed(names: readonly (keyof RepositoryEditorViewModel)[]): void
     {
         for (const name of names)
         {
-            this.RaisePropertyChanged(name, undefined, (this as unknown as Record<string, unknown>)[name])
+            this.RaisePropertyChanged(name, undefined, this[name])
         }
     }
 }
