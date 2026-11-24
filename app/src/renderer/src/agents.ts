@@ -168,11 +168,11 @@ export interface ToolTiming
     bytes: number
 }
 
-/** One model call of a turn. `v` and `kind` are the log-line envelope: ignore a record whose kind is unknown. */
+/** One model call of a turn. `v` and `kind` are the log-line envelope; `kind` discriminates it from a TurnRecord. */
 export interface StepRecord
 {
     v: number
-    kind: 'step' | 'turn'
+    kind: 'step'
     turn: number
     step: number
     at: number
@@ -192,7 +192,7 @@ export interface StepRecord
 export interface TurnRecord
 {
     v: number
-    kind: 'step' | 'turn'
+    kind: 'turn'
     turn: number
     at: number
     steps: number

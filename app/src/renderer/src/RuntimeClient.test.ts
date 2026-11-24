@@ -293,16 +293,20 @@ describe('RuntimeClient', () =>
     it('trace_notifications_raise_signals', () =>
     {
         const client = new RuntimeClient()
-        const seen: unknown[] = []
-        client.OnTraceStep.Subscribe(p => seen.push(p))
-        client.OnTraceTurn.Subscribe(p => seen.push(p))
-        client.OnTraceWarning.Subscribe(p => seen.push(p))
+        const steps: unknown[] = []
+        const turns: unknown[] = []
+        const warnings: unknown[] = []
+        client.OnTraceStep.Subscribe(p => steps.push(p))
+        client.OnTraceTurn.Subscribe(p => turns.push(p))
+        client.OnTraceWarning.Subscribe(p => warnings.push(p))
         const step = { id: 's', record: { v: 1, kind: 'step', turn: 1, step: 1, at: 1, prompt_tokens: 1, n_ctx: 2, out_tokens: 1, think_tokens: 0, load_ms: null, ttft_ms: 1, gen_ms: 1, end: 'answered', tools: [], error: null } }
         const turn = { id: 's', record: { v: 1, kind: 'turn', turn: 1, at: 2, steps: 1, reason: 'answered', total_ms: 5, out_tokens: 1, think_tokens: 0, peak_fill: 0.1, committed: true, user: 'q' } }
         const warning = { id: 's', message: 'disk full' }
         client.HandleFrame(JSON.stringify({ method: 'trace_step', params: step }))
         client.HandleFrame(JSON.stringify({ method: 'trace_turn', params: turn }))
         client.HandleFrame(JSON.stringify({ method: 'trace_warning', params: warning }))
-        expect(seen).toEqual([step, turn, warning])
+        expect(steps).toEqual([step])
+        expect(turns).toEqual([turn])
+        expect(warnings).toEqual([warning])
     })
 })

@@ -5,17 +5,17 @@ import type {
     CatalogInfo,
     Placement,
     PlacementChanged,
+    SamplingConfig,
     SessionBusy,
     SessionLoading,
     SessionSummary,
-    TraceStepNote,
-    TracePage,
-    TraceTurnNote,
-    TraceWarning,
     TemplateNode,
-    SamplingConfig,
     TemplateRecord,
-    ToolSpec
+    ToolSpec,
+    TracePage,
+    TraceStepNote,
+    TraceTurnNote,
+    TraceWarning
 } from './agents'
 
 export type { SamplingConfig }
