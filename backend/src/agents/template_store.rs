@@ -22,6 +22,13 @@ const SEED_RUNTIME: &str = "llamacpp";
 const SEED_MODEL_HINT: &str = "gemma-4";
 const SEED_N_CTX: u32 = 8192;
 const SEED_STEP_BUDGET: usize = 8;
+const WORKER_NAME: &str = "Worker";
+const WORKER_ID: &str = "worker";
+const WORKER_STEP_BUDGET: usize = 16;
+const WORKER_SYSTEM_PROMPT: &str = "You work in a private workspace folder. Save your results \
+     there as files with write_file and append_file. Keep a running plan with note_add, and \
+     check your notes before each step. Paths are relative to your workspace; prefix /sandbox/ \
+     to read the shared sandbox.";
 const FALLBACK_SLUG: &str = "agent";
 const ERR_INVALID_PATH: &str = "invalid path";
 const ERR_NOT_EMPTY: &str = "group is not empty";
@@ -127,8 +134,8 @@ pub struct TemplateStore {
 }
 
 impl TemplateStore {
-    /// Opens (creating if needed) the store at `root`; seeds `Examples/Default.toml` when the
-    /// root is missing or empty.
+    /// Opens (creating if needed) the store at `root`; seeds `Examples/Default.toml` and
+    /// `Examples/Worker.toml` when the root is missing or empty.
     pub fn open(root: &Path, rules: impl RulesSource + 'static) -> io::Result<Self> {
         let fresh = !root.exists() || fs::read_dir(root)?.next().is_none();
         fs::create_dir_all(root)?;
@@ -138,15 +145,37 @@ impl TemplateStore {
             write_lock: Mutex::new(()),
         };
         if fresh {
-            let seed = Self::seed_template(&store.rules.rules());
+            let rules = store.rules.rules();
             let dir = root.join(SEED_GROUP);
             fs::create_dir_all(&dir)?;
-            Self::write_atomic(&dir, SEED_ID, &seed)?;
+            Self::write_atomic(&dir, SEED_ID, &Self::seed_template(&rules))?;
+            Self::write_atomic(&dir, WORKER_ID, &Self::worker_template(&rules))?;
         }
         Ok(store)
     }
 
+    /// `Examples/Default`: every tool without side effects, in a session workspace.
     fn seed_template(rules: &TemplateRules) -> AgentTemplate {
+        let mut seed = Self::seed_base(rules);
+        seed.tools.retain(|t| !rules.writing_tools.contains(t));
+        seed
+    }
+
+    /// `Examples/Worker`: every tool, a larger budget and trimming, told to save its results
+    /// in its workspace and keep a plan in its notes.
+    fn worker_template(rules: &TemplateRules) -> AgentTemplate {
+        AgentTemplate {
+            name: WORKER_NAME.to_string(),
+            system_prompt: WORKER_SYSTEM_PROMPT.to_string(),
+            step_budget: WORKER_STEP_BUDGET,
+            context_strategy: ContextStrategy::Trim,
+            ..Self::seed_base(rules)
+        }
+    }
+
+    /// What the seeds share: the runtime, the model picked for it, the context size and every
+    /// tool.
+    fn seed_base(rules: &TemplateRules) -> AgentTemplate {
         let capable = |m: &&(String, Vec<String>)| m.1.iter().any(|r| r == SEED_RUNTIME);
         let model = rules
             .models
@@ -580,8 +609,17 @@ mod tests {
                 host: Some("hive".into()),
                 context_strategy: ContextStrategy::default(),
                 compact_at_pct: DEFAULT_COMPACT_AT_PCT,
-            workspace: WorkspaceConfig::default(),
+                workspace: WorkspaceConfig::default(),
             }
+        }
+
+        /// The test rules with one writing tool and one note tool added.
+        fn writing_rules() -> TemplateRules {
+            let mut rules = TemplateRules::for_tests();
+            rules.tools.push("write_file".into());
+            rules.tools.push("note_add".into());
+            rules.writing_tools = vec!["write_file".into()];
+            rules
         }
     }
 
@@ -627,19 +665,78 @@ mod tests {
             vec![TemplateNode::Group {
                 name: "Examples".into(),
                 path: "Examples".into(),
-                children: vec![TemplateNode::Template {
-                    id: "default".into(),
-                    path: "Examples".into(),
-                    name: "Default".into(),
-                    runtime: "llamacpp".into(),
-                    model: "gemma-4-e4b".into(),
-                    error: None,
-                }],
+                children: vec![
+                    TemplateNode::Template {
+                        id: "default".into(),
+                        path: "Examples".into(),
+                        name: "Default".into(),
+                        runtime: "llamacpp".into(),
+                        model: "gemma-4-e4b".into(),
+                        error: None,
+                    },
+                    TemplateNode::Template {
+                        id: "worker".into(),
+                        path: "Examples".into(),
+                        name: "Worker".into(),
+                        runtime: "llamacpp".into(),
+                        model: "gemma-4-e4b".into(),
+                        error: None,
+                    },
+                ],
             }]
         );
         let (t, _) = s.get("default").unwrap();
         assert_eq!(t.tools, TemplateRules::for_tests().tools);
         assert_eq!(t.n_ctx, 8192);
+    }
+
+    #[test]
+    fn seeds_default_without_writing_tools_and_worker_with_all() {
+        let d = TempDir::new("seedtools");
+        let s = TemplateStore::open(&d.0.join("templates"), TempDir::writing_rules()).unwrap();
+        let (default, _) = s.get("default").unwrap();
+        assert_eq!(default.tools, ["read_file", "web_search", "note_add"]);
+        assert_eq!(default.workspace, WorkspaceConfig::default());
+        // Written explicitly, not left to the serde default.
+        let file = fs::read_to_string(d.0.join("templates/Examples/default.toml")).unwrap();
+        assert!(
+            file.contains("[workspace]") && file.contains("mode = \"session\""),
+            "{file}"
+        );
+        let (worker, _) = s.get("worker").unwrap();
+        assert_eq!(worker.tools, TempDir::writing_rules().tools);
+        assert_eq!(s.check(&default), None);
+        assert_eq!(s.check(&worker), None);
+    }
+
+    #[test]
+    fn worker_seed_has_budget_16_and_trim() {
+        let d = TempDir::new("seedworker");
+        let s = TemplateStore::open(&d.0.join("templates"), TempDir::writing_rules()).unwrap();
+        let (default, _) = s.get("default").unwrap();
+        let (worker, path) = s.get("worker").unwrap();
+        assert_eq!(path, "Examples");
+        assert_eq!(worker.name, "Worker");
+        assert_eq!(worker.step_budget, 16);
+        assert_eq!(worker.context_strategy, ContextStrategy::Trim);
+        assert_eq!(worker.workspace, WorkspaceConfig::default());
+        assert_eq!(
+            worker.system_prompt,
+            "You work in a private workspace folder. Save your results there as files with \
+             write_file and append_file. Keep a running plan with note_add, and check your notes \
+             before each step. Paths are relative to your workspace; prefix /sandbox/ to read \
+             the shared sandbox."
+        );
+        assert_eq!(
+            (&worker.runtime, &worker.model, worker.n_ctx),
+            (&default.runtime, &default.model, default.n_ctx)
+        );
+        assert_eq!(worker.model, "gemma-4-e4b");
+        // An existing root gets no seed, Worker included.
+        s.delete("worker").unwrap();
+        let reopened =
+            TemplateStore::open(&d.0.join("templates"), TempDir::writing_rules()).unwrap();
+        assert!(reopened.get("worker").is_err());
     }
 
     #[test]
@@ -855,6 +952,11 @@ n_ctx = 4096
         s.create_group("empty").unwrap();
         s.delete_group("empty").unwrap();
         s.delete("default").unwrap();
+        assert_eq!(
+            s.delete_group("Examples"),
+            Err(TemplateError("group is not empty".into()))
+        );
+        s.delete("worker").unwrap();
         s.delete_group("Examples").unwrap();
     }
 

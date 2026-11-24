@@ -67,19 +67,24 @@ struct Config {
 impl Config {
     const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// The runtime's tool registry; a missing or unusable sandbox leaves only the sandbox-free
-    /// tools.
-    fn tool_registry(catalog: &Catalog) -> Result<ToolRegistry, Box<dyn std::error::Error>> {
-        let sandbox = catalog
+    const ERR_SANDBOX: &'static str = "tools sandbox unavailable:";
+
+    /// The catalog's tools sandbox; None when it has none or it is unusable (logged).
+    fn sandbox(catalog: &Catalog) -> Option<Sandbox> {
+        catalog
             .tools
             .as_ref()
             .and_then(|tools| match Sandbox::new(&tools.sandbox) {
                 Ok(sandbox) => Some(sandbox),
                 Err(e) => {
-                    eprintln!("tools sandbox unavailable: {e}");
+                    eprintln!("{} {e}", Self::ERR_SANDBOX);
                     None
                 }
-            });
+            })
+    }
+
+    /// The runtime's tool registry; without a sandbox only the sandbox-free tools.
+    fn tool_registry(sandbox: Option<Sandbox>) -> Result<ToolRegistry, Box<dyn std::error::Error>> {
         Ok(ToolRegistry::new(vec![Box::new(BuiltinSource::new(
             sandbox,
         ))])?)
@@ -177,12 +182,14 @@ impl AgentsStack {
         })
     }
 
-    /// The runtime's shared state: one local host per configured name over `manager`.
+    /// The runtime's shared state: one local host per configured name over `manager`, and the
+    /// same sandbox the registry's file tools use.
     fn into_deps<H: LocalHarness + 'static>(
         self,
         manager: Arc<H>,
         registry: Arc<ToolRegistry>,
         tool_loop: Arc<ToolLoop>,
+        sandbox: Option<Sandbox>,
     ) -> RuntimeDeps {
         let hosts: Vec<Arc<dyn ModelHost>> = self
             .host_names
@@ -204,6 +211,7 @@ impl AgentsStack {
             catalog: self.source,
             hub: Arc::new(Hub::new()),
             traces: Arc::new(self.traces),
+            sandbox,
         }
     }
 
@@ -229,7 +237,9 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
     if let Some(host) = &config.advertise_host {
         catalog.advertise_host = host.clone();
     }
-    let registry = Arc::new(Config::tool_registry(&catalog)?);
+    // One sandbox for the file tools and the sessions' workspace folders.
+    let sandbox = Config::sandbox(&catalog);
+    let registry = Arc::new(Config::tool_registry(sandbox.clone())?);
     let executor = Arc::new(ToolExecutor::new(
         registry.clone(),
         Box::new(EnabledPolicy),
@@ -271,7 +281,7 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
         },
     ));
     if let (Ok((stack, listener)), Some(addr)) = (runtime, runtime_addr) {
-        let deps = stack.into_deps(manager.clone(), registry, tool_loop);
+        let deps = stack.into_deps(manager.clone(), registry, tool_loop, sandbox);
         println!(
             "runtime listening on ws://{} ({} tools, {} templates, {} sessions)",
             addr,
@@ -431,15 +441,16 @@ exe = \"x\"
         let tool_loop = Arc::new(ToolLoop::new(executor, registry.clone()));
         let names = AgentsStack::host_names(&catalog).unwrap();
         let stack = AgentsStack::open(&catalog, names, &registry).unwrap();
-        let deps = stack.into_deps(manager, registry, tool_loop);
+        let deps = stack.into_deps(manager, registry, tool_loop, None);
         let tree = deps.templates.tree();
-        assert_eq!(AgentsStack::template_count(&tree), 1);
+        assert_eq!(AgentsStack::template_count(&tree), 2);
         match &tree[..] {
             [TemplateNode::Group { name, children, .. }] => {
                 assert_eq!(name, "Examples");
                 assert!(matches!(
                     &children[..],
-                    [TemplateNode::Template { name, .. }] if name == "Default"
+                    [TemplateNode::Template { name: a, .. }, TemplateNode::Template { name: b, .. }]
+                        if a == "Default" && b == "Worker"
                 ));
             }
             other => panic!("unexpected tree: {other:?}"),

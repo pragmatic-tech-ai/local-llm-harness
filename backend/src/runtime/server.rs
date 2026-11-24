@@ -52,6 +52,16 @@
 //! is committed. A gone client is only noticed when a write to it fails. Cancelling a turn from
 //! the client is out of scope.
 //!
+//! Every turn's tool calls run in the session's workspace: the folder its snapshot names
+//! (`sessions/{id}`, `shared` or `workspaces/{name}` below the sandbox; editing the template
+//! later does not move it), with a handle on the session for the note tools ([`SessionNotes`]).
+//! A note change is saved through the store's own short lock and then, with that lock
+//! released, sent as `notes_changed {id, notes}` to the session's connections; `reset` clears
+//! the notes and sends `notes_changed` with an empty list. `get_notes {id}` needs no attachment
+//! and returns `{notes}`. `delete_session` removes a `session`-mode folder with everything in it
+//! (links inside are removed, never followed); a failure is only logged. Shared and named
+//! folders are never removed, and `reset` leaves every folder's files in place.
+//!
 //! The catalog is read through [`CatalogSource`] and the template rules through the template
 //! store's source, so `list_catalog`, `save_template` and `create_session` see models dropped
 //! on disk; the last two (and `list_catalog`) also refresh the hosts' model lists.
@@ -70,21 +80,23 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
+use super::builtin::Sandbox;
 pub use super::catalog_source::{CatalogSource, CatalogView};
 use super::compaction::{Compactor, SummarySink};
 use super::hub::{ConnId, Hub};
 use super::registry::ToolRegistry;
-use super::tool::ToolScope;
+use super::tool::{SessionHandle, ToolScope};
 use super::tool_loop::{
     LinkFailure, LoopSink, SinkClosed, StepLink, ToolLoop, TurnConfig, TurnLinks,
 };
 use super::trace::{NoTrace, SessionTrace, TraceLog, TraceStore, TurnTrace};
 use super::worker::WorkerLink;
+use super::workspace::Workspace;
 use crate::agents::dispatcher::{Dispatcher, Placement};
 use crate::agents::host::{HarnessIdentity, ModelRequirement};
 use crate::agents::session::{SessionRecord, SessionSummary};
 use crate::agents::session_store::{SessionError, SessionStore};
-use crate::agents::template::{AgentTemplate, CompactionState};
+use crate::agents::template::{AgentTemplate, CompactionState, WorkspaceMode};
 use crate::agents::template_store::{TemplateError, TemplateStore};
 use crate::engine::SamplingConfig;
 use crate::rpc::{
@@ -106,6 +118,8 @@ pub struct RuntimeDeps {
     pub hub: Arc<Hub>,
     /// The sessions' trace logs, next to their session files.
     pub traces: Arc<TraceStore>,
+    /// The tools' sandbox, where the sessions' workspace folders live; None without one.
+    pub sandbox: Option<Sandbox>,
 }
 
 /// Accepts websocket connections forever.
@@ -121,6 +135,8 @@ impl RuntimeServer {
     pub const PLACEMENT_CHANGED: &'static str = "placement_changed";
     /// Sent `{id}` to a session's connections when its turn has to load the model first.
     pub const SESSION_LOADING: &'static str = "session_loading";
+    /// Sent `{id, notes}` to a session's connections when its notes change.
+    pub const NOTES_CHANGED: &'static str = "notes_changed";
 
     pub async fn serve(listener: TcpListener, deps: RuntimeDeps) {
         loop {
@@ -265,6 +281,48 @@ impl SummarySink for SessionCompactionSink {
     }
 }
 
+/// A turn's handle on its session for the tools. The notes are read and saved through the
+/// store's own short lock; a saved change is then announced with `notes_changed`, so the store
+/// and hub locks are never held together.
+struct SessionNotes {
+    sessions: Arc<SessionStore>,
+    hub: Arc<Hub>,
+    session: String,
+}
+
+impl SessionNotes {
+    /// Sends `notes_changed {id, notes}` to the connections attached to session `id`.
+    fn announce(hub: &Hub, id: &str, notes: &[String]) {
+        hub.to_session(
+            id,
+            RuntimeServer::NOTES_CHANGED,
+            json!({ "id": id, "notes": notes }),
+        );
+    }
+}
+
+impl SessionHandle for SessionNotes {
+    fn notes(&self) -> Option<Vec<String>> {
+        self.sessions.get(&self.session).map(|rec| rec.notes)
+    }
+
+    fn set_notes(&self, notes: Vec<String>) -> bool {
+        if self
+            .sessions
+            .set_notes(&self.session, notes.clone())
+            .is_err()
+        {
+            return false;
+        }
+        Self::announce(&self.hub, &self.session, &notes);
+        true
+    }
+
+    fn exists(&self) -> bool {
+        self.sessions.contains(&self.session)
+    }
+}
+
 /// A `list_sessions` row: the summary's fields plus the live placement and busy flag.
 #[derive(Debug, Serialize)]
 struct SessionRow {
@@ -291,15 +349,23 @@ impl SessionView {
         rec.enable_thinking.unwrap_or(rec.snapshot.enable_thinking)
     }
 
-    /// What one turn of `rec` runs with: the snapshot's budget and tools, and the session's
-    /// sampling and thinking.
-    fn turn_config(rec: &SessionRecord) -> TurnConfig {
+    /// What one turn of `rec` runs with: the snapshot's budget, tools and workspace folder, the
+    /// session's sampling and thinking, and a handle on the session for the tools.
+    fn turn_config(deps: &RuntimeDeps, rec: &SessionRecord) -> TurnConfig {
+        let session = SessionNotes {
+            sessions: Arc::clone(&deps.sessions),
+            hub: Arc::clone(&deps.hub),
+            session: rec.id.clone(),
+        };
         TurnConfig {
             step_budget: rec.snapshot.step_budget,
             tools: rec.snapshot.tools.clone(),
             enable_thinking: Self::thinking(rec),
             sampling: Self::sampling(rec),
-            scope: ToolScope::default(),
+            scope: ToolScope {
+                workspace: Some(rec.snapshot.workspace.folder(&rec.id)),
+                session: Some(Arc::new(session)),
+            },
         }
     }
 
@@ -498,6 +564,7 @@ impl RuntimeConnection {
     const M_LIST_TOOLS: &'static str = "list_tools";
     const M_RESET: &'static str = "reset";
     const M_GET_TRACE: &'static str = "get_trace";
+    const M_GET_NOTES: &'static str = "get_notes";
     const ERR_NO_SESSION: &'static str = "no session attached";
     const ERR_BUSY: &'static str = "session is busy";
     const ERR_UNKNOWN_METHOD: &'static str = "unknown method: ";
@@ -514,6 +581,8 @@ impl RuntimeConnection {
     const ERR_RESET_MARKER: &'static str = "trace reset marker not written for";
     /// Logged when a deleted session's trace log could not be removed.
     const ERR_TRACE_DELETE: &'static str = "trace log not deleted for";
+    /// Logged when a deleted session's workspace folder could not be removed.
+    const ERR_WORKSPACE_DELETE: &'static str = "workspace folder not deleted for";
 
     /// Registers a connection with the hub; the receiver yields every frame to write to it.
     pub fn new(deps: RuntimeDeps) -> (Self, mpsc::UnboundedReceiver<Value>) {
@@ -707,6 +776,7 @@ impl RuntimeConnection {
         if let Err(e) = log.and_then(|log| SessionTrace::reset(&log)) {
             eprintln!("{} {id}: {e}", Self::ERR_RESET_MARKER);
         }
+        SessionNotes::announce(&self.deps.hub, &id, &[]);
         Ok(Value::Null)
     }
 
@@ -748,7 +818,7 @@ impl RuntimeConnection {
         content: &str,
         log: Result<Arc<TraceLog>, String>,
     ) -> Result<Value, RpcError> {
-        let config = SessionView::turn_config(&rec);
+        let config = SessionView::turn_config(deps, &rec);
         let mut compactor = SessionView::compactor(deps, &rec, &config);
         let links = SessionLinks::new(
             &deps.dispatcher,
@@ -928,15 +998,25 @@ impl SharedRequests {
             }
             RuntimeConnection::M_DELETE_SESSION => {
                 let p: IdParams = Frames::params(params)?;
+                // Read first: the snapshot says whether the session owns its folder.
+                let rec = deps.sessions.get(&p.id);
                 deps.sessions.delete(&p.id).map_err(RpcError::internal)?;
                 deps.hub.detach_session(&p.id);
-                // The session is gone either way; a leftover log is only logged.
+                // The session is gone either way; a leftover log or folder is only logged.
                 if let Err(e) = deps.traces.delete(&p.id) {
                     eprintln!("{} {}: {e}", RuntimeConnection::ERR_TRACE_DELETE, p.id);
+                }
+                if let Some(rec) = rec {
+                    self.remove_workspace(rec).await;
                 }
                 Self::sessions_changed(deps)
             }
             RuntimeConnection::M_GET_TRACE => self.get_trace(params).await,
+            RuntimeConnection::M_GET_NOTES => {
+                let p: IdParams = Frames::params(params)?;
+                let rec = Self::record(deps, &p.id)?;
+                Ok(json!({ "notes": rec.notes }))
+            }
             RuntimeConnection::M_LOAD_SESSION_MODEL => self.load_session_model(params).await,
             // Allowed while the session is busy: the running turn keeps its current step, and
             // its next step finds no model and ends `Error` with `no model running`.
@@ -972,6 +1052,31 @@ impl SharedRequests {
             .map_err(RpcError::internal)?
             .map_err(RpcError::internal)?;
         Ok(page.wire())
+    }
+
+    /// Removes a deleted session's own (`session`-mode) workspace folder, on the blocking pool;
+    /// shared and named folders, and a runtime without a sandbox, are left alone. A failure is
+    /// only logged.
+    async fn remove_workspace(&self, rec: SessionRecord) {
+        let Some(sandbox) = self.deps.sandbox.clone() else {
+            return;
+        };
+        if rec.snapshot.workspace.mode != WorkspaceMode::Session {
+            return;
+        }
+        let folder = rec.snapshot.workspace.folder(&rec.id);
+        let removed =
+            tokio::task::spawn_blocking(move || Workspace::remove_folder(&sandbox, &folder))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()));
+        if let Err(e) = removed {
+            eprintln!(
+                "{} {}: {e}",
+                RuntimeConnection::ERR_WORKSPACE_DELETE,
+                rec.id
+            );
+        }
     }
 
     /// Evicts (and retires) the trace handle of a session that is not in the store, so a
@@ -1090,7 +1195,7 @@ impl SharedRequests {
 mod tests {
     use super::*;
     use crate::agents::host::HostState;
-    use crate::agents::template::ContextStrategy;
+    use crate::agents::template::{ContextStrategy, WorkspaceConfig};
     use crate::engine::{ChatMessage, Role};
     use crate::rpc::test_support::TestClient;
     use crate::rpc::{ERR_INVALID_PARAMS, ERR_PARSE};
@@ -2770,5 +2875,231 @@ mod tests {
             Ok(())
         );
         assert!(!rt.deps.sessions.contains(&rec.id));
+    }
+
+    /// Sessions with workspaces and notes, over a sandboxed runtime when they need folders.
+    struct Workspaces;
+
+    impl Workspaces {
+        const NOTE: &'static str = "plan: write the report";
+        const FILE: &'static str = "out.txt";
+        const BODY: &'static str = "result";
+        const KEEP: &'static str = "keep.txt";
+        const TEAM: &'static str = "team";
+        const NOTES: &'static str = "notes";
+        const NOTE_ADD: &'static str = "note_add";
+        const WRITE_FILE: &'static str = "write_file";
+        const LINK: &'static str = "link";
+        const SHARED: &'static str = "shared";
+
+        /// A link whose first step calls `name` with `args`, then answers.
+        fn calling(name: &str, args: Value) -> Arc<FakeLink> {
+            let call = Notes::call("c", name, args);
+            FakeLink::new(
+                true,
+                vec![
+                    Notes::script(vec![Notes::started(), Notes::done("", vec![call])]),
+                    Client::answer(ANSWER),
+                ],
+            )
+        }
+
+        /// Creates a session from `template_id`; returns its id.
+        async fn create_from(c: &mut Client, template_id: &str) -> String {
+            let row = c
+                .call(C::M_CREATE_SESSION, json!({ "template_id": template_id }))
+                .await
+                .unwrap();
+            row["id"].as_str().unwrap().to_string()
+        }
+
+        /// Creates a session from the Worker seed and attaches to it; returns its id.
+        async fn open_worker(c: &mut Client) -> String {
+            let id = Self::create_from(c, TestRuntime::WORKER_ID).await;
+            c.attach(&id).await;
+            id
+        }
+
+        /// Saves a copy of the Default seed named `name` with `workspace`; returns its id.
+        fn template_with(rt: &TestRuntime, name: &str, workspace: WorkspaceConfig) -> String {
+            let mut template = rt.template();
+            template.name = name.into();
+            template.workspace = workspace;
+            rt.deps.templates.save(None, GROUP, &template).unwrap()
+        }
+
+        /// The folder `rel` below the sandbox, with `KEEP` written in it.
+        fn folder_with_file(rt: &TestRuntime, rel: &std::path::Path) -> std::path::PathBuf {
+            let folder = rt.sandbox_root().join(rel);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join(Self::KEEP), Self::BODY).unwrap();
+            folder
+        }
+
+        /// The `session`-mode folder of session `id`.
+        fn session_folder(rt: &TestRuntime, id: &str) -> std::path::PathBuf {
+            rt.sandbox_root()
+                .join(WorkspaceConfig::default().folder(id))
+        }
+    }
+
+    #[tokio::test]
+    async fn note_add_in_a_turn_persists_and_notifies() {
+        let link = Workspaces::calling(Workspaces::NOTE_ADD, json!({ "text": Workspaces::NOTE }));
+        let rt = TestRuntime::sandboxed("noteturn", link);
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = Workspaces::open_worker(&mut a).await;
+        a.drain();
+        assert_eq!(a.send().await.unwrap(), Value::Null);
+        let frames = a.drain();
+        assert_eq!(
+            TestClient::params_of(&frames, RuntimeServer::NOTES_CHANGED),
+            [json!({ "id": id, Workspaces::NOTES: [Workspaces::NOTE] })]
+        );
+        let notes = a.call(C::M_GET_NOTES, json!({ "id": id })).await.unwrap();
+        assert_eq!(notes, json!({ Workspaces::NOTES: [Workspaces::NOTE] }));
+        let reopened = SessionStore::open(&rt.sessions_dir()).unwrap();
+        assert_eq!(reopened.get(&id).unwrap().notes, [Workspaces::NOTE]);
+    }
+
+    #[tokio::test]
+    async fn get_notes_needs_no_attachment() {
+        let rt = TestRuntime::new("notesnoattach", Client::idle());
+        let mut a = Client::new(&rt);
+        let id = a.create().await;
+        let empty = a.call(C::M_GET_NOTES, json!({ "id": id })).await.unwrap();
+        assert_eq!(empty, json!({ Workspaces::NOTES: [] }));
+        rt.deps
+            .sessions
+            .set_notes(&id, vec![Workspaces::NOTE.into()])
+            .unwrap();
+        let notes = a.call(C::M_GET_NOTES, json!({ "id": id })).await.unwrap();
+        assert_eq!(notes, json!({ Workspaces::NOTES: [Workspaces::NOTE] }));
+        let missing = "nope";
+        let err = a
+            .call(C::M_GET_NOTES, json!({ "id": missing }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::rpc::ERR_INTERNAL);
+        assert_eq!(err.message, SessionError::unknown(missing).0);
+    }
+
+    #[tokio::test]
+    async fn reset_clears_notes_and_notifies_empty() {
+        let rt = TestRuntime::new("notesreset", Client::idle());
+        let mut a = Client::new(&rt);
+        let mut b = Client::new(&rt);
+        let id = a.open_session().await;
+        rt.deps
+            .sessions
+            .set_notes(&id, vec![Workspaces::NOTE.into()])
+            .unwrap();
+        a.drain();
+        b.drain();
+        a.call(C::M_RESET, Value::Null).await.unwrap();
+        assert_eq!(
+            TestClient::params_of(&a.drain(), RuntimeServer::NOTES_CHANGED),
+            [json!({ "id": id, Workspaces::NOTES: [] })]
+        );
+        // Not attached: only the session's connections hear about its notes.
+        assert!(TestClient::params_of(&b.drain(), RuntimeServer::NOTES_CHANGED).is_empty());
+        assert!(rt.deps.sessions.get(&id).unwrap().notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_session_folder() {
+        let rt = TestRuntime::sandboxed("wsdelete", Client::idle());
+        let mut a = Client::new(&rt);
+        let id = Workspaces::create_from(&mut a, TestRuntime::WORKER_ID).await;
+        let other = Workspaces::create_from(&mut a, TestRuntime::WORKER_ID).await;
+        let folder = Workspaces::folder_with_file(&rt, &WorkspaceConfig::default().folder(&id));
+        let kept = Workspaces::folder_with_file(&rt, &WorkspaceConfig::default().folder(&other));
+        a.call(C::M_DELETE_SESSION, json!({ "id": id }))
+            .await
+            .unwrap();
+        assert!(!folder.exists());
+        assert!(kept.join(Workspaces::KEEP).is_file());
+        // A session whose folder was never made deletes cleanly too.
+        let bare = Workspaces::create_from(&mut a, TestRuntime::WORKER_ID).await;
+        a.call(C::M_DELETE_SESSION, json!({ "id": bare }))
+            .await
+            .unwrap();
+        assert!(!rt.deps.sessions.contains(&bare));
+    }
+
+    #[tokio::test]
+    async fn delete_session_keeps_shared_and_named_folders() {
+        let rt = TestRuntime::sandboxed("wskeep", Client::idle());
+        let mut a = Client::new(&rt);
+        let shared = WorkspaceConfig {
+            mode: WorkspaceMode::Shared,
+            name: None,
+        };
+        let named = WorkspaceConfig {
+            mode: WorkspaceMode::Named,
+            name: Some(Workspaces::TEAM.into()),
+        };
+        for (name, workspace) in [("SharedAgent", shared), ("NamedAgent", named)] {
+            let template_id = Workspaces::template_with(&rt, name, workspace.clone());
+            let id = Workspaces::create_from(&mut a, &template_id).await;
+            let folder = Workspaces::folder_with_file(&rt, &workspace.folder(&id));
+            // A stray folder under the session's id is no business of a non-session mode.
+            let stray = Workspaces::folder_with_file(&rt, &WorkspaceConfig::default().folder(&id));
+            a.call(C::M_DELETE_SESSION, json!({ "id": id }))
+                .await
+                .unwrap();
+            assert!(folder.join(Workspaces::KEEP).is_file(), "{name}");
+            assert!(stray.join(Workspaces::KEEP).is_file(), "{name}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn delete_session_does_not_follow_junctions() {
+        use crate::runtime::builtin::tests::TestDir;
+        let rt = TestRuntime::sandboxed("wsjunction", Client::idle());
+        let outside = TestDir::new();
+        std::fs::write(outside.path.join(Workspaces::KEEP), Workspaces::BODY).unwrap();
+        let mut a = Client::new(&rt);
+        let id = Workspaces::create_from(&mut a, TestRuntime::WORKER_ID).await;
+        let folder = Workspaces::folder_with_file(&rt, &WorkspaceConfig::default().folder(&id));
+        TestDir::junction(&folder.join(Workspaces::LINK), &outside.path);
+        a.call(C::M_DELETE_SESSION, json!({ "id": id }))
+            .await
+            .unwrap();
+        assert!(!folder.exists());
+        assert!(outside.path.join(Workspaces::KEEP).is_file());
+    }
+
+    #[tokio::test]
+    async fn turn_scope_uses_snapshot_workspace() {
+        let args = json!({ "path": Workspaces::FILE, "content": Workspaces::BODY });
+        let rt =
+            TestRuntime::sandboxed("wsscope", Workspaces::calling(Workspaces::WRITE_FILE, args));
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = Workspaces::open_worker(&mut a).await;
+        // Moving the template to the shared folder after create does not move the session.
+        let (mut worker, path) = rt.deps.templates.get(TestRuntime::WORKER_ID).unwrap();
+        worker.workspace.mode = WorkspaceMode::Shared;
+        rt.deps
+            .templates
+            .save(Some(TestRuntime::WORKER_ID), &path, &worker)
+            .unwrap();
+        assert_eq!(a.send().await.unwrap(), Value::Null);
+        let written = Workspaces::session_folder(&rt, &id).join(Workspaces::FILE);
+        assert_eq!(std::fs::read_to_string(written).unwrap(), Workspaces::BODY);
+        assert!(!rt.sandbox_root().join(Workspaces::SHARED).exists());
+        // The turn's config carries the snapshot's folder and a handle on this session.
+        let rec = rt.deps.sessions.get(&id).unwrap();
+        let config = SessionView::turn_config(&rt.deps, &rec);
+        assert_eq!(
+            config.scope.workspace,
+            Some(WorkspaceConfig::default().folder(&id))
+        );
+        let handle = config.scope.session.expect("session handle");
+        assert!(handle.exists());
+        assert_eq!(handle.notes(), Some(vec![]));
     }
 }

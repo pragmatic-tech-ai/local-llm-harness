@@ -321,8 +321,9 @@ impl Drop for TempDir {
 
 /// A complete `RuntimeDeps` over temp-dir stores (trace logs in the sessions directory), one
 /// `FakeHost` and a registry holding the test `echo` tool. The template store seeds its `Default`
-/// template (id [`Self::TEMPLATE_ID`]) for runtime [`Self::RUNTIME`] and model [`Self::MODEL`],
-/// which the host serves with `link`.
+/// template (id [`Self::TEMPLATE_ID`]) and its `Worker` template (id [`Self::WORKER_ID`]) for
+/// runtime [`Self::RUNTIME`] and model [`Self::MODEL`], which the host serves with `link`.
+/// [`Self::sandboxed`] adds a sandbox and the builtin file and note tools.
 pub(crate) struct TestRuntime {
     pub(crate) deps: super::server::RuntimeDeps,
     pub(crate) host: Arc<crate::agents::host::FakeHost>,
@@ -334,17 +335,35 @@ impl TestRuntime {
     pub(crate) const RUNTIME: &'static str = "llamacpp";
     pub(crate) const MODEL: &'static str = "tiny";
     pub(crate) const TEMPLATE_ID: &'static str = "default";
+    pub(crate) const WORKER_ID: &'static str = "worker";
     const TEMPLATES_DIR: &'static str = "templates";
     const SESSIONS_DIR: &'static str = "sessions";
+    const SANDBOX_DIR: &'static str = "sandbox";
     const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub(crate) fn new(tag: &str, link: Arc<FakeLink>) -> Self {
-        Self::over(TempDir::new(tag), link)
+        Self::over(TempDir::new(tag), link, false)
+    }
+
+    /// Like [`Self::new`], with a sandbox (`sandbox` in the temp dir) and the builtin tools.
+    pub(crate) fn sandboxed(tag: &str, link: Arc<FakeLink>) -> Self {
+        Self::over(TempDir::new(tag), link, true)
     }
 
     /// A fresh runtime over this one's data directory, as after a supervisor restart.
     pub(crate) fn reopen(self, link: Arc<FakeLink>) -> Self {
-        Self::over(self.dir, link)
+        let sandboxed = self.deps.sandbox.is_some();
+        Self::over(self.dir, link, sandboxed)
+    }
+
+    /// The sandbox root of a [`Self::sandboxed`] runtime.
+    pub(crate) fn sandbox_root(&self) -> std::path::PathBuf {
+        self.deps
+            .sandbox
+            .as_ref()
+            .expect("sandboxed runtime")
+            .root()
+            .to_path_buf()
     }
 
     /// The sessions directory (session files and their trace logs).
@@ -352,7 +371,8 @@ impl TestRuntime {
         self.dir.0.join(Self::SESSIONS_DIR)
     }
 
-    fn over(dir: TempDir, link: Arc<FakeLink>) -> Self {
+    fn over(dir: TempDir, link: Arc<FakeLink>, sandboxed: bool) -> Self {
+        use super::builtin::{BuiltinSource, Sandbox};
         use super::executor::ToolExecutor;
         use super::policy::EnabledPolicy;
         use super::registry::ToolRegistry;
@@ -362,8 +382,16 @@ impl TestRuntime {
         use crate::agents::session_store::SessionStore;
         use crate::agents::template_store::TemplateStore;
 
-        let registry =
-            Arc::new(ToolRegistry::new(vec![TestSource::echo_boxed()]).expect("registry"));
+        let sandbox = sandboxed.then(|| {
+            let root = dir.0.join(Self::SANDBOX_DIR);
+            std::fs::create_dir_all(&root).expect("sandbox dir");
+            Sandbox::new(&root).expect("sandbox")
+        });
+        let mut sources = vec![TestSource::echo_boxed()];
+        if let Some(sandbox) = &sandbox {
+            sources.push(Box::new(BuiltinSource::new(Some(sandbox.clone()))));
+        }
+        let registry = Arc::new(ToolRegistry::new(sources).expect("registry"));
         let executor = Arc::new(ToolExecutor::new(
             registry.clone(),
             Box::new(EnabledPolicy),
@@ -386,6 +414,7 @@ impl TestRuntime {
             traces: Arc::new(super::trace::TraceStore::new(
                 dir.0.join(Self::SESSIONS_DIR),
             )),
+            sandbox,
         };
         Self { deps, host, dir }
     }
