@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -33,6 +33,13 @@ pub struct GenerateRequest {
     pub sampling: SamplingConfig,
 }
 
+/// A prompt's size as the worker measures it: its token count and the context window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct PromptSize {
+    pub prompt_tokens: usize,
+    pub n_ctx: usize,
+}
+
 /// Why a worker call failed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkError(pub String);
@@ -50,6 +57,10 @@ impl std::error::Error for LinkError {}
 pub trait WorkerLink: Send + Sync {
     async fn model_props(&self) -> Result<Value, LinkError>;
     async fn tokenize(&self, text: &str) -> Result<Value, LinkError>;
+    /// Renders `req` exactly as `generate` would and returns its token count and the window
+    /// size, without generating. `req.sampling` is ignored. A worker without the method
+    /// answers an error, which callers treat as "measure unavailable".
+    async fn measure_prompt(&self, req: &GenerateRequest) -> Result<PromptSize, LinkError>;
     /// Streams every notification; ends when the response frame arrives. An error frame or an
     /// unparseable frame is an `Err` item; a socket closed before the response just ends the
     /// stream. Dropping the stream closes the socket, which makes the worker drop its engine
@@ -226,6 +237,13 @@ impl WorkerLink for WsWorkerLink {
         self.call("tokenize", json!({"text": text})).await
     }
 
+    async fn measure_prompt(&self, req: &GenerateRequest) -> Result<PromptSize, LinkError> {
+        let params = serde_json::to_value(req).map_err(|e| LinkError(e.to_string()))?;
+        let result = self.call("measure_prompt", params).await?;
+        serde_json::from_value(result)
+            .map_err(|e| LinkError(format!("bad measure_prompt result: {e}")))
+    }
+
     async fn generate(
         &self,
         req: &GenerateRequest,
@@ -335,6 +353,31 @@ mod tests {
         let link = Fixture::link(FakeEngine::new(&[]).with_token_count(7)).await;
         let result = link.tokenize("abc").await.expect("tokenize");
         assert_eq!(result["count"], 7);
+    }
+
+    #[tokio::test]
+    async fn ws_link_measure_prompt_round_trips() {
+        let link = Fixture::link(FakeEngine::new(&[]).with_token_count(7)).await;
+        let size = link
+            .measure_prompt(&Fixture::request())
+            .await
+            .expect("measure");
+        assert_eq!(
+            size,
+            PromptSize {
+                prompt_tokens: 7,
+                n_ctx: 8192
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_link_measure_prompt_unknown_method_is_err() {
+        let frame =
+            r#"{"id":1,"error":{"code":-32601,"message":"unknown method: measure_prompt"}}"#;
+        let (link, _closed) = Fixture::raw_server(Script::Frames(vec![frame])).await;
+        let err = link.measure_prompt(&Fixture::request()).await.unwrap_err();
+        assert!(err.0.contains("unknown method"), "{}", err.0);
     }
 
     #[tokio::test]

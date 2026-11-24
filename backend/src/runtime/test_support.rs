@@ -12,7 +12,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use super::tool_loop::{LinkFailure, LoopSink, SinkClosed, StepLink, ToolLoop, TurnLinks};
-use super::worker::{GenerateRequest, LinkError, Note, WorkerLink};
+use super::worker::{GenerateRequest, LinkError, Note, PromptSize, WorkerLink};
 
 /// What one `generate` call yields: a stream of items, or an immediate failure.
 pub(crate) type Scripted = Result<Vec<Result<Note, LinkError>>, LinkError>;
@@ -81,9 +81,19 @@ pub(crate) struct FakeLink {
     scripts: Mutex<VecDeque<Scripted>>,
     repeat_last: bool,
     requests: Mutex<Vec<GenerateRequest>>,
+    measure: Mutex<Result<PromptSize, LinkError>>,
 }
 
 impl FakeLink {
+    const MEASURE_UNAVAILABLE: &'static str = "measure_prompt unavailable";
+
+    /// Every `measure_prompt` call answers `size` (the default is an error). Unused until the
+    /// compaction tasks that drive the loop with it.
+    #[allow(dead_code)]
+    pub(crate) fn set_measure(&self, size: PromptSize) {
+        *self.measure.lock().expect("measure") = Ok(size);
+    }
+
     /// One script per `generate` call, in order; a call past the end fails the test.
     pub(crate) fn new(supports_tools: bool, scripts: Vec<Scripted>) -> Arc<Self> {
         Arc::new(Self {
@@ -91,6 +101,7 @@ impl FakeLink {
             scripts: Mutex::new(scripts.into()),
             repeat_last: false,
             requests: Mutex::new(Vec::new()),
+            measure: Mutex::new(Err(LinkError(Self::MEASURE_UNAVAILABLE.into()))),
         })
     }
 
@@ -101,6 +112,7 @@ impl FakeLink {
             scripts: Mutex::new(scripts.into()),
             repeat_last: false,
             requests: Mutex::new(Vec::new()),
+            measure: Mutex::new(Err(LinkError(Self::MEASURE_UNAVAILABLE.into()))),
         })
     }
 
@@ -111,6 +123,7 @@ impl FakeLink {
             scripts: Mutex::new(VecDeque::from([script])),
             repeat_last: true,
             requests: Mutex::new(Vec::new()),
+            measure: Mutex::new(Err(LinkError(Self::MEASURE_UNAVAILABLE.into()))),
         })
     }
 
@@ -121,6 +134,7 @@ impl FakeLink {
             scripts: Mutex::new(VecDeque::new()),
             repeat_last: false,
             requests: Mutex::new(Vec::new()),
+            measure: Mutex::new(Err(LinkError(Self::MEASURE_UNAVAILABLE.into()))),
         })
     }
 
@@ -137,6 +151,10 @@ impl WorkerLink for FakeLink {
 
     async fn tokenize(&self, _text: &str) -> Result<Value, LinkError> {
         Ok(json!({"count": 0}))
+    }
+
+    async fn measure_prompt(&self, _req: &GenerateRequest) -> Result<PromptSize, LinkError> {
+        self.measure.lock().expect("measure").clone()
     }
 
     async fn generate(

@@ -73,6 +73,22 @@ struct GenerateParams {
     sampling: Option<SamplingConfig>,
 }
 
+/// The worker's `measure_prompt` params: `generate`'s, minus sampling (which is ignored).
+#[derive(Debug, Deserialize)]
+struct MeasureParams {
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    enable_thinking: bool,
+}
+
+/// A prompt rendered through the chat template, with its token count.
+struct RenderedPrompt {
+    text: String,
+    used: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct RpcError {
     pub(crate) code: i64,
@@ -268,6 +284,15 @@ impl RpcDispatch for Connection {
                 self.generate(ws, p).await?;
                 Ok(Value::Null)
             }
+            "measure_prompt" => {
+                let p: MeasureParams = Frames::params(req.params.clone())?;
+                let tools = p.tools.unwrap_or_default();
+                let rendered = self
+                    .render_and_count(&p.messages, &tools, p.enable_thinking)
+                    .await
+                    .map_err(RpcError::internal)?;
+                Ok(json!({"prompt_tokens": rendered.used, "n_ctx": self.props.n_ctx}))
+            }
             other => {
                 Err(RpcError::new(ERR_METHOD_NOT_FOUND, format!("unknown method: {other}")).into())
             }
@@ -342,21 +367,14 @@ impl Connection {
     async fn generate(&mut self, ws: &mut Ws, p: GenerateParams) -> Result<(), Failure> {
         let cfg = p.sampling.unwrap_or_else(|| self.sampling.clone());
         let tools = p.tools.unwrap_or_default();
-        if !tools.is_empty() && !self.engine.supports_tools() {
-            return Self::turn_error(ws, Self::TOOLS_UNSUPPORTED).await;
-        }
-        let prompt = match self
-            .engine
-            .apply_template(&p.messages, true, p.enable_thinking, &tools)
+        let rendered = match self
+            .render_and_count(&p.messages, &tools, p.enable_thinking)
             .await
         {
-            Ok(prompt) => prompt,
-            Err(e) => return Self::turn_error(ws, e).await,
+            Ok(rendered) => rendered,
+            Err(message) => return Self::turn_error(ws, message).await,
         };
-        let used = match self.engine.tokenize(&prompt).await {
-            Ok(t) => t.count,
-            Err(e) => return Self::turn_error(ws, e).await,
-        };
+        let RenderedPrompt { text: prompt, used } = rendered;
         let fill = match ContextFill::check(used, self.props.n_ctx, cfg.max_tokens) {
             Ok(fill) => fill,
             Err((fill, TurnRejected::WindowFull { needed, total })) => {
@@ -404,6 +422,32 @@ impl Connection {
         let content = format!("{opener}{}", parser.content());
         let done = json!({"content": content, "tool_calls": parser.calls()});
         Self::notify(ws, "turn_done", done).await
+    }
+
+    /// Renders `messages` through the engine's chat template (with `tools` and thinking, ready
+    /// for generation) and counts the result's tokens. The one path both `generate` and
+    /// `measure_prompt` use, so their counts cannot drift. Touches no engine cache.
+    async fn render_and_count(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        enable_thinking: bool,
+    ) -> Result<RenderedPrompt, String> {
+        if !tools.is_empty() && !self.engine.supports_tools() {
+            return Err(Self::TOOLS_UNSUPPORTED.to_string());
+        }
+        let text = self
+            .engine
+            .apply_template(messages, true, enable_thinking, tools)
+            .await
+            .map_err(|e| e.to_string())?;
+        let used = self
+            .engine
+            .tokenize(&text)
+            .await
+            .map_err(|e| e.to_string())?
+            .count;
+        Ok(RenderedPrompt { text, used })
     }
 
     /// The engine's tool-call parser when tools were offered; plain text otherwise.
@@ -947,6 +991,45 @@ mod tests {
             ),
             "{step2}"
         );
+    }
+
+    #[tokio::test]
+    async fn measure_prompt_matches_generate_turn_started_tokens() {
+        let engine = Harness::tool_engine(&["ok"])
+            .with_template(Harness::GEMMA4)
+            .with_token_count(37);
+        let mut client = TestClient::connect(Arc::new(engine), 4096).await;
+        let params = json!({"messages": Harness::messages(), "tools": Harness::tools(),
+            "enable_thinking": true});
+        let (notes, resp) = client.request("measure_prompt", params.clone()).await;
+        assert!(notes.is_empty());
+        let (gen_notes, _) = client.request("generate", params).await;
+        let started = &TestClient::params_of(&gen_notes, "turn_started")[0];
+        assert_eq!(resp["result"]["prompt_tokens"], started["prompt_tokens"]);
+        assert_eq!(resp["result"]["prompt_tokens"], 37);
+        assert_eq!(resp["result"]["n_ctx"], 4096);
+        assert_eq!(resp["result"]["n_ctx"], started["n_ctx"]);
+    }
+
+    #[tokio::test]
+    async fn measure_prompt_does_not_generate() {
+        let engine = Arc::new(FakeEngine::new(&["ok"]));
+        let mut client = TestClient::connect(engine.clone(), 8192).await;
+        let params = json!({"messages": Harness::messages()});
+        let (notes, resp) = client.request("measure_prompt", params).await;
+        assert!(notes.is_empty());
+        assert_eq!(resp["result"], json!({"prompt_tokens": 10, "n_ctx": 8192}));
+        assert_eq!(engine.pulled_chunks(), 0);
+    }
+
+    #[tokio::test]
+    async fn measure_prompt_bad_params_is_32602() {
+        let engine = FakeEngine::new(&[]);
+        let mut client = TestClient::connect(Arc::new(engine), 8192).await;
+        let (_, resp) = client
+            .request("measure_prompt", json!({"messages": "nope"}))
+            .await;
+        assert_eq!(resp["error"]["code"], ERR_INVALID_PARAMS);
     }
 
     #[tokio::test]
