@@ -55,7 +55,8 @@ use tokio_tungstenite::tungstenite::Message;
 pub use super::catalog_source::{CatalogSource, CatalogView};
 use super::hub::{ConnId, Hub};
 use super::registry::ToolRegistry;
-use super::tool_loop::{LoopSink, SinkClosed, ToolLoop, TurnConfig, TurnLinks};
+use super::tool_loop::{LoopSink, SinkClosed, StepLink, ToolLoop, TurnConfig, TurnLinks};
+use super::trace::NoTrace;
 use super::worker::WorkerLink;
 use crate::agents::dispatcher::{Dispatcher, Placement};
 use crate::agents::host::{HarnessIdentity, ModelRequirement};
@@ -152,11 +153,16 @@ impl<'a> SessionLinks<'a> {
     fn bound(&self) -> std::sync::MutexGuard<'_, Option<HarnessIdentity>> {
         self.bound.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// A step link with no load time measured (Task 4 measures the step-0 load).
+    fn plain(link: Arc<dyn WorkerLink>) -> StepLink {
+        StepLink { link, load: None }
+    }
 }
 
 #[async_trait]
 impl TurnLinks for SessionLinks<'_> {
-    async fn link(&self, step: usize) -> Result<Arc<dyn WorkerLink>, String> {
+    async fn link(&self, step: usize) -> Result<StepLink, String> {
         if step == 0 {
             let link = self
                 .dispatcher
@@ -170,7 +176,7 @@ impl TurnLinks for SessionLinks<'_> {
                 .await
                 .map_err(|e| e.0)?;
             *self.bound() = self.dispatcher.identity(&self.req);
-            return Ok(link);
+            return Ok(Self::plain(link));
         }
         let bound = self.bound().clone();
         if let (Some(bound), Some(now)) = (bound, self.dispatcher.identity(&self.req)) {
@@ -180,6 +186,7 @@ impl TurnLinks for SessionLinks<'_> {
         }
         self.dispatcher
             .current_link(&self.req)
+            .map(Self::plain)
             .ok_or_else(|| ToolLoop::NO_MODEL.to_string())
     }
 }
@@ -631,7 +638,14 @@ impl RuntimeConnection {
         };
         let ran = deps
             .tool_loop
-            .run(&rec.transcript, content, &config, &links, &mut sink)
+            .run(
+                &rec.transcript,
+                content,
+                &config,
+                &links,
+                &mut NoTrace,
+                &mut sink,
+            )
             .await;
         match ran {
             Ok((_, Some(transcript))) => {
@@ -1039,7 +1053,7 @@ mod tests {
 
     #[async_trait]
     impl TurnLinks for SwapBeforeSecondStep<'_> {
-        async fn link(&self, step: usize) -> Result<Arc<dyn WorkerLink>, String> {
+        async fn link(&self, step: usize) -> Result<StepLink, String> {
             if step == 1 {
                 self.rt.load();
             }
@@ -1570,7 +1584,14 @@ mod tests {
         let (end, transcript) = rt
             .deps
             .tool_loop
-            .run(&rec.transcript, CONTENT, &config, &links, &mut sink)
+            .run(
+                &rec.transcript,
+                CONTENT,
+                &config,
+                &links,
+                &mut NoTrace,
+                &mut sink,
+            )
             .await
             .unwrap();
         assert_eq!(end.reason, crate::runtime::tool_loop::EndReason::Error);

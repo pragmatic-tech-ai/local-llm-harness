@@ -11,7 +11,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
-use super::tool_loop::{LoopSink, SinkClosed, ToolLoop, TurnLinks};
+use super::tool_loop::{LoopSink, SinkClosed, StepLink, ToolLoop, TurnLinks};
 use super::worker::{GenerateRequest, LinkError, Note, WorkerLink};
 
 /// What one `generate` call yields: a stream of items, or an immediate failure.
@@ -34,6 +34,23 @@ impl Notes {
 
     pub(crate) fn chunk() -> Note {
         Self::note("turn_chunk", json!({"text": "x"}))
+    }
+
+    /// `turn_started` carrying a prompt and its fill, as the worker sends it.
+    pub(crate) fn started_fill(prompt: &str, prompt_tokens: u32, n_ctx: u32) -> Note {
+        Self::note(
+            "turn_started",
+            json!({"prompt": prompt, "prompt_tokens": prompt_tokens, "n_ctx": n_ctx}),
+        )
+    }
+
+    /// `turn_chunk` with `tokens` token entries, as every engine sends it.
+    pub(crate) fn chunk_of(text: &str, tokens: usize) -> Note {
+        let token = json!({"token": "t", "logprob": 0.0, "top": []});
+        Self::note(
+            "turn_chunk",
+            json!({"text": text, "tokens": vec![token; tokens], "stop": false}),
+        )
     }
 
     pub(crate) fn done(content: &str, calls: Vec<Value>) -> Note {
@@ -186,8 +203,11 @@ impl FakeConnector {
 #[async_trait]
 impl TurnLinks for FakeConnector {
     /// A connector with no link reports "no model running", as the production adapter does.
-    async fn link(&self, _step: usize) -> Result<Arc<dyn WorkerLink>, String> {
-        self.connect().ok_or_else(|| ToolLoop::NO_MODEL.to_string())
+    async fn link(&self, _step: usize) -> Result<StepLink, String> {
+        let link = self
+            .connect()
+            .ok_or_else(|| ToolLoop::NO_MODEL.to_string())?;
+        Ok(StepLink { link, load: None })
     }
 }
 

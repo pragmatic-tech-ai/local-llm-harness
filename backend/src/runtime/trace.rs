@@ -1,12 +1,19 @@
 //! Per-session append-only trace log (`{id}.trace.jsonl`): step and turn records plus reset
 //! markers, one JSON object per line, and the store that hands out one log per session id.
+//! [`TurnTrace`] is where the tool loop reports each step; [`SessionTrace`] is the one that
+//! appends to a session's log and sends the records live.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use super::tool_loop::{LoopSink, SinkClosed};
 
 /// File-name suffix of a session's trace log, appended to the session id.
 pub const TRACE_FILE_SUFFIX: &str = ".trace.jsonl";
@@ -377,12 +384,177 @@ impl TraceStore {
     }
 }
 
+/// Where the tool loop reports each finished step of a turn.
+#[async_trait]
+pub trait TurnTrace: Send {
+    /// One step, as the loop measured it; `turn` and `at` are 0 and the trace sets them.
+    async fn step(&mut self, record: StepRecord, sink: &mut dyn LoopSink)
+        -> Result<(), SinkClosed>;
+}
+
+/// A trace that keeps nothing.
+pub struct NoTrace;
+
+#[async_trait]
+impl TurnTrace for NoTrace {
+    async fn step(
+        &mut self,
+        _record: StepRecord,
+        _sink: &mut dyn LoopSink,
+    ) -> Result<(), SinkClosed> {
+        Ok(())
+    }
+}
+
+/// The trace of one turn of one session: every record is appended to the session's log
+/// first, then sent live (`trace_warning` first when the append failed). A closed sink stops
+/// the notes, never the log.
+pub struct SessionTrace {
+    log: Arc<TraceLog>,
+    session: String,
+    turn: u64,
+    user: String,
+    started: Instant,
+    steps: u32,
+    out_tokens: u32,
+    think_tokens: u32,
+    peak_fill: f64,
+    /// A failure from before the first record (allocating the turn number), sent with it.
+    warning: Option<String>,
+}
+
+impl SessionTrace {
+    /// Sent `{id, record}` after a step record is appended.
+    pub const M_TRACE_STEP: &'static str = "trace_step";
+    /// Sent `{id, record}` after the turn record is appended.
+    pub const M_TRACE_TURN: &'static str = "trace_turn";
+    /// Sent `{id, message}` when writing the log failed.
+    pub const M_TRACE_WARNING: &'static str = "trace_warning";
+    /// The turn reason of a turn cut off because no connection was left.
+    pub const REASON_ABORTED: &'static str = "aborted";
+    /// The turn number used when the log cannot be read to allocate one.
+    const FALLBACK_TURN: u64 = 0;
+    /// The stored user message is cut to this many characters.
+    const USER_CHARS: usize = 200;
+    const FIELD_ID: &'static str = "id";
+    const FIELD_RECORD: &'static str = "record";
+    const FIELD_MESSAGE: &'static str = "message";
+
+    /// Starts the trace of a new turn: allocates its number from `log` and starts its clock.
+    /// An unreadable log gives turn 0 and a warning sent with the first record.
+    pub fn new(log: Arc<TraceLog>, session: String, user: &str) -> SessionTrace {
+        let (turn, warning) = match log.next_turn() {
+            Ok(turn) => (turn, None),
+            Err(e) => (Self::FALLBACK_TURN, Some(e.to_string())),
+        };
+        SessionTrace {
+            log,
+            session,
+            turn,
+            user: user.chars().take(Self::USER_CHARS).collect(),
+            started: Instant::now(),
+            steps: 0,
+            out_tokens: 0,
+            think_tokens: 0,
+            peak_fill: 0.0,
+            warning,
+        }
+    }
+
+    /// Appends the turn record, then sends it as `trace_turn`.
+    pub async fn finish(
+        mut self,
+        reason: &str,
+        committed: bool,
+        sink: &mut dyn LoopSink,
+    ) -> Result<(), SinkClosed> {
+        let record = TurnRecord {
+            turn: self.turn,
+            at: Self::now_ms(),
+            steps: self.steps,
+            reason: reason.to_string(),
+            total_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            out_tokens: self.out_tokens,
+            think_tokens: self.think_tokens,
+            peak_fill: self.peak_fill,
+            committed,
+            user: std::mem::take(&mut self.user),
+        };
+        let live = json!(&record);
+        self.deliver(TraceRecord::Turn(record), live, Self::M_TRACE_TURN, sink)
+            .await
+    }
+
+    /// Appends a `reset` marker to `log`.
+    // The runtime server's `reset_session` calls this once it is wired (agent-trace Task 4).
+    #[allow(dead_code)]
+    pub(crate) fn reset(log: &TraceLog) -> io::Result<()> {
+        log.append(&TraceRecord::Reset(ResetRecord { at: Self::now_ms() }))
+    }
+
+    /// Appends `record`, warns about anything that failed, then sends `live` as `method`.
+    async fn deliver(
+        &mut self,
+        record: TraceRecord,
+        live: Value,
+        method: &str,
+        sink: &mut dyn LoopSink,
+    ) -> Result<(), SinkClosed> {
+        let appended = self.log.append(&record);
+        if let Some(message) = self.warning.take() {
+            self.warn(message, sink).await?;
+        }
+        if let Err(e) = appended {
+            self.warn(e.to_string(), sink).await?;
+        }
+        let params = json!({ (Self::FIELD_ID): self.session, (Self::FIELD_RECORD): live });
+        sink.notify(method, params).await
+    }
+
+    async fn warn(&self, message: String, sink: &mut dyn LoopSink) -> Result<(), SinkClosed> {
+        let params = json!({ (Self::FIELD_ID): self.session, (Self::FIELD_MESSAGE): message });
+        sink.notify(Self::M_TRACE_WARNING, params).await
+    }
+
+    /// Wall-clock Unix milliseconds.
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+#[async_trait]
+impl TurnTrace for SessionTrace {
+    async fn step(
+        &mut self,
+        mut record: StepRecord,
+        sink: &mut dyn LoopSink,
+    ) -> Result<(), SinkClosed> {
+        record.turn = self.turn;
+        record.at = Self::now_ms();
+        self.steps = self.steps.saturating_add(1);
+        self.out_tokens = self.out_tokens.saturating_add(record.out_tokens);
+        self.think_tokens = self.think_tokens.saturating_add(record.think_tokens);
+        if let (Some(used), Some(total)) = (record.prompt_tokens, record.n_ctx) {
+            if total > 0 {
+                self.peak_fill = self.peak_fill.max(f64::from(used) / f64::from(total));
+            }
+        }
+        let live = json!(&record);
+        self.deliver(TraceRecord::Step(record), live, Self::M_TRACE_STEP, sink)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::RecordingSink;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const FILE: &str = "s-1-0.trace.jsonl";
+    const SESSION: &str = "s-1-0";
     /// A crash-cut record: cut mid-kind, no line feed.
     const CUT_LINE: &str = "{\"v\":1,\"kind\":\"st";
 
@@ -463,6 +635,11 @@ mod tests {
 
         fn reset() -> TraceRecord {
             TraceRecord::Reset(ResetRecord { at: 3000 })
+        }
+
+        /// A session trace over this directory's log, for the user message "hi".
+        fn session_trace(&self) -> SessionTrace {
+            SessionTrace::new(Arc::new(self.log()), SESSION.into(), "hi")
         }
     }
 
@@ -663,5 +840,146 @@ mod tests {
         let b = store.log("s-1-0").unwrap();
         assert!(!Arc::ptr_eq(&a, &b));
         assert_eq!(b.next_turn().unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn session_trace_appends_then_notifies_and_finishes() {
+        let d = TempDir::new("strace");
+        let mut trace = d.session_trace();
+        let mut sink = RecordingSink::new();
+        trace
+            .step(TempDir::step_record(0, 1), &mut sink)
+            .await
+            .unwrap();
+        let file = d.0.join(FILE);
+        assert_eq!(TraceLog::read_records(&file).unwrap().len(), 1);
+        assert_eq!(sink.methods(), [SessionTrace::M_TRACE_STEP]);
+        let note = &sink.notes[0].params;
+        assert_eq!(note["id"], SESSION);
+        assert_eq!(note["record"]["turn"], 1);
+        assert_eq!(note["record"]["step"], 1);
+        assert!(note["record"]["at"].as_u64().unwrap() > 0);
+
+        trace.finish("answered", true, &mut sink).await.unwrap();
+        let records = TraceLog::read_records(&file).unwrap();
+        assert_eq!(records.len(), 2);
+        let TraceRecord::Turn(turn) = &records[1] else {
+            panic!("not a turn record: {:?}", records[1]);
+        };
+        assert_eq!((turn.turn, turn.steps), (1, 1));
+        assert_eq!(turn.peak_fill, 100.0 / 1000.0);
+        assert!(turn.committed);
+        assert_eq!(turn.reason, "answered");
+        assert_eq!((turn.out_tokens, turn.think_tokens), (5, 0));
+        assert_eq!(turn.user, "hi");
+        assert_eq!(
+            sink.methods(),
+            [SessionTrace::M_TRACE_STEP, SessionTrace::M_TRACE_TURN]
+        );
+        assert_eq!(sink.notes[1].params["id"], SESSION);
+        assert_eq!(sink.notes[1].params["record"], json!(turn));
+    }
+
+    #[tokio::test]
+    async fn session_trace_numbers_turns_and_cuts_the_user_message() {
+        let d = TempDir::new("snumber");
+        let log = Arc::new(d.log());
+        let mut sink = RecordingSink::new();
+        let first = SessionTrace::new(Arc::clone(&log), SESSION.into(), &"é".repeat(300));
+        first.finish("answered", true, &mut sink).await.unwrap();
+        let second = SessionTrace::new(log, SESSION.into(), "x");
+        second
+            .finish(SessionTrace::REASON_ABORTED, false, &mut sink)
+            .await
+            .unwrap();
+        let records = TraceLog::read_records(&d.0.join(FILE)).unwrap();
+        let turns: Vec<&TurnRecord> = records
+            .iter()
+            .filter_map(|r| match r {
+                TraceRecord::Turn(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!((turns[0].turn, turns[1].turn), (1, 2));
+        assert_eq!(turns[0].user.chars().count(), 200);
+        assert_eq!((turns[1].steps, turns[1].peak_fill), (0, 0.0));
+        assert_eq!(turns[1].reason, "aborted");
+    }
+
+    #[tokio::test]
+    async fn session_trace_write_failure_warns_and_still_notifies() {
+        let d = TempDir::new("sfail");
+        let mut trace = d.session_trace();
+        fs::create_dir(d.0.join(FILE)).unwrap();
+        let mut sink = RecordingSink::new();
+        trace
+            .step(TempDir::step_record(0, 1), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.methods(),
+            [SessionTrace::M_TRACE_WARNING, SessionTrace::M_TRACE_STEP]
+        );
+        assert_eq!(sink.notes[0].params["id"], SESSION);
+        assert!(!sink.notes[0].params["message"].as_str().unwrap().is_empty());
+        assert_eq!(sink.notes[1].params["record"]["turn"], 1);
+    }
+
+    #[tokio::test]
+    async fn session_trace_over_an_unreadable_log_uses_turn_zero_and_warns_once() {
+        let d = TempDir::new("sunread");
+        fs::create_dir(d.0.join(FILE)).unwrap();
+        let mut trace = d.session_trace();
+        let mut sink = RecordingSink::new();
+        trace
+            .step(TempDir::step_record(0, 1), &mut sink)
+            .await
+            .unwrap();
+        // The turn-number failure, then this append's failure, then the record.
+        assert_eq!(
+            sink.methods(),
+            [
+                SessionTrace::M_TRACE_WARNING,
+                SessionTrace::M_TRACE_WARNING,
+                SessionTrace::M_TRACE_STEP
+            ]
+        );
+        assert_eq!(sink.notes[2].params["record"]["turn"], 0);
+        trace.finish("answered", true, &mut sink).await.unwrap();
+        assert_eq!(
+            &sink.methods()[3..],
+            [SessionTrace::M_TRACE_WARNING, SessionTrace::M_TRACE_TURN]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_trace_appends_even_when_sink_is_closed() {
+        let d = TempDir::new("sclosed");
+        let mut trace = d.session_trace();
+        let mut sink = RecordingSink::closing_after(0);
+        assert_eq!(
+            trace.step(TempDir::step_record(0, 1), &mut sink).await,
+            Err(SinkClosed)
+        );
+        assert_eq!(
+            trace
+                .finish(SessionTrace::REASON_ABORTED, false, &mut sink)
+                .await,
+            Err(SinkClosed)
+        );
+        let records = TraceLog::read_records(&d.0.join(FILE)).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(&records[1], TraceRecord::Turn(t) if t.steps == 1 && !t.committed));
+        assert!(sink.notes.is_empty());
+    }
+
+    #[test]
+    fn reset_appends_a_marker() {
+        let d = TempDir::new("sreset");
+        let log = d.log();
+        log.append(&TempDir::step(1, 1)).unwrap();
+        SessionTrace::reset(&log).unwrap();
+        let records = TraceLog::read_records(&d.0.join(FILE)).unwrap();
+        assert!(matches!(&records[1], TraceRecord::Reset(r) if r.at > 0));
+        assert!(log.page(None, None).unwrap().reset_pending);
     }
 }
