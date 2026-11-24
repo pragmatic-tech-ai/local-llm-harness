@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agents::host::ModelRequirement;
 use crate::engine::SamplingConfig;
 use crate::runtime::builtin::Sandbox;
 
@@ -14,7 +15,10 @@ const ERR_UNKNOWN_TOOL: &str = "unknown tool: ";
 const ERR_UNKNOWN_RUNTIME: &str = "unknown runtime: ";
 const ERR_UNKNOWN_MODEL: &str = "unknown model: ";
 const ERR_STEP_BUDGET: &str = "step_budget must be at least 1";
-const ERR_UNKNOWN_HOST: &str = "unknown host: ";
+const ERR_UNKNOWN_REPOSITORY: &str = "unknown repository: ";
+const ERR_LIST_UNAVAILABLE_PREFIX: &str = "model list unavailable for repository ";
+const ERR_CTX_EXCEEDS_PREFIX: &str = "n_ctx exceeds the model's context length (";
+const OPENROUTER_RUNTIME: &str = "openrouter";
 const ERR_UNKNOWN_STRATEGY: &str = "unknown context strategy: ";
 const ERR_COMPACT_PCT: &str = "compact_at_pct must be between 10 and 95";
 const ERR_UNKNOWN_WORKSPACE_MODE: &str = "unknown workspace mode: ";
@@ -203,8 +207,10 @@ pub struct AgentTemplate {
     pub enable_thinking: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling: Option<SamplingConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
+    /// The repository the model comes from; `host` is the old name and still reads. A missing
+    /// value means `hive`.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "host")]
+    pub repository: Option<String>,
     #[serde(default)]
     pub context_strategy: ContextStrategy,
     #[serde(
@@ -236,14 +242,39 @@ impl AgentTemplate {
     }
 }
 
-/// What a template may reference: the known runtimes, models (with the runtimes able to load
-/// each), tools and hosts.
+/// How a repository serves its models, which decides how a template naming it is validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepositoryKind {
+    #[serde(rename = "pragmatic")]
+    Pragmatic,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+}
+
+/// One model a repository offers: the runtimes able to load it and its context length, if
+/// known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleModel {
+    pub id: String,
+    pub runtimes: Vec<String>,
+    pub context_length: Option<u32>,
+}
+
+/// A repository a template may name, with its models. `None` means the list is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRules {
+    pub name: String,
+    pub kind: RepositoryKind,
+    pub models: Option<Vec<RuleModel>>,
+}
+
+/// What a template may reference: the known runtimes, tools and repositories (each with the
+/// models it offers).
 #[derive(Debug, Clone, Default)]
 pub struct TemplateRules {
     pub runtimes: Vec<String>,
-    pub models: Vec<(String, Vec<String>)>,
     pub tools: Vec<String>,
-    pub hosts: Vec<String>,
+    pub repositories: Vec<RepositoryRules>,
     /// The names of the registry tools that have side effects.
     pub writing_tools: Vec<String>,
 }
@@ -267,6 +298,17 @@ impl<T: RulesSource + ?Sized> RulesSource for std::sync::Arc<T> {
     }
 }
 
+impl RuleModel {
+    /// A model loadable by `runtimes`, with no known context length.
+    pub fn of(id: &str, runtimes: &[&str]) -> Self {
+        Self {
+            id: id.to_string(),
+            runtimes: runtimes.iter().map(|r| r.to_string()).collect(),
+            context_length: None,
+        }
+    }
+}
+
 impl TemplateRules {
     pub fn validate(&self, t: &AgentTemplate) -> Result<(), String> {
         if t.step_budget < 1 {
@@ -275,26 +317,70 @@ impl TemplateRules {
         if let Some(tool) = t.tools.iter().find(|n| !self.tools.contains(n)) {
             return Err(format!("{ERR_UNKNOWN_TOOL}{tool}"));
         }
-        if !self.runtimes.contains(&t.runtime) {
-            return Err(format!("{ERR_UNKNOWN_RUNTIME}{}", t.runtime));
-        }
-        let Some((_, runtimes)) = self.models.iter().find(|(m, _)| *m == t.model) else {
-            return Err(format!("{ERR_UNKNOWN_MODEL}{}", t.model));
-        };
-        if !runtimes.contains(&t.runtime) {
-            return Err(format!(
-                "runtime {} cannot load model {}",
-                t.runtime, t.model
-            ));
-        }
-        if let Some(host) = t.host.as_ref().filter(|h| !self.hosts.contains(h)) {
-            return Err(format!("{ERR_UNKNOWN_HOST}{host}"));
-        }
+        self.validate_model(t)?;
         if !(MIN_COMPACT_AT_PCT..=MAX_COMPACT_AT_PCT).contains(&t.compact_at_pct) {
             return Err(ERR_COMPACT_PCT.to_string());
         }
         t.workspace.validate()?;
         Ok(())
+    }
+
+    /// The runtime, model and context checks, against the repository the template names.
+    fn validate_model(&self, t: &AgentTemplate) -> Result<(), String> {
+        let name = t
+            .repository
+            .as_deref()
+            .unwrap_or(ModelRequirement::DEFAULT_REPOSITORY);
+        let Some(repo) = self.repositories.iter().find(|r| r.name == name) else {
+            return Err(format!("{ERR_UNKNOWN_REPOSITORY}{name}"));
+        };
+        match repo.kind {
+            RepositoryKind::Pragmatic => {
+                if !self.runtimes.contains(&t.runtime) {
+                    return Err(format!("{ERR_UNKNOWN_RUNTIME}{}", t.runtime));
+                }
+                let found = repo
+                    .models
+                    .iter()
+                    .flatten()
+                    .find(|m| m.id == t.model)
+                    .ok_or_else(|| format!("{ERR_UNKNOWN_MODEL}{}", t.model))?;
+                if !found.runtimes.contains(&t.runtime) {
+                    return Err(format!(
+                        "runtime {} cannot load model {}",
+                        t.runtime, t.model
+                    ));
+                }
+                Ok(())
+            }
+            RepositoryKind::OpenRouter => {
+                if t.runtime != OPENROUTER_RUNTIME {
+                    return Err(format!("{ERR_UNKNOWN_RUNTIME}{}", t.runtime));
+                }
+                let Some(models) = repo.models.as_ref() else {
+                    return Err(format!("{ERR_LIST_UNAVAILABLE_PREFIX}{name}"));
+                };
+                let found = models
+                    .iter()
+                    .find(|m| m.id == t.model)
+                    .ok_or_else(|| format!("{ERR_UNKNOWN_MODEL}{}", t.model))?;
+                match found.context_length {
+                    Some(n) if t.n_ctx > n => Err(format!("{ERR_CTX_EXCEEDS_PREFIX}{n})")),
+                    _ => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// The models of the first Pragmatic repository, preferring `hive`: what a seed template
+    /// picks from.
+    pub fn pragmatic_models(&self) -> &[RuleModel] {
+        self.repositories
+            .iter()
+            .filter(|r| r.kind == RepositoryKind::Pragmatic)
+            .min_by_key(|r| r.name != ModelRequirement::DEFAULT_REPOSITORY)
+            .and_then(|r| r.models.as_deref())
+            .unwrap_or_default()
     }
 
     /// A small fixed rule set for tests: runtimes `llamacpp`/`candle`, models `gemma-4-e4b`
@@ -303,12 +389,15 @@ impl TemplateRules {
     pub fn for_tests() -> Self {
         Self {
             runtimes: vec!["llamacpp".into(), "candle".into()],
-            models: vec![
-                ("gemma-4-e4b".into(), vec!["llamacpp".into()]),
-                ("tiny".into(), vec!["candle".into(), "llamacpp".into()]),
-            ],
             tools: vec!["read_file".into(), "web_search".into()],
-            hosts: vec!["hive".into()],
+            repositories: vec![RepositoryRules {
+                name: "hive".into(),
+                kind: RepositoryKind::Pragmatic,
+                models: Some(vec![
+                    RuleModel::of("gemma-4-e4b", &["llamacpp"]),
+                    RuleModel::of("tiny", &["candle", "llamacpp"]),
+                ]),
+            }],
             writing_tools: vec![],
         }
     }
@@ -495,6 +584,134 @@ mod tests {
             ["workspaces", "research"]
                 .iter()
                 .collect::<std::path::PathBuf>()
+        );
+    }
+
+    struct Fixtures;
+
+    impl Fixtures {
+        const OR_MODEL: &'static str = "vendor/model";
+        const OR_CTX: u32 = 8192;
+
+        fn openrouter(models: Option<Vec<RuleModel>>) -> TemplateRules {
+            let mut rules = TemplateRules::for_tests();
+            rules.repositories.push(RepositoryRules {
+                name: "or".into(),
+                kind: RepositoryKind::OpenRouter,
+                models,
+            });
+            rules
+        }
+
+        fn or_models() -> Option<Vec<RuleModel>> {
+            Some(vec![RuleModel {
+                id: Self::OR_MODEL.into(),
+                runtimes: vec!["openrouter".into()],
+                context_length: Some(Self::OR_CTX),
+            }])
+        }
+
+        fn or_template(runtime: &str, model: &str, n_ctx: u32) -> AgentTemplate {
+            let text = format!(
+                "name = \"T\"
+repository = \"or\"
+runtime = \"{runtime}\"
+model = \"{model}\"
+n_ctx = {n_ctx}
+"
+            );
+            toml::from_str(&text).unwrap()
+        }
+    }
+
+    #[test]
+    fn legacy_host_field_routes_to_hive() {
+        let t: AgentTemplate = toml::from_str(&format!(
+            "{BASE}host = \"hive\"
+"
+        ))
+        .unwrap();
+        assert_eq!(t.repository.as_deref(), Some("hive"));
+        assert_eq!(ModelRequirement::of(&t).repository, "hive");
+        assert!(!toml::to_string_pretty(&t).unwrap().contains("host"));
+    }
+
+    #[test]
+    fn missing_repository_means_hive() {
+        let t: AgentTemplate = toml::from_str(BASE).unwrap();
+        assert_eq!(t.repository, None);
+        assert_eq!(ModelRequirement::of(&t).repository, "hive");
+        assert_eq!(TemplateRules::for_tests().validate(&t), Ok(()));
+    }
+
+    #[test]
+    fn unknown_repository_is_rejected() {
+        let t: AgentTemplate = toml::from_str(&format!(
+            "{BASE}repository = \"far\"
+"
+        ))
+        .unwrap();
+        assert_eq!(
+            TemplateRules::for_tests().validate(&t),
+            Err("unknown repository: far".to_string())
+        );
+    }
+
+    #[test]
+    fn openrouter_model_validates_runtime_model_and_ctx() {
+        let rules = Fixtures::openrouter(Fixtures::or_models());
+        let ok = Fixtures::or_template("openrouter", Fixtures::OR_MODEL, Fixtures::OR_CTX);
+        assert_eq!(rules.validate(&ok), Ok(()));
+        let wrong_runtime = Fixtures::or_template("llamacpp", Fixtures::OR_MODEL, 4096);
+        assert_eq!(
+            rules.validate(&wrong_runtime),
+            Err("unknown runtime: llamacpp".to_string())
+        );
+        let wrong_model = Fixtures::or_template("openrouter", "nope", 4096);
+        assert_eq!(
+            rules.validate(&wrong_model),
+            Err("unknown model: nope".to_string())
+        );
+        let too_big = Fixtures::or_template("openrouter", Fixtures::OR_MODEL, Fixtures::OR_CTX + 1);
+        assert_eq!(
+            rules.validate(&too_big),
+            Err("n_ctx exceeds the model's context length (8192)".to_string())
+        );
+    }
+
+    #[test]
+    fn openrouter_unknown_list_refuses_save() {
+        let rules = Fixtures::openrouter(None);
+        let t = Fixtures::or_template("openrouter", Fixtures::OR_MODEL, 4096);
+        assert_eq!(
+            rules.validate(&t),
+            Err("model list unavailable for repository or".to_string())
+        );
+    }
+
+    #[test]
+    fn pragmatic_validation_unchanged() {
+        let rules = TemplateRules::for_tests();
+        let t: AgentTemplate = toml::from_str(BASE).unwrap();
+        assert_eq!(rules.validate(&t), Ok(()));
+        let mut bad_runtime = t.clone();
+        bad_runtime.runtime = "nope".into();
+        assert_eq!(
+            rules.validate(&bad_runtime),
+            Err("unknown runtime: nope".to_string())
+        );
+        let mut bad_model = t.clone();
+        bad_model.model = "nope".into();
+        assert_eq!(
+            rules.validate(&bad_model),
+            Err("unknown model: nope".to_string())
+        );
+        let mut cannot = t;
+        cannot.model = "gemma-4-e4b".into();
+        cannot.runtime = "candle".into();
+        assert_eq!(
+            rules.validate(&cannot),
+            Err("runtime candle cannot load model gemma-4-e4b".to_string())
         );
     }
 }

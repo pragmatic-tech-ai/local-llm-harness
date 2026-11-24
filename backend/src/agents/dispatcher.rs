@@ -596,7 +596,7 @@ mod tests {
             n_ctx: 4096,
             enable_thinking: false,
             sampling: None,
-            host: None,
+            repository: None,
             context_strategy: ContextStrategy::default(),
             compact_at_pct: DEFAULT_COMPACT_AT_PCT,
             workspace: WorkspaceConfig::default(),
@@ -607,7 +607,7 @@ mod tests {
             Fixtures::req("gemma-3", 4096, "hive")
         );
         let mut elsewhere = record.snapshot.clone();
-        elsewhere.host = Some("lab".into());
+        elsewhere.repository = Some("lab".into());
         assert_eq!(ModelRequirement::of(&elsewhere).repository, "lab");
     }
 

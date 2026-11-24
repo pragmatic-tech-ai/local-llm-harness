@@ -10,7 +10,9 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::agents::template::{RulesSource, TemplateRules};
+use crate::agents::template::{
+    RepositoryKind, RepositoryRules, RuleModel, RulesSource, TemplateRules,
+};
 use crate::supervisor::catalog::Catalog;
 use crate::supervisor::control::CatalogListing;
 use crate::supervisor::discovery::discover;
@@ -73,6 +75,14 @@ impl CatalogSource for DiscoveredCatalog {
 
 impl RulesSource for DiscoveredCatalog {
     fn rules(&self) -> TemplateRules {
+        let models: Vec<RuleModel> = discover(&self.catalog)
+            .into_iter()
+            .map(|m| RuleModel {
+                id: m.display_name,
+                runtimes: m.runtimes,
+                context_length: None,
+            })
+            .collect();
         TemplateRules {
             runtimes: self
                 .catalog
@@ -80,13 +90,17 @@ impl RulesSource for DiscoveredCatalog {
                 .iter()
                 .map(|r| r.name.clone())
                 .collect(),
-            models: discover(&self.catalog)
-                .into_iter()
-                .map(|m| (m.display_name, m.runtimes))
-                .collect(),
             tools: self.tools.clone(),
             writing_tools: self.writing_tools.clone(),
-            hosts: self.hosts.clone(),
+            repositories: self
+                .hosts
+                .iter()
+                .map(|name| RepositoryRules {
+                    name: name.clone(),
+                    kind: RepositoryKind::Pragmatic,
+                    models: Some(models.clone()),
+                })
+                .collect(),
         }
     }
 }
@@ -155,16 +169,16 @@ mod tests {
         let before = source.view();
         assert_eq!(before.models.len(), 1);
         assert_eq!(before.hosts, [HOST]);
-        assert_eq!(source.rules().models.len(), 1);
+        assert_eq!(source.rules().pragmatic_models().len(), 1);
         std::fs::write(dir.0.join("late.gguf"), Fixtures::gguf("llama")).unwrap();
         let after = source.view();
         assert_eq!(after.models.len(), 2);
         assert!(after.models.iter().any(|m| m[NAME] == "late"));
         let rules = source.rules();
-        assert!(rules.models.iter().any(|(m, _)| m == "late"));
+        assert!(rules.pragmatic_models().iter().any(|m| m.id == "late"));
         assert_eq!(rules.tools, [TOOL]);
         assert!(rules.writing_tools.is_empty());
-        assert_eq!(rules.hosts, [HOST]);
+        assert_eq!(rules.repositories[0].name, HOST);
         assert_eq!(rules.runtimes, ["llamacpp"]);
     }
 }

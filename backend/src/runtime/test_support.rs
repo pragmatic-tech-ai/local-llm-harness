@@ -488,9 +488,15 @@ impl TestRuntime {
     ) -> crate::agents::template::TemplateRules {
         crate::agents::template::TemplateRules {
             runtimes: vec![Self::RUNTIME.to_string()],
-            models: vec![(Self::MODEL.to_string(), vec![Self::RUNTIME.to_string()])],
             tools: registry.specs().into_iter().map(|s| s.name).collect(),
-            hosts: vec![Self::HOST.to_string()],
+            repositories: vec![crate::agents::template::RepositoryRules {
+                name: Self::HOST.to_string(),
+                kind: crate::agents::template::RepositoryKind::Pragmatic,
+                models: Some(vec![crate::agents::template::RuleModel::of(
+                    Self::MODEL,
+                    &[Self::RUNTIME],
+                )]),
+            }],
             writing_tools: registry
                 .specs()
                 .into_iter()

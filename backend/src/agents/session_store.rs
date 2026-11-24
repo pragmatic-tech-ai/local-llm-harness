@@ -351,7 +351,7 @@ mod tests {
                 n_ctx: 4096,
                 enable_thinking: false,
                 sampling: None,
-                host: None,
+                repository: None,
                 context_strategy: ContextStrategy::default(),
                 compact_at_pct: DEFAULT_COMPACT_AT_PCT,
                 workspace: WorkspaceConfig::default(),

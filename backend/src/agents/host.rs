@@ -32,15 +32,14 @@ impl ModelRequirement {
     /// The repository a template that names none uses: the Pragmatic provider.
     pub const DEFAULT_REPOSITORY: &'static str = "hive";
 
-    /// What a template snapshot asks for. Until templates carry a `repository`, it comes from
-    /// the template's `host`.
+    /// What a template snapshot asks for.
     pub fn of(snapshot: &AgentTemplate) -> Self {
         ModelRequirement {
             runtime: snapshot.runtime.clone(),
             model: snapshot.model.clone(),
             n_ctx: snapshot.n_ctx,
             repository: snapshot
-                .host
+                .repository
                 .clone()
                 .unwrap_or_else(|| Self::DEFAULT_REPOSITORY.to_string()),
         }

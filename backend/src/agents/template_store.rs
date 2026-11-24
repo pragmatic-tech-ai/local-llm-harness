@@ -10,8 +10,8 @@ use serde::Serialize;
 
 use super::atomic_file::AtomicFile;
 use super::template::{
-    AgentTemplate, ContextStrategy, RulesSource, TemplateRules, WorkspaceConfig,
-    DEFAULT_COMPACT_AT_PCT,
+    AgentTemplate, ContextStrategy, RepositoryKind, RepositoryRules, RuleModel, RulesSource,
+    TemplateRules, WorkspaceConfig, DEFAULT_COMPACT_AT_PCT,
 };
 
 const EXT: &str = "toml";
@@ -176,14 +176,14 @@ impl TemplateStore {
     /// What the seeds share: the runtime, the model picked for it, the context size and every
     /// tool.
     fn seed_base(rules: &TemplateRules) -> AgentTemplate {
-        let capable = |m: &&(String, Vec<String>)| m.1.iter().any(|r| r == SEED_RUNTIME);
-        let model = rules
-            .models
+        let models = rules.pragmatic_models();
+        let capable = |m: &&RuleModel| m.runtimes.iter().any(|r| r == SEED_RUNTIME);
+        let model = models
             .iter()
             .filter(capable)
-            .find(|m| m.0.contains(SEED_MODEL_HINT))
-            .or_else(|| rules.models.iter().find(capable))
-            .map(|m| m.0.clone())
+            .find(|m| m.id.contains(SEED_MODEL_HINT))
+            .or_else(|| models.iter().find(capable))
+            .map(|m| m.id.clone())
             .unwrap_or_default();
         AgentTemplate {
             name: SEED_NAME.to_string(),
@@ -195,7 +195,7 @@ impl TemplateStore {
             n_ctx: SEED_N_CTX,
             enable_thinking: false,
             sampling: None,
-            host: None,
+            repository: None,
             context_strategy: ContextStrategy::default(),
             compact_at_pct: DEFAULT_COMPACT_AT_PCT,
             workspace: WorkspaceConfig::default(),
@@ -606,7 +606,7 @@ mod tests {
                 n_ctx: 4096,
                 enable_thinking: true,
                 sampling: Some(crate::engine::SamplingConfig::default()),
-                host: Some("hive".into()),
+                repository: Some("hive".into()),
                 context_strategy: ContextStrategy::default(),
                 compact_at_pct: DEFAULT_COMPACT_AT_PCT,
                 workspace: WorkspaceConfig::default(),
@@ -860,7 +860,12 @@ mod tests {
                 "",
                 "runtime candle cannot load model gemma-4-e4b",
             ),
-            ("host", "llamacpp", "host = \"far\"", "unknown host: far"),
+            (
+                "repository",
+                "llamacpp",
+                "repository = \"far\"",
+                "unknown repository: far",
+            ),
         ];
         for (id, runtime, extra, _) in cases {
             let body = format!(
@@ -910,18 +915,22 @@ n_ctx = 4096
             s.save(None, "", &t).unwrap_err().0,
             "unknown model: dropped-in"
         );
-        shared
-            .lock()
-            .unwrap()
+        shared.lock().unwrap().repositories[0]
             .models
-            .push(("dropped-in".into(), vec!["llamacpp".into()]));
+            .as_mut()
+            .unwrap()
+            .push(RuleModel::of("dropped-in", &["llamacpp"]));
         let id = s.save(None, "", &t).unwrap();
         assert!(s
             .tree()
             .iter()
             .any(|n| matches!(n, TemplateNode::Template { id: i, error: None, .. } if *i == id)));
         // Removed again: the tree flags it without a restart.
-        shared.lock().unwrap().models.pop();
+        shared.lock().unwrap().repositories[0]
+            .models
+            .as_mut()
+            .unwrap()
+            .pop();
         assert!(s.tree().iter().any(
             |n| matches!(n, TemplateNode::Template { id: i, error: Some(_), .. } if *i == id)
         ));
@@ -1160,13 +1169,16 @@ n_ctx = 4096
         let d = TempDir::new("fallback");
         let rules = TemplateRules {
             runtimes: vec!["llamacpp".into(), "candle".into()],
-            models: vec![
-                ("only-candle".into(), vec!["candle".into()]),
-                ("alpha".into(), vec!["candle".into(), "llamacpp".into()]),
-                ("beta".into(), vec!["llamacpp".into()]),
-            ],
             tools: vec![],
-            hosts: vec![],
+            repositories: vec![RepositoryRules {
+                name: "hive".into(),
+                kind: RepositoryKind::Pragmatic,
+                models: Some(vec![
+                    RuleModel::of("only-candle", &["candle"]),
+                    RuleModel::of("alpha", &["candle", "llamacpp"]),
+                    RuleModel::of("beta", &["llamacpp"]),
+                ]),
+            }],
             writing_tools: vec![],
         };
         let s = TemplateStore::open(&d.0.join("templates"), rules).unwrap();
