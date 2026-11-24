@@ -1,6 +1,6 @@
 # Context compaction
 
-**Status:** approved 2026-11-24 (owner "go"); implemented on feat/context-compaction
+**Status:** approved 2026-11-24; shipped and live-proven on the hive 2026-11-24 (main @37d645b0). Live proof on gemma-4, read_file, 40%: trim cut 6 417 → 2 371 tokens (2 results elided); summarize fell back to trim on turn 2 (nothing to summarize yet), summarised the first turn on turn 3 (9.3 s, 4 354 → 2 316) and reused it on turn 4; off never compacted (2 208 → 6 487). Every strategy recalled the first answer. The owner confirmed the editor fields and the trace lines.
 **Roadmap:** step 3, memory and context (`docs/roadmap.md`)
 **Builds on:**
 - `docs/specs/2026-11-23-agent-templates-sessions-design.md`: templates, sessions and the runtime on :8779

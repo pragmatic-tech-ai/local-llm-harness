@@ -24,7 +24,7 @@ policy seam stays, unused.
 2. **Agent trace in the instrument panel.** *Shipped 2026-11-24* (`docs/specs/2026-11-24-agent-trace-design.md`). Per step: context fill, tokens, tool latency,
    and why the loop stopped. This makes every later capability measurable on the small
    model.
-3. **Memory and context.** Conversations survive reconnects, supervisor restarts and model
+3. **Memory and context.** *Shipped 2026-11-24* (sessions persist transcripts; `docs/specs/2026-11-24-context-compaction-design.md` adds per-template trim/summarize compaction). Conversations survive reconnects, supervisor restarts and model
    swaps. When the window fills, old tool results are compacted or summarised instead of
    the turn failing with `window_full`.
 4. **Longer tasks.** Per-agent step budgets, a scratchpad/notes tool, and write tools in
