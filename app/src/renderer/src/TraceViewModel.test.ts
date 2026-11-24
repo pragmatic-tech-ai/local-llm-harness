@@ -90,6 +90,24 @@ describe('TraceViewModel', () =>
         expect(rig.Turn(0).Steps.Count).toBe(2)
         rig.Turn(1).Expanded = true
         expect(rig.Turn(1).Expanded).toBe(true)
+        expect(rig.Turn(1).UserToggled).toBe(true)
+        expect(rig.Turn(0).UserToggled).toBe(false)
+    })
+
+    it('new_newest_turn_collapses_the_previous_only_when_not_toggled', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show('s1', { turns: [Rig.Turn(1)], more: false, reset_pending: false })
+        // Collapsed then re-expanded by the user: it stays expanded when turn 2 starts.
+        rig.Turn(0).Expanded = false
+        rig.Turn(0).Expanded = true
+        rig.Notify('trace_step', { id: 's1', record: Rig.Step(2, 1) })
+        expect(rig.Turn(0).Turn).toBe(2)
+        expect(rig.Turn(0).Expanded).toBe(true)
+        expect(rig.Turn(1).Expanded).toBe(true)
+        // Turn 2 was never toggled: turn 3 collapses it by default.
+        rig.Notify('trace_step', { id: 's1', record: Rig.Step(3, 1) })
+        expect(rig.trace.Turns.ToArray().map(t => t.Expanded)).toEqual([true, false, true])
     })
 
     it('step_text_formats_fill_tokens_and_timing', async () =>
@@ -98,7 +116,7 @@ describe('TraceViewModel', () =>
         const steps = [
             Rig.Step(1, 1),
             Rig.Step(1, 2, { think_tokens: 5, load_ms: 12345, ttft_ms: null, gen_ms: 0 }),
-            Rig.Step(1, 3, { prompt_tokens: null as unknown as number, n_ctx: null as unknown as number, ttft_ms: null, gen_ms: null, out_tokens: 0, end: 'error', error: 'link failed' }),
+            Rig.Step(1, 3, { prompt_tokens: null, n_ctx: null, ttft_ms: null, gen_ms: null, out_tokens: 0, end: 'error', error: 'link failed' }),
         ]
         await rig.Show('s1', { turns: [Rig.Turn(1, { steps })], more: false, reset_pending: false })
         const [first, second, third] = rig.Turn(0).Steps.ToArray()
@@ -124,8 +142,9 @@ describe('TraceViewModel', () =>
         const aborted = Rig.Step(1, 2, { end: 'aborted' })
         await rig.Show('s1', { turns: [Rig.Turn(1, { steps: [Rig.Step(1, 1, { tools }), aborted] })], more: false, reset_pending: false })
         const [step, last] = rig.Turn(0).Steps.ToArray()
-        expect(step.Tools).toEqual(['└ read_file  ok  4 ms  26 B', '└ fetch  failed  1 200 ms  4 096 B'])
+        expect(step.Tools.map(t => t.Text)).toEqual(['└ read_file  ok  4 ms  26 B', '└ fetch  failed  1 200 ms  4 096 B'])
         expect(step.HasTools).toBe(true)
+        expect(last.Tools).toEqual([])
         expect(last.ErrorText).toBe('aborted')
         expect(last.HasTools).toBe(false)
     })
@@ -167,6 +186,16 @@ describe('TraceViewModel', () =>
         rig.Notify('trace_turn', { id: 's1', record: Rig.Summary(4, { steps: 1, reason: 'aborted' }) })
         expect(rig.trace.Turns.Count).toBe(1)
         expect(rig.Turn(0).HeaderText).toBe('Turn 4 · aborted · 1 steps · 21.4 s · peak 41%')
+    })
+
+    it('live_summary_before_page_wins_over_paged_summary', async () =>
+    {
+        const rig = new Rig()
+        const done = rig.trace.ShowSession(rig.client, 's1')
+        rig.Notify('trace_turn', { id: 's1', record: Rig.Summary(6, { steps: 3, reason: 'budget', total_ms: 5000, peak_fill: 0.5 }) })
+        await rig.Respond('get_trace', { turns: [Rig.Turn(6, { summary: Rig.Summary(6, { steps: 1, reason: 'answered' }) })], more: false, reset_pending: false })
+        await done
+        expect(rig.Headers()).toEqual(['Turn 6 · budget · 3 steps · 5.0 s · peak 50%'])
     })
 
     it('turn_without_summary_and_not_live_is_incomplete', async () =>
@@ -235,6 +264,44 @@ describe('TraceViewModel', () =>
         rig.client.HandleFrame(JSON.stringify({ id: rig.Frames('get_trace').pop()!.id, error: { code: -32602, message: 'unknown session: s3' } }))
         await done
         expect(rig.trace.WarningText).toBe('trace unavailable: unknown session: s3')
+    })
+
+    it('successful_reload_clears_a_page_failure_but_keeps_a_trace_warning', async () =>
+    {
+        const rig = new Rig()
+        const failing = rig.trace.ShowSession(rig.client, 's1')
+        rig.client.HandleFrame(JSON.stringify({ id: rig.Frames('get_trace').pop()!.id, error: { code: -32603, message: 'connection lost' } }))
+        await failing
+        expect(rig.trace.WarningText).toBe('trace unavailable: connection lost')
+        // Same-session re-show (reconnect) succeeds: the page failure is gone.
+        await rig.Show('s1', { turns: [Rig.Turn(1)], more: false, reset_pending: false })
+        expect(rig.trace.HasWarning).toBe(false)
+        // A trace_warning note survives a same-session reload, beside a page failure while one stands.
+        rig.Notify('trace_warning', { id: 's1', message: 'trace write failed: disk full' })
+        const again = rig.trace.ShowSession(rig.client, 's1')
+        rig.client.HandleFrame(JSON.stringify({ id: rig.Frames('get_trace').pop()!.id, error: { code: -32603, message: 'busy' } }))
+        await again
+        expect(rig.trace.WarningText).toBe('trace write failed: disk full · trace unavailable: busy')
+        await rig.Show('s1', { turns: [], more: false, reset_pending: false })
+        expect(rig.trace.WarningText).toBe('trace write failed: disk full')
+    })
+
+    it('failed_load_older_warns_keeps_more_and_can_retry', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show('s1', { turns: [Rig.Turn(9)], more: true, reset_pending: false })
+        rig.trace.LoadOlderCommand.Execute(undefined)
+        rig.client.HandleFrame(JSON.stringify({ id: rig.Frames('get_trace').pop()!.id, error: { code: -32603, message: 'read failed' } }))
+        await new Promise(r => setTimeout(r, 0))
+        expect(rig.trace.WarningText).toBe('trace unavailable: read failed')
+        expect(rig.trace.HasMore).toBe(true)
+        expect(rig.trace.LoadOlderCommand.CanExecute(undefined)).toBe(true)
+        // Retry succeeds: the older turn is appended and the warning clears.
+        rig.trace.LoadOlderCommand.Execute(undefined)
+        expect(rig.Frames('get_trace').pop()!.params).toEqual({ id: 's1', before: 9 })
+        await rig.Respond('get_trace', { turns: [Rig.Turn(8)], more: false, reset_pending: false })
+        expect(rig.trace.Turns.ToArray().map(t => t.Turn)).toEqual([9, 8])
+        expect(rig.trace.HasWarning).toBe(false)
     })
 
     it('signals_for_other_sessions_are_ignored', async () =>

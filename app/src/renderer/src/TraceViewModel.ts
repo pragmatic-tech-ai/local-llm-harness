@@ -40,6 +40,23 @@ export class TraceNumbers
     }
 }
 
+/** One tool run of a step, as one sub-row: `└ {name}  ok|failed  {ms} ms  {bytes} B`. */
+export class TraceToolViewModel extends Observable
+{
+    private readonly text: string
+
+    constructor(text: string)
+    {
+        super()
+        this.text = text
+    }
+
+    public get Text(): string
+    {
+        return this.text
+    }
+}
+
 /** One model call of a traced turn: the fill line with its bar, the token/timing line, tool rows and any error. */
 export class TraceStepViewModel extends Observable
 {
@@ -57,16 +74,18 @@ export class TraceStepViewModel extends Observable
     private static readonly EndRejected: StepEnd = 'rejected'
     private static readonly EndError: StepEnd = 'error'
     private static readonly EndAborted: StepEnd = 'aborted'
-    private static readonly ToolsSeparator = '\n'
     /** Pixel width of a step's fill track (the panel's context bar is wider; these sit beside the fill text). */
     private static readonly BarPixels = 80
 
     private readonly record: StepRecord
+    private readonly tools: TraceToolViewModel[]
 
     constructor(record: StepRecord)
     {
         super()
         this.record = record
+        this.tools = record.tools.map(t => new TraceToolViewModel(TextFormat.Format(TraceStepViewModel.ToolFormat, t.name,
+            t.ok ? TraceStepViewModel.ToolOk : TraceStepViewModel.ToolFailed, TraceNumbers.Thousands(t.ms), TraceNumbers.Thousands(t.bytes))))
     }
 
     public get Step(): number
@@ -129,16 +148,10 @@ export class TraceStepViewModel extends Observable
         return text
     }
 
-    public get Tools(): string[]
+    /** One row per tool the step ran, in run order. */
+    public get Tools(): TraceToolViewModel[]
     {
-        return this.record.tools.map(t => TextFormat.Format(TraceStepViewModel.ToolFormat, t.name,
-            t.ok ? TraceStepViewModel.ToolOk : TraceStepViewModel.ToolFailed, TraceNumbers.Thousands(t.ms), TraceNumbers.Thousands(t.bytes)))
-    }
-
-    /** The tool rows as one multi-line text block. */
-    public get ToolsText(): string
-    {
-        return this.Tools.join(TraceStepViewModel.ToolsSeparator)
+        return this.tools
     }
 
     public get HasTools(): boolean
@@ -191,6 +204,7 @@ export class TraceTurnViewModel extends Observable
     private summary: TurnRecord | null = null
     private live = false
     private expanded: boolean
+    private userToggled = false
     private resetBefore = false
 
     constructor(turn: number, expanded: boolean)
@@ -210,14 +224,28 @@ export class TraceTurnViewModel extends Observable
         return this.expanded
     }
 
+    /** The user's toggle (the header's binding): from now on the row keeps its expansion when a newer turn arrives. */
     public set Expanded(value: boolean)
     {
-        const old = this.expanded
-        if (old !== value)
+        if (value !== this.expanded)
         {
-            this.expanded = value
-            this.RaisePropertyChanged(TraceTurnViewModel.PropExpanded, old, value)
-            this.RaisePropertyChanged(TraceTurnViewModel.PropGlyph, undefined, this.Glyph)
+            this.userToggled = true
+            this.SetExpanded(value)
+        }
+    }
+
+    /** The user has toggled this row; its expansion is no longer the default. */
+    public get UserToggled(): boolean
+    {
+        return this.userToggled
+    }
+
+    /** A newer turn became the newest: this row collapses unless the user toggled it. */
+    public CollapseByDefault(): void
+    {
+        if (!this.userToggled)
+        {
+            this.SetExpanded(false)
         }
     }
 
@@ -299,6 +327,17 @@ export class TraceTurnViewModel extends Observable
         this.Steps.Insert(index, new TraceStepViewModel(record))
     }
 
+    private SetExpanded(value: boolean): void
+    {
+        const old = this.expanded
+        if (old !== value)
+        {
+            this.expanded = value
+            this.RaisePropertyChanged(TraceTurnViewModel.PropExpanded, old, value)
+            this.RaisePropertyChanged(TraceTurnViewModel.PropGlyph, undefined, this.Glyph)
+        }
+    }
+
     private UpdateHeader(mutate: () => void): void
     {
         const old = this.HeaderText
@@ -314,6 +353,7 @@ export class TraceTurnViewModel extends Observable
 export class TraceViewModel extends Observable
 {
     private static readonly PageFailedFormat = 'trace unavailable: {0}'
+    private static readonly WarningSeparator = ' · '
     private static readonly PropWarningText = 'WarningText'
     private static readonly PropHasWarning = 'HasWarning'
     private static readonly PropHasMore = 'HasMore'
@@ -332,7 +372,10 @@ export class TraceViewModel extends Observable
     private resetPending = false
     /** The oldest turn number any page returned: the `before` of the next older page. */
     private oldestPaged: number | null = null
-    private warning = ''
+    /** The last `trace_warning` for this session: kept until a switch to another session. */
+    private noteWarning = ''
+    /** The last failed page load: cleared by the next successful page and by every ShowSession. */
+    private pageError = ''
 
     constructor()
     {
@@ -359,25 +402,34 @@ export class TraceViewModel extends Observable
 
     public get WarningText(): string
     {
-        return this.warning
+        if (this.noteWarning.length > 0 && this.pageError.length > 0)
+        {
+            return this.noteWarning + TraceViewModel.WarningSeparator + this.pageError
+        }
+        return this.noteWarning + this.pageError
     }
 
     public get HasWarning(): boolean
     {
-        return this.warning.length > 0
+        return this.WarningText.length > 0
     }
 
     /**
      * Shows a session's trace (null to show none): clears the list, follows that session's live records and loads the
-     * first page. Called on attach, on switch and after reconnect; a warning is kept only when the session is the same.
+     * first page. Called on attach, on switch and after reconnect. A `trace_warning` is kept only when the session is
+     * the same; a page failure is always dropped (the reload retries it).
      */
     public async ShowSession(client: RuntimeClient | null, id: string | null): Promise<void>
     {
         const token = ++this.token
-        if (id !== this.id)
+        this.UpdateWarning(() =>
         {
-            this.SetWarning('')
-        }
+            if (id !== this.id)
+            {
+                this.noteWarning = ''
+            }
+            this.pageError = ''
+        })
         this.Unsubscribe()
         this.client = client
         this.id = id
@@ -409,7 +461,7 @@ export class TraceViewModel extends Observable
             {
                 if (n.id === this.id)
                 {
-                    this.SetWarning(n.message)
+                    this.UpdateWarning(() => { this.noteWarning = n.message })
                 }
             }),
         ]
@@ -422,7 +474,7 @@ export class TraceViewModel extends Observable
         {
             if (token === this.token)
             {
-                this.SetWarning(TextFormat.Format(TraceViewModel.PageFailedFormat, TextFormat.Message(e)))
+                this.SetPageError(TextFormat.Format(TraceViewModel.PageFailedFormat, TextFormat.Message(e)))
             }
             return
         }
@@ -473,7 +525,7 @@ export class TraceViewModel extends Observable
             if (token === this.token)
             {
                 this.SetLoadingOlder(false)
-                this.SetWarning(TextFormat.Format(TraceViewModel.PageFailedFormat, TextFormat.Message(e)))
+                this.SetPageError(TextFormat.Format(TraceViewModel.PageFailedFormat, TextFormat.Message(e)))
             }
             return
         }
@@ -487,6 +539,7 @@ export class TraceViewModel extends Observable
 
     private ApplyPage(page: TracePage): void
     {
+        this.SetPageError('')
         for (const t of page.turns)
         {
             this.ApplyPagedTurn(t)
@@ -554,7 +607,7 @@ export class TraceViewModel extends Observable
         const row = new TraceTurnViewModel(turn, index === 0)
         if (index === 0 && this.Turns.Count > 0)
         {
-            this.Turns.Get(0)!.Expanded = false
+            this.Turns.Get(0)!.CollapseByDefault()
         }
         this.Turns.Insert(index, row)
         return row
@@ -581,16 +634,22 @@ export class TraceViewModel extends Observable
         this.subscriptions = []
     }
 
-    private SetWarning(text: string): void
+    private SetPageError(text: string): void
     {
-        const old = this.warning
-        if (old === text)
-        {
-            return
-        }
+        this.UpdateWarning(() => { this.pageError = text })
+    }
+
+    /** Applies a change to either warning source, then notifies the combined line when it changed. */
+    private UpdateWarning(mutate: () => void): void
+    {
+        const old = this.WarningText
         const oldHas = this.HasWarning
-        this.warning = text
-        this.RaisePropertyChanged(TraceViewModel.PropWarningText, old, text)
+        mutate()
+        const text = this.WarningText
+        if (old !== text)
+        {
+            this.RaisePropertyChanged(TraceViewModel.PropWarningText, old, text)
+        }
         if (oldHas !== this.HasWarning)
         {
             this.RaisePropertyChanged(TraceViewModel.PropHasWarning, oldHas, this.HasWarning)

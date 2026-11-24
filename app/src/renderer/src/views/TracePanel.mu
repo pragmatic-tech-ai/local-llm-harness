@@ -4,6 +4,7 @@
 import TraceViewModel from "../TraceViewModel.js"
 import TraceTurnViewModel from "../TraceViewModel.js"
 import TraceStepViewModel from "../TraceViewModel.js"
+import TraceToolViewModel from "../TraceViewModel.js"
 
 resources TracePanelResources {
     ItemsPanelTemplate x:key="TraceStackPanel" {
@@ -48,6 +49,11 @@ resources TracePanelResources {
         }
     }
 
+    // A tool sub-row of a step.
+    DataTemplate [ DataType = TraceToolViewModel ] {
+        TextBlock [ Text = $Text, Style = @BodySm, FontFamily = "Consolas" ]
+    }
+
     // A step: fill text + bar (the context-bar style, smaller), then out/think/load/ttft/gen/rate, tool rows, error.
     DataTemplate [ DataType = TraceStepViewModel ] {
         StackPanel [ Orientation = Vertical, Margin = (0,2,0,2) ] {
@@ -58,9 +64,10 @@ resources TracePanelResources {
                     Border [ Fill = @Fg2, CornerRadius = 3, HorizontalAlignment = Left, Width = $BarWidth ]
                 }
             }
-            TextBlock [ Text = $StatsText, Style = @BodySm, Foreground = @Fg2, FontFamily = "Consolas", TextWrapping = Wrap ]
-            TextBlock [ Text = $ToolsText, Style = @BodySm, FontFamily = "Consolas", Margin = (12,0,0,0),
-                        Visibility = $HasTools << ToVisibility ]
+            // No wrapping: the Wrap path re-joins words with single spaces, losing the double-space separators.
+            TextBlock [ Text = $StatsText, Style = @BodySm, Foreground = @Fg2, FontFamily = "Consolas" ]
+            ItemsControl [ ItemsSource = $Tools, ItemsPanel = @TraceStackPanel, Margin = (12,0,0,0),
+                           Visibility = $HasTools << ToVisibility ]
             TextBlock [ Text = $ErrorText, Style = @BodySm, Foreground = @StateDanger, TextWrapping = Wrap,
                         Visibility = $HasError << ToVisibility ]
         }
