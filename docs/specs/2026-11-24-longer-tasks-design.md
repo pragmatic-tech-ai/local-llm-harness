@@ -140,7 +140,7 @@ Every file tool, read and write, takes paths relative to the session's write fol
   existing ancestor, and that ancestor must lie inside the write folder. Every file tool,
   read or write, first creates the write folder if it is missing. That way the folder always
   exists, and is canonical, before any path is checked against it. Comparisons are made between
-  canonical paths, as `Sandbox::resolve` does today, so Windows `\?\` prefixes and case are
+  canonical paths, as `Sandbox::resolve` does today, so Windows `\\?\` prefixes and case are
   handled the same way. A symlink or junction
   that leads out is refused with `path escapes the sandbox`.
 - **Displayed paths.** Paths in tool results stay relative and never expose host paths. Paths
