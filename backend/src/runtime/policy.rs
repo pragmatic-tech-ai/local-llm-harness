@@ -13,19 +13,31 @@ pub trait ToolPolicy: Send + Sync {
     fn decide(&self, spec: &ToolSpec, args: &Value) -> Decision;
 }
 
-/// Allows only tools that declare no side effects.
-pub struct ReadOnlyPolicy;
+/// Allows every call: the executor already refuses tools the agent has not enabled, so the
+/// template's tool list is the only gate.
+pub struct EnabledPolicy;
 
-impl ReadOnlyPolicy {
-    const DENY_REASON: &'static str = "tool has side effects; not allowed by the read-only policy";
+impl ToolPolicy for EnabledPolicy {
+    fn decide(&self, _spec: &ToolSpec, _args: &Value) -> Decision {
+        Decision::Allow
+    }
 }
 
-impl ToolPolicy for ReadOnlyPolicy {
-    fn decide(&self, spec: &ToolSpec, _args: &Value) -> Decision {
-        if spec.side_effects {
-            Decision::Deny(Self::DENY_REASON.to_string())
-        } else {
-            Decision::Allow
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn enabled_policy_allows_side_effects() {
+        for side_effects in [false, true] {
+            let spec = ToolSpec {
+                name: "t".into(),
+                description: String::new(),
+                parameters: json!({}),
+                side_effects,
+            };
+            assert_eq!(EnabledPolicy.decide(&spec, &json!({})), Decision::Allow);
         }
     }
 }

@@ -113,6 +113,25 @@ impl Tool for FlagTool {
     }
 }
 
+/// Reports the write folder from its context's scope.
+pub(crate) struct ScopeTool;
+
+#[async_trait]
+impl Tool for ScopeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "scope".into(),
+            description: "Reports its scope".into(),
+            parameters: json!({"type": "object"}),
+            side_effects: false,
+        }
+    }
+
+    async fn call(&self, _args: Value, ctx: &ToolContext) -> ToolOutcome {
+        ToolOutcome::Ok(json!({"workspace": ctx.scope.workspace}))
+    }
+}
+
 /// A `ToolSource` over a fixed list of tools.
 pub(crate) struct TestSource {
     tools: Vec<Arc<dyn Tool>>,
@@ -141,6 +160,10 @@ impl TestSource {
 
     pub(crate) fn writer_boxed() -> Box<dyn ToolSource> {
         Box::new(Self::new(vec![Arc::new(WriterTool)]))
+    }
+
+    pub(crate) fn scope_boxed() -> Box<dyn ToolSource> {
+        Box::new(Self::new(vec![Arc::new(ScopeTool)]))
     }
 }
 

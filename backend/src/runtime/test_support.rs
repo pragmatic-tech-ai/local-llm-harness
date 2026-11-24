@@ -354,7 +354,7 @@ impl TestRuntime {
 
     fn over(dir: TempDir, link: Arc<FakeLink>) -> Self {
         use super::executor::ToolExecutor;
-        use super::policy::ReadOnlyPolicy;
+        use super::policy::EnabledPolicy;
         use super::registry::ToolRegistry;
         use super::test_tools::TestSource;
         use crate::agents::dispatcher::{Dispatcher, ExplicitLoadPolicy};
@@ -366,7 +366,7 @@ impl TestRuntime {
             Arc::new(ToolRegistry::new(vec![TestSource::echo_boxed()]).expect("registry"));
         let executor = Arc::new(ToolExecutor::new(
             registry.clone(),
-            Box::new(ReadOnlyPolicy),
+            Box::new(EnabledPolicy),
             Self::TOOL_TIMEOUT,
         ));
         let host = FakeHost::serving_with_link(Self::HOST, &[(Self::RUNTIME, Self::MODEL)], link);

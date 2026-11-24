@@ -10,6 +10,7 @@ pub mod tool;
 pub mod tool_loop;
 pub mod trace;
 pub mod worker;
+pub mod workspace;
 
 #[cfg(test)]
 pub(crate) mod test_support;

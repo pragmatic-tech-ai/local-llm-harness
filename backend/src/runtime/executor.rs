@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use super::policy::{Decision, ToolPolicy};
 use super::registry::ToolRegistry;
-use super::tool::{ToolCallRequest, ToolContext, ToolOutcome};
+use super::tool::{ToolCallRequest, ToolContext, ToolOutcome, ToolScope};
 
 /// Minimal JSON-schema subset check: object args, `required`, and primitive `type`s.
 pub struct SchemaCheck;
@@ -73,7 +73,13 @@ impl ToolExecutor {
     }
 
     /// Order: parse error, unknown tool, not enabled for this agent, policy, schema, run.
-    pub async fn execute(&self, call: &ToolCallRequest, enabled: &[String]) -> ToolOutcome {
+    /// The tool sees a clone of `scope` in its context.
+    pub async fn execute(
+        &self,
+        call: &ToolCallRequest,
+        enabled: &[String],
+        scope: &ToolScope,
+    ) -> ToolOutcome {
         if let Some(e) = &call.parse_error {
             return ToolOutcome::Err(format!("could not parse tool call: {e}"));
         }
@@ -96,6 +102,7 @@ impl ToolExecutor {
         }
         let ctx = ToolContext {
             call_id: call.id.clone(),
+            scope: scope.clone(),
         };
         let call_args = call.arguments.clone();
         let mut handle = tokio::spawn(async move { tool.call(call_args, &ctx).await });
@@ -122,11 +129,11 @@ impl ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::policy::ReadOnlyPolicy;
+    use crate::runtime::policy::EnabledPolicy;
     use crate::runtime::test_tools::TestSource;
-    use crate::runtime::tool::ToolSource;
-    use crate::runtime::tool::ToolSpec;
+    use crate::runtime::tool::{ToolScope, ToolSource, ToolSpec};
     use serde_json::json;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct AskPolicy;
@@ -142,7 +149,7 @@ mod tests {
     impl Fixture {
         fn executor(source: Box<dyn ToolSource>, timeout: Duration) -> ToolExecutor {
             let reg = ToolRegistry::new(vec![source]).unwrap();
-            ToolExecutor::new(Arc::new(reg), Box::new(ReadOnlyPolicy), timeout)
+            ToolExecutor::new(Arc::new(reg), Box::new(EnabledPolicy), timeout)
         }
 
         /// Every tool name `ex`'s registry holds, all enabled.
@@ -178,7 +185,11 @@ mod tests {
     async fn executor_reports_unknown_tool() {
         let ex = Fixture::executor(TestSource::echo_boxed(), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("nope", json!({})), &Fixture::all(&ex))
+            .execute(
+                &Fixture::call("nope", json!({})),
+                &Fixture::all(&ex),
+                &ToolScope::default(),
+            )
             .await;
         assert_eq!(out, ToolOutcome::Err("unknown tool: nope".into()));
     }
@@ -188,7 +199,11 @@ mod tests {
         let ex = Fixture::executor(TestSource::writer_boxed(), Duration::from_secs(1));
         let enabled = vec!["echo".to_string()];
         let out = ex
-            .execute(&Fixture::call("writer", json!({})), &enabled)
+            .execute(
+                &Fixture::call("writer", json!({})),
+                &enabled,
+                &ToolScope::default(),
+            )
             .await;
         assert_eq!(
             out,
@@ -196,7 +211,11 @@ mod tests {
         );
         // Unknown wins over not-enabled.
         let out = ex
-            .execute(&Fixture::call("nope", json!({})), &enabled)
+            .execute(
+                &Fixture::call("nope", json!({})),
+                &enabled,
+                &ToolScope::default(),
+            )
             .await;
         assert_eq!(out, ToolOutcome::Err("unknown tool: nope".into()));
     }
@@ -207,28 +226,68 @@ mod tests {
         let mut call = Fixture::call("echo", json!({}));
         call.parse_error = Some("bad".into());
         assert_eq!(
-            ex.execute(&call, &Fixture::all(&ex)).await,
+            ex.execute(&call, &Fixture::all(&ex), &ToolScope::default())
+                .await,
             ToolOutcome::Err("could not parse tool call: bad".into())
         );
     }
 
     #[tokio::test]
-    async fn executor_denies_side_effects_under_read_only() {
+    async fn executor_runs_side_effect_tool_when_enabled() {
+        let ex = Fixture::executor(TestSource::writer_boxed(), Duration::from_secs(1));
+        let enabled = vec!["writer".to_string()];
+        let out = ex
+            .execute(
+                &Fixture::call("writer", json!({})),
+                &enabled,
+                &ToolScope::default(),
+            )
+            .await;
+        assert_eq!(out, ToolOutcome::Ok(json!({"written": true})));
+    }
+
+    #[tokio::test]
+    async fn executor_refuses_side_effect_tool_when_not_enabled() {
         let ex = Fixture::executor(TestSource::writer_boxed(), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("writer", json!({})), &Fixture::all(&ex))
+            .execute(
+                &Fixture::call("writer", json!({})),
+                &[],
+                &ToolScope::default(),
+            )
             .await;
         assert_eq!(
             out,
-            ToolOutcome::Err("tool has side effects; not allowed by the read-only policy".into())
+            ToolOutcome::Err("tool not enabled for this agent: writer".into())
         );
+    }
+
+    #[tokio::test]
+    async fn executor_passes_scope_to_tool() {
+        let ex = Fixture::executor(TestSource::scope_boxed(), Duration::from_secs(1));
+        let scope = ToolScope {
+            workspace: Some(PathBuf::from("shared")),
+            session: None,
+        };
+        let out = ex
+            .execute(
+                &Fixture::call("scope", json!({})),
+                &Fixture::all(&ex),
+                &scope,
+            )
+            .await;
+        assert_eq!(out, ToolOutcome::Ok(json!({"workspace": "shared"})));
     }
 
     #[tokio::test]
     async fn executor_times_out() {
         let ex = Fixture::executor(TestSource::slow_boxed(), Duration::from_millis(50));
         let out = ex
-            .execute(&Fixture::call("slow", json!({})), &Fixture::all(&ex))
+            .execute(
+                &Fixture::call("slow", json!({})),
+                &Fixture::all(&ex),
+                &ToolScope::default(),
+            )
             .await;
         assert_eq!(out, ToolOutcome::Err("tool timed out after 0.05s".into()));
     }
@@ -249,6 +308,7 @@ mod tests {
             .execute(
                 &Fixture::call("echo", json!({"text":"x"})),
                 &Fixture::all(&ex),
+                &ToolScope::default(),
             )
             .await;
         assert_eq!(
@@ -261,7 +321,11 @@ mod tests {
     async fn executor_reports_panicking_tool_as_error() {
         let ex = Fixture::executor(TestSource::panic_boxed(), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("panic", json!({})), &Fixture::all(&ex))
+            .execute(
+                &Fixture::call("panic", json!({})),
+                &Fixture::all(&ex),
+                &ToolScope::default(),
+            )
             .await;
         match out {
             ToolOutcome::Err(m) => assert!(m.starts_with("tool panicked")),
@@ -277,7 +341,11 @@ mod tests {
             Duration::from_millis(50),
         );
         let out = ex
-            .execute(&Fixture::call("flag", json!({})), &Fixture::all(&ex))
+            .execute(
+                &Fixture::call("flag", json!({})),
+                &Fixture::all(&ex),
+                &ToolScope::default(),
+            )
             .await;
         assert!(!out.is_ok());
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -298,6 +366,7 @@ mod tests {
             .execute(
                 &Fixture::call("echo", json!({"text":"x"})),
                 &Fixture::all(&ex),
+                &ToolScope::default(),
             )
             .await;
         assert_eq!(out, ToolOutcome::Ok(json!({"text":"x"})));
@@ -307,7 +376,11 @@ mod tests {
     async fn executor_rejects_invalid_arguments() {
         let ex = Fixture::executor(TestSource::echo_boxed(), Duration::from_secs(1));
         let out = ex
-            .execute(&Fixture::call("echo", json!({})), &Fixture::all(&ex))
+            .execute(
+                &Fixture::call("echo", json!({})),
+                &Fixture::all(&ex),
+                &ToolScope::default(),
+            )
             .await;
         match out {
             ToolOutcome::Err(m) => assert!(m.starts_with("invalid arguments: ")),

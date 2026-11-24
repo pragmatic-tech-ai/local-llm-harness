@@ -8,7 +8,7 @@ use backend::runtime::builtin::{BuiltinSource, Sandbox};
 use backend::runtime::catalog_source::DiscoveredCatalog;
 use backend::runtime::executor::ToolExecutor;
 use backend::runtime::hub::Hub;
-use backend::runtime::policy::ReadOnlyPolicy;
+use backend::runtime::policy::EnabledPolicy;
 use backend::runtime::registry::ToolRegistry;
 use backend::runtime::server::{PlacementWatcher, RuntimeDeps, RuntimeServer};
 use backend::runtime::tool_loop::ToolLoop;
@@ -232,7 +232,7 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
     let registry = Arc::new(Config::tool_registry(&catalog)?);
     let executor = Arc::new(ToolExecutor::new(
         registry.clone(),
-        Box::new(ReadOnlyPolicy),
+        Box::new(EnabledPolicy),
         Config::TOOL_TIMEOUT,
     ));
     let tool_loop = Arc::new(ToolLoop::new(executor, registry.clone()));
@@ -425,7 +425,7 @@ exe = \"x\"
         let registry = DataDir::registry();
         let executor = Arc::new(ToolExecutor::new(
             registry.clone(),
-            Box::new(ReadOnlyPolicy),
+            Box::new(EnabledPolicy),
             Config::TOOL_TIMEOUT,
         ));
         let tool_loop = Arc::new(ToolLoop::new(executor, registry.clone()));

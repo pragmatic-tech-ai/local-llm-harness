@@ -15,7 +15,7 @@ use serde_json::{json, Map, Value};
 use super::compaction::Compactor;
 use super::executor::ToolExecutor;
 use super::registry::ToolRegistry;
-use super::tool::ToolCallRequest;
+use super::tool::{ToolCallRequest, ToolScope};
 use super::trace::{CompactionRecord, StepOutcome, StepRecord, ToolTiming, TurnTrace};
 use super::worker::{GenerateRequest, LinkError, Note, WorkerLink};
 use crate::engine::tool_format::{NoThinkCounter, ParsedCall, ThinkCounter, ThinkCounters};
@@ -427,7 +427,11 @@ impl ToolLoop {
                 let started = Instant::now();
                 let outcome = self
                     .executor
-                    .execute(&Self::request_of(call), &config.tools)
+                    .execute(
+                        &Self::request_of(call),
+                        &config.tools,
+                        &ToolScope::default(),
+                    )
                     .await;
                 let ms = StepMeter::millis(started.elapsed());
                 let result = outcome.result_value();
@@ -716,7 +720,7 @@ mod tests {
     use crate::agents::template::{CompactionState, ContextStrategy, DEFAULT_COMPACT_AT_PCT};
     use crate::engine::template::ChatTemplate;
     use crate::runtime::compaction::{Summarize, SummaryNote, SummarySink, Trim};
-    use crate::runtime::policy::ReadOnlyPolicy;
+    use crate::runtime::policy::EnabledPolicy;
     use crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink, Scripted};
     use crate::runtime::test_tools::TestSource;
     use crate::runtime::tool::ToolSource;
@@ -825,7 +829,7 @@ mod tests {
             let registry = Arc::new(ToolRegistry::new(sources).expect("registry"));
             let executor = Arc::new(ToolExecutor::new(
                 registry.clone(),
-                Box::new(ReadOnlyPolicy),
+                Box::new(EnabledPolicy),
                 Duration::from_secs(5),
             ));
             Self {
