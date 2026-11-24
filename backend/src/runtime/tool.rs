@@ -111,6 +111,7 @@ pub struct ToolCallRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::FakeSession;
 
     #[test]
     fn outcome_result_value_wraps_errors() {
@@ -122,26 +123,10 @@ mod tests {
         assert!(ToolOutcome::Ok(json!(1)).is_ok());
     }
 
-    struct Alive(bool);
-
-    impl SessionHandle for Alive {
-        fn notes(&self) -> Option<Vec<String>> {
-            self.0.then(Vec::new)
-        }
-
-        fn set_notes(&self, _notes: Vec<String>) -> bool {
-            self.0
-        }
-
-        fn exists(&self) -> bool {
-            self.0
-        }
-    }
-
     #[test]
     fn scope_compares_sessions_by_identity() {
-        let a: Arc<dyn SessionHandle> = Arc::new(Alive(true));
-        let b: Arc<dyn SessionHandle> = Arc::new(Alive(true));
+        let a: Arc<dyn SessionHandle> = FakeSession::alive();
+        let b: Arc<dyn SessionHandle> = FakeSession::alive();
         let with = |s: &Arc<dyn SessionHandle>| ToolScope {
             workspace: Some(PathBuf::from("shared")),
             session: Some(s.clone()),
@@ -162,12 +147,12 @@ mod tests {
         assert!(!ToolScope::default().session_deleted());
         let gone = ToolScope {
             workspace: None,
-            session: Some(Arc::new(Alive(false))),
+            session: Some(FakeSession::deleted()),
         };
         assert!(gone.session_deleted());
         let live = ToolScope {
             workspace: None,
-            session: Some(Arc::new(Alive(true))),
+            session: Some(FakeSession::alive()),
         };
         assert!(!live.session_deleted());
     }

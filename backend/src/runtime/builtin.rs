@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,8 +27,21 @@ impl Sandbox {
     pub const NOT_RELATIVE: &'static str = "path must be relative to the sandbox";
     pub const ESCAPES: &'static str = "path escapes the sandbox";
     const NO_SUCH_PATH: &'static str = "no such path: ";
-    const CURRENT: &'static str = ".";
-    const SEPARATOR: &'static str = "/";
+    const INVALID_NAME: &'static str = "invalid file name: ";
+    /// The display form of a folder itself.
+    pub(crate) const CURRENT: &'static str = ".";
+    /// The separator of displayed paths.
+    pub(crate) const SEPARATOR: &'static str = "/";
+    /// Windows device names, reserved with or without an extension, in any case.
+    const RESERVED: [&'static str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    /// Marks an alternate data stream (`name:stream`) or a drive.
+    const STREAM_MARK: char = ':';
+    const EXTENSION_MARK: char = '.';
+    /// Trailing characters Windows silently strips from a name.
+    const STRIPPED_TAIL: [char; 2] = ['.', ' '];
 
     /// Canonicalises the root; fails if it does not exist.
     pub fn new(root: &Path) -> std::io::Result<Self> {
@@ -60,7 +74,8 @@ impl Sandbox {
     }
 
     /// Lexically normalises a relative path to its plain (`Normal`) components. Anchored or
-    /// absolute paths, and `..` that climbs above the start, are refused.
+    /// absolute paths, `..` that climbs above the start, and names Windows would misread
+    /// (see [`Self::check_name`]) are refused.
     pub fn normalise(rel: &Path) -> Result<PathBuf, String> {
         let anchored = rel
             .components()
@@ -73,7 +88,10 @@ impl Sandbox {
         let mut stack: Vec<&std::ffi::OsStr> = Vec::new();
         for component in rel.components() {
             match component {
-                Component::Normal(part) => stack.push(part),
+                Component::Normal(part) => {
+                    Self::check_name(part)?;
+                    stack.push(part)
+                }
                 Component::ParentDir => {
                     if stack.pop().is_none() {
                         return Err(Self::ESCAPES.to_string());
@@ -83,6 +101,23 @@ impl Sandbox {
             }
         }
         Ok(stack.into_iter().collect())
+    }
+
+    /// Refuses a path component that Windows would not take as the plain name it reads as: a
+    /// reserved device name (`CON`, `nul.txt`, `com1 .log`), a `:` (an alternate data stream),
+    /// or a trailing dot or space (stripped, so the name would alias another).
+    fn check_name(part: &std::ffi::OsStr) -> Result<(), String> {
+        let name = part.to_string_lossy();
+        let stem = name
+            .split(Self::EXTENSION_MARK)
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(Self::STRIPPED_TAIL);
+        let reserved = Self::RESERVED.iter().any(|r| r.eq_ignore_ascii_case(stem));
+        if reserved || name.contains(Self::STREAM_MARK) || name.ends_with(Self::STRIPPED_TAIL) {
+            return Err(format!("{}{name}", Self::INVALID_NAME));
+        }
+        Ok(())
     }
 
     pub fn no_such_path(shown: &str) -> String {
@@ -224,7 +259,6 @@ struct FileWork;
 impl FileWork {
     const PATH: &'static str = "path";
     const CONTENT: &'static str = "content";
-    const CURRENT: &'static str = ".";
     const PATH_NOT_STRING: &'static str = "path must be a string";
     const CONTENT_NOT_STRING: &'static str = "content must be a string";
     const TASK_FAILED: &'static str = "tool task failed: ";
@@ -233,28 +267,26 @@ impl FileWork {
         "Paths are relative to your workspace; prefix /sandbox/ to read elsewhere in the sandbox.";
     const WRITE_HINT: &'static str = "Paths are relative to your workspace.";
 
-    /// Runs `work` on the blocking pool against the call's write folder.
+    /// Runs `work` on the blocking pool against the call's write folder. Every file tool,
+    /// reads included, is refused with `session deleted` once the call's session is gone; the
+    /// check runs on the blocking pool right before `work`, which opens the folder first, so
+    /// a session deleted while the call waited for a thread never gets its folder back.
     async fn run<F>(ctx: &ToolContext, work: F) -> ToolOutcome
     where
         F: FnOnce(Option<&Path>) -> Result<Value, String> + Send + 'static,
     {
-        let folder = ctx.scope.workspace.clone();
-        match tokio::task::spawn_blocking(move || work(folder.as_deref())).await {
+        let scope = ctx.scope.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            if scope.session_deleted() {
+                return Err(Self::SESSION_DELETED.to_string());
+            }
+            work(scope.workspace.as_deref())
+        });
+        match task.await {
             Ok(Ok(value)) => ToolOutcome::Ok(value),
             Ok(Err(e)) => ToolOutcome::Err(e),
             Err(e) => ToolOutcome::Err(format!("{}{e}", Self::TASK_FAILED)),
         }
-    }
-
-    /// Like `run`, but refused first when the call's session has been deleted.
-    async fn run_write<F>(ctx: &ToolContext, work: F) -> ToolOutcome
-    where
-        F: FnOnce(Option<&Path>) -> Result<Value, String> + Send + 'static,
-    {
-        if ctx.scope.session_deleted() {
-            return ToolOutcome::Err(Self::SESSION_DELETED.to_string());
-        }
-        Self::run(ctx, work).await
     }
 
     /// The string argument `key`, or `err` when it is missing or not a string.
@@ -277,9 +309,9 @@ impl FileWork {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": description}
+                Self::PATH: {"type": "string", "description": description}
             },
-            "required": ["path"]
+            "required": [Self::PATH]
         })
     }
 
@@ -287,10 +319,10 @@ impl FileWork {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": path},
-                "content": {"type": "string", "description": content}
+                Self::PATH: {"type": "string", "description": path},
+                Self::CONTENT: {"type": "string", "description": content}
             },
-            "required": ["path", "content"]
+            "required": [Self::PATH, Self::CONTENT]
         })
     }
 }
@@ -343,7 +375,7 @@ impl ListDirTool {
     const NOTE: &'static str = "note";
 
     fn list(sandbox: &Sandbox, folder: Option<&Path>, rel: &str) -> Result<Value, String> {
-        let workspace = Workspace::open(sandbox, folder)?;
+        let workspace = Workspace::open_read(sandbox, folder, rel)?;
         let dir = workspace.resolve_read(rel)?;
         if !dir.is_dir() {
             return Err(Self::NOT_A_DIRECTORY.to_string());
@@ -402,7 +434,7 @@ impl Tool for ListDirTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": Self::PATH_DESCRIPTION}
+                    FileWork::PATH: {"type": "string", "description": Self::PATH_DESCRIPTION}
                 }
             }),
             side_effects: false,
@@ -411,7 +443,7 @@ impl Tool for ListDirTool {
 
     async fn call(&self, args: Value, ctx: &ToolContext) -> ToolOutcome {
         let rel = match args.get(FileWork::PATH) {
-            None | Some(Value::Null) => FileWork::CURRENT.to_string(),
+            None | Some(Value::Null) => Sandbox::CURRENT.to_string(),
             Some(Value::String(s)) => s.clone(),
             Some(_) => return ToolOutcome::Err(FileWork::PATH_NOT_STRING.to_string()),
         };
@@ -430,6 +462,7 @@ impl ReadFileTool {
     const DESCRIPTION: &'static str = "Read a UTF-8 text file (up to 65536 bytes).";
     const PATH_DESCRIPTION: &'static str = "File to read";
     const MAX_BYTES: &'static str = "max_bytes";
+    const MAX_BYTES_DESCRIPTION: &'static str = "Maximum bytes to read (capped at 65536)";
     const IS_DIRECTORY: &'static str = "path is a directory, not a file";
     const CANNOT_READ: &'static str = "cannot read file: ";
     const NOT_UTF8: &'static str = "file is not valid UTF-8 text";
@@ -441,7 +474,7 @@ impl ReadFileTool {
         rel: &str,
         cap: u64,
     ) -> Result<Value, String> {
-        let workspace = Workspace::open(sandbox, folder)?;
+        let workspace = Workspace::open_read(sandbox, folder, rel)?;
         let path = workspace.resolve_read(rel)?;
         if path.is_dir() {
             return Err(Self::IS_DIRECTORY.to_string());
@@ -480,10 +513,10 @@ impl Tool for ReadFileTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": Self::PATH_DESCRIPTION},
-                    "max_bytes": {"type": "integer", "description": "Maximum bytes to read (capped at 65536)"}
+                    FileWork::PATH: {"type": "string", "description": Self::PATH_DESCRIPTION},
+                    Self::MAX_BYTES: {"type": "integer", "description": Self::MAX_BYTES_DESCRIPTION}
                 },
-                "required": ["path"]
+                "required": [FileWork::PATH]
             }),
             side_effects: false,
         }
@@ -517,6 +550,7 @@ impl WriteFileTool {
         "Create or overwrite a text file in your workspace, creating missing parent folders.";
     const PATH_DESCRIPTION: &'static str = "File to write";
     const CONTENT_DESCRIPTION: &'static str = "The whole new content (at most 262144 bytes)";
+    const TEMP_PREFIX: &'static str = ".wf-";
     const TEMP_SUFFIX: &'static str = ".tmp";
     const NO_PARENT: &'static str = "path has no parent folder";
 
@@ -537,17 +571,18 @@ impl WriteFileTool {
     /// Writes a temp file beside `target`, then renames it over `target`, so an interrupted
     /// write never leaves half a file.
     fn replace(target: &Path, bytes: &[u8]) -> Result<(), String> {
-        let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        // Counts temp files within this process; with the process id it keeps names unique.
+        static NEXT_TEMP: AtomicU32 = AtomicU32::new(0);
+        let Some(parent) = target.parent() else {
             return Err(Self::NO_PARENT.to_string());
         };
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        // A short, fixed-width name, so a target whose own name is near the 255-character
+        // limit still gets a temp file beside it.
         let temp = parent.join(format!(
-            ".{}.{}-{nanos}{}",
-            name.to_string_lossy(),
+            "{}{:08x}{:08x}{}",
+            Self::TEMP_PREFIX,
             std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
             Self::TEMP_SUFFIX
         ));
         let written = fs::OpenOptions::new()
@@ -587,7 +622,7 @@ impl Tool for WriteFileTool {
             Err(out) => return out,
         };
         let sandbox = self.sandbox.clone();
-        FileWork::run_write(ctx, move |folder| {
+        FileWork::run(ctx, move |folder| {
             Self::write(&sandbox, folder, &path, &content)
         })
         .await
@@ -625,6 +660,9 @@ impl AppendFileTool {
         if size > WriteLimits::MAX_FILE_BYTES {
             return Err(WriteLimits::FILE_TOO_LARGE.to_string());
         }
+        // Accepted limitation: a hard link already in the write folder is appended through,
+        // since it cannot be told from an ordinary file. No tool creates links, so only a user
+        // on the host can plant one (see the spec's anti-goals).
         fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -655,7 +693,7 @@ impl Tool for AppendFileTool {
             Err(out) => return out,
         };
         let sandbox = self.sandbox.clone();
-        FileWork::run_write(ctx, move |folder| {
+        FileWork::run(ctx, move |folder| {
             Self::append(&sandbox, folder, &path, &content)
         })
         .await
@@ -705,7 +743,7 @@ impl Tool for MakeDirTool {
             Err(out) => return out,
         };
         let sandbox = self.sandbox.clone();
-        FileWork::run_write(ctx, move |folder| Self::make(&sandbox, folder, &path)).await
+        FileWork::run(ctx, move |folder| Self::make(&sandbox, folder, &path)).await
     }
 }
 
@@ -726,14 +764,17 @@ impl DeletePathTool {
 
     fn delete(sandbox: &Sandbox, folder: Option<&Path>, path: &str) -> Result<Value, String> {
         let workspace = Workspace::open(sandbox, folder)?;
-        let target = workspace.resolve_write(path)?;
+        // The leaf is not followed: a link is deleted itself, never its target.
+        let target = workspace.resolve_leaf(path)?;
         if workspace.is_root(&target) {
             return Err(Self::ROOT.to_string());
         }
         let meta = fs::symlink_metadata(&target).map_err(|_| Sandbox::no_such_path(path))?;
         let shown = workspace.display(&target);
         let cannot = |e: std::io::Error| format!("{}{e}", Self::CANNOT_DELETE);
-        let deleted = if meta.is_dir() {
+        let deleted = if meta.file_type().is_symlink() {
+            Self::remove_link(&target).map_err(cannot)?
+        } else if meta.is_dir() {
             if fs::read_dir(&target).map_err(cannot)?.next().is_some() {
                 return Err(Self::NOT_EMPTY.to_string());
             }
@@ -744,6 +785,21 @@ impl DeletePathTool {
             Self::FILE
         };
         Ok(json!({"path": shown, "deleted": deleted}))
+    }
+
+    /// Removes the link at `link` (a symlink or, on Windows, a junction) and not its target;
+    /// reports it as a folder or a file by the kind of link.
+    fn remove_link(link: &Path) -> std::io::Result<&'static str> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            if fs::symlink_metadata(link)?.file_type().is_symlink_dir() {
+                fs::remove_dir(link)?;
+                return Ok(Self::DIR);
+            }
+        }
+        fs::remove_file(link)?;
+        Ok(Self::FILE)
     }
 }
 
@@ -764,7 +820,7 @@ impl Tool for DeletePathTool {
             Err(out) => return out,
         };
         let sandbox = self.sandbox.clone();
-        FileWork::run_write(ctx, move |folder| Self::delete(&sandbox, folder, &path)).await
+        FileWork::run(ctx, move |folder| Self::delete(&sandbox, folder, &path)).await
     }
 }
 
@@ -811,8 +867,9 @@ impl ToolSource for BuiltinSource {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::runtime::tool::{SessionHandle, ToolScope};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use crate::runtime::test_support::FakeSession;
+    use crate::runtime::tool::ToolScope;
+    use std::sync::atomic::AtomicU64;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -882,25 +939,6 @@ pub(crate) mod tests {
                 .output()
                 .unwrap();
             assert!(made.status.success(), "mklink failed");
-        }
-    }
-
-    /// A session handle whose existence the test controls.
-    struct FakeSession {
-        alive: AtomicBool,
-    }
-
-    impl SessionHandle for FakeSession {
-        fn notes(&self) -> Option<Vec<String>> {
-            self.exists().then(Vec::new)
-        }
-
-        fn set_notes(&self, _notes: Vec<String>) -> bool {
-            self.exists()
-        }
-
-        fn exists(&self) -> bool {
-            self.alive.load(Ordering::SeqCst)
         }
     }
 
@@ -1488,9 +1526,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn write_after_session_deleted_is_refused() {
         let dir = TestDir::new();
-        let session = Arc::new(FakeSession {
-            alive: AtomicBool::new(false),
-        });
+        let session = FakeSession::deleted();
         let scope = ToolScope {
             workspace: Some(PathBuf::from(Writes::FOLDER)),
             session: Some(session.clone()),
@@ -1506,7 +1542,7 @@ pub(crate) mod tests {
             assert_eq!(out, Writes::err("session deleted"), "{tool}");
         }
         assert!(!dir.path.join("sessions").exists(), "nothing created");
-        session.alive.store(true, Ordering::SeqCst);
+        session.revive();
         for (tool, args) in calls {
             assert!(dir.run_scoped(tool, args, &scope).await.is_ok(), "{tool}");
         }
@@ -1560,5 +1596,162 @@ pub(crate) mod tests {
                 json!({"path": "/sandbox/n.txt", "content": "root", "bytes": 4, "truncated": false})
             )
         );
+    }
+
+    #[tokio::test]
+    async fn reads_after_session_deleted_are_refused_and_create_nothing() {
+        let dir = TestDir::new();
+        let scope = ToolScope {
+            workspace: Some(PathBuf::from(Writes::FOLDER)),
+            session: Some(FakeSession::deleted()),
+        };
+        let calls = [
+            ("list_dir", json!({})),
+            ("list_dir", json!({"path": "/sandbox"})),
+            ("read_file", json!({"path": "a.txt"})),
+        ];
+        for (tool, args) in calls {
+            let out = dir.run_scoped(tool, args, &scope).await;
+            assert_eq!(out, Writes::err("session deleted"), "{tool}");
+        }
+        assert!(!dir.path.join("sessions").exists(), "nothing created");
+    }
+
+    #[tokio::test]
+    async fn sandbox_reads_work_when_the_write_folder_cannot_be_made() {
+        let dir = TestDir::new();
+        // `sessions` is a file, so `sessions/s1` can never be created.
+        fs::write(dir.path.join("sessions"), "not a folder").unwrap();
+        fs::write(dir.path.join("notes.txt"), "n").unwrap();
+        let out = Writes::run(&dir, "read_file", json!({"path": "/sandbox/notes.txt"})).await;
+        assert_eq!(
+            out,
+            ToolOutcome::Ok(
+                json!({"path": "/sandbox/notes.txt", "content": "n", "bytes": 1, "truncated": false})
+            )
+        );
+        let ToolOutcome::Ok(v) = Writes::run(&dir, "list_dir", json!({"path": "/sandbox"})).await
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(v["path"], "/sandbox");
+        assert!(v.get("note").is_none());
+        // A read inside the write folder still needs the folder.
+        let ToolOutcome::Err(e) = Writes::run(&dir, "list_dir", json!({})).await else {
+            panic!("expected Err");
+        };
+        assert!(e.starts_with("cannot create workspace folder: "), "{e}");
+        assert!(dir.path.join("sessions").is_file());
+    }
+
+    #[test]
+    fn windows_hostile_names_are_refused() {
+        for (bad, name) in [
+            ("CON", "CON"),
+            ("con", "con"),
+            ("nul.txt", "nul.txt"),
+            ("Aux.tar.gz", "Aux.tar.gz"),
+            ("com1", "com1"),
+            ("LPT9.log", "LPT9.log"),
+            ("prn .txt", "prn .txt"),
+            ("sub/CON/x.txt", "CON"),
+            ("a.txt:stream", "a.txt:stream"),
+            ("notes:s", "notes:s"),
+            ("trailing.", "trailing."),
+            ("trailing ", "trailing "),
+            ("dir./x.txt", "dir."),
+        ] {
+            assert_eq!(
+                Sandbox::normalise(Path::new(bad)),
+                Err(format!("invalid file name: {name}")),
+                "{bad}"
+            );
+        }
+        for good in [
+            "console.txt",
+            "com10",
+            "lpt",
+            "nul_x",
+            ".hidden",
+            "a.b.c",
+            "sub/./x",
+            "x/..",
+        ] {
+            assert!(Sandbox::normalise(Path::new(good)).is_ok(), "{good}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_tools_refuse_hostile_names() {
+        let dir = TestDir::new();
+        let out = Writes::run(&dir, "write_file", json!({"path": "nul", "content": "x"})).await;
+        assert_eq!(out, Writes::err("invalid file name: nul"));
+        let out = Writes::run(
+            &dir,
+            "append_file",
+            json!({"path": "notes:s", "content": "x"}),
+        )
+        .await;
+        assert_eq!(out, Writes::err("invalid file name: notes:s"));
+        let out = Writes::run(&dir, "read_file", json!({"path": "CON"})).await;
+        assert_eq!(out, Writes::err("invalid file name: CON"));
+    }
+
+    #[tokio::test]
+    async fn write_file_takes_a_name_near_the_length_limit() {
+        let dir = TestDir::new();
+        let name = format!("{}.txt", "n".repeat(236));
+        assert_eq!(name.len(), 240);
+        let args = json!({"path": name, "content": "long"});
+        let out = Writes::run(&dir, "write_file", args).await;
+        assert_eq!(out, ToolOutcome::Ok(json!({"path": name, "bytes": 4})));
+        let folder = Writes::folder(&dir);
+        assert_eq!(fs::read_to_string(folder.join(&name)).unwrap(), "long");
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1, "no temp file");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn delete_inner_junction_removes_the_link_not_its_target() {
+        let dir = TestDir::new();
+        fs::create_dir_all(Writes::folder(&dir)).unwrap();
+        let inner = Writes::folder(&dir).join("data");
+        fs::create_dir(&inner).unwrap();
+        fs::write(inner.join("keep.txt"), "keep").unwrap();
+        let link = Writes::folder(&dir).join("link");
+        TestDir::junction(&link, &inner);
+        let out = Writes::run(&dir, "delete_path", json!({"path": "link"})).await;
+        assert_eq!(
+            out,
+            ToolOutcome::Ok(json!({"path": "link", "deleted": "dir"}))
+        );
+        assert!(fs::symlink_metadata(&link).is_err(), "link removed");
+        assert!(inner.join("keep.txt").is_file(), "target untouched");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn delete_junction_to_outside_removes_only_the_link() {
+        let dir = TestDir::new();
+        let outside = TestDir::new();
+        fs::write(outside.path.join("keep.txt"), "keep").unwrap();
+        fs::create_dir_all(Writes::folder(&dir)).unwrap();
+        let link = Writes::folder(&dir).join("out");
+        TestDir::junction(&link, &outside.path);
+        let out = Writes::run(&dir, "delete_path", json!({"path": "out"})).await;
+        // Remove the junction itself so cleanup never follows it, should the delete fail.
+        let _ = fs::remove_dir(&link);
+        assert_eq!(
+            out,
+            ToolOutcome::Ok(json!({"path": "out", "deleted": "dir"}))
+        );
+        assert!(outside.path.join("keep.txt").is_file());
+        // A link inside a junction to outside is still out of reach.
+        let link = Writes::folder(&dir).join("out2");
+        TestDir::junction(&link, &outside.path);
+        let out = Writes::run(&dir, "delete_path", json!({"path": "out2/keep.txt"})).await;
+        let _ = fs::remove_dir(&link);
+        assert_eq!(out, Writes::err("path escapes the sandbox"));
+        assert!(outside.path.join("keep.txt").is_file());
     }
 }

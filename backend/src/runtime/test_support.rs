@@ -1,7 +1,8 @@
 //! Fakes shared by runtime tests: a scripted worker link/connector, a recording sink, a temp
-//! dir and a complete `RuntimeDeps` builder ([`TestRuntime`]).
-//! Import as `crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink,
-//! Scripted, TempDir, TestRuntime}`.
+//! dir, a session handle ([`FakeSession`]) and a complete `RuntimeDeps` builder
+//! ([`TestRuntime`]).
+//! Import as `crate::runtime::test_support::{FakeConnector, FakeLink, FakeSession, Notes,
+//! RecordingSink, Scripted, TempDir, TestRuntime}`.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
+use super::tool::SessionHandle;
 use super::tool_loop::{LinkFailure, LoopSink, SinkClosed, StepLink, ToolLoop, TurnLinks};
 use super::worker::{GenerateRequest, LinkError, Note, PromptSize, WorkerLink};
 
@@ -295,6 +297,66 @@ impl LoopSink for RecordingSink {
         }
         self.notes.push(Notes::note(method, params));
         Ok(())
+    }
+}
+
+/// A session handle whose notes, existence and saves the test controls. A deleted session
+/// has no notes; [`Self::refusing_saves`] keeps reading its notes but fails every save.
+pub(crate) struct FakeSession {
+    notes: Mutex<Option<Vec<String>>>,
+    refuse_saves: bool,
+}
+
+impl FakeSession {
+    /// A live session with no notes.
+    pub(crate) fn alive() -> Arc<Self> {
+        Self::with(Some(Vec::new()), false)
+    }
+
+    /// A session that no longer exists.
+    pub(crate) fn deleted() -> Arc<Self> {
+        Self::with(None, false)
+    }
+
+    /// A live session whose notes read fine but whose every save fails.
+    pub(crate) fn refusing_saves() -> Arc<Self> {
+        Self::with(Some(Vec::new()), true)
+    }
+
+    /// Deletes the session (its notes go with it).
+    pub(crate) fn delete(&self) {
+        *self.notes.lock().expect("notes") = None;
+    }
+
+    /// Brings a deleted session back, with no notes.
+    pub(crate) fn revive(&self) {
+        *self.notes.lock().expect("notes") = Some(Vec::new());
+    }
+
+    fn with(notes: Option<Vec<String>>, refuse_saves: bool) -> Arc<Self> {
+        Arc::new(Self {
+            notes: Mutex::new(notes),
+            refuse_saves,
+        })
+    }
+}
+
+impl SessionHandle for FakeSession {
+    fn notes(&self) -> Option<Vec<String>> {
+        self.notes.lock().expect("notes").clone()
+    }
+
+    fn set_notes(&self, notes: Vec<String>) -> bool {
+        let mut guard = self.notes.lock().expect("notes");
+        if guard.is_none() || self.refuse_saves {
+            return false;
+        }
+        *guard = Some(notes);
+        true
+    }
+
+    fn exists(&self) -> bool {
+        self.notes.lock().expect("notes").is_some()
     }
 }
 

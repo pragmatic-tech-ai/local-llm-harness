@@ -53,7 +53,9 @@ Steps 5 (planning) and 6 (several agents) build on all three.
 ## Anti-goals
 
 - A write that lands outside the write folder, through `..`, an absolute path, the `/sandbox/`
-  prefix, or a symlink or junction.
+  prefix, or a symlink or junction. One accepted limitation: `append_file` writes through a hard link
+  already inside the write folder, because a hard link cannot be told from an ordinary file; only
+  a user on the host can plant one there (no tool creates links).
 - A read-only template that suddenly gains write access because of this change.
 - A delete that removes more than one file or one empty folder.
 - Notes that disappear when the transcript is trimmed or summarised.

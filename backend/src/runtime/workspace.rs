@@ -24,8 +24,6 @@ impl Workspace {
     const CANNOT_CREATE: &'static str = "cannot create workspace folder: ";
     const CANNOT_CREATE_PARENT: &'static str = "cannot create parent folders: ";
     const NOT_A_FOLDER: &'static str = "workspace folder must name a folder below the sandbox";
-    const CURRENT: &'static str = ".";
-    const SLASH: &'static str = "/";
     const BACKSLASH: char = '\\';
 
     /// Opens the write folder `folder` (relative to the sandbox; None is the sandbox root),
@@ -53,6 +51,29 @@ impl Workspace {
         })
     }
 
+    /// The workspace a read of `path` resolves in. A `/sandbox` read never touches the write
+    /// folder, so it neither creates the folder nor fails when the folder cannot be made (say,
+    /// `sessions` is a file); any other read opens the folder like a write does.
+    pub fn open_read(
+        sandbox: &Sandbox,
+        folder: Option<&Path>,
+        path: &str,
+    ) -> Result<Workspace, String> {
+        if Self::sandbox_relative(path).is_none() {
+            return Self::open(sandbox, folder);
+        }
+        let root = sandbox.root();
+        let folder = match folder {
+            // Only located, for display: the part that exists must still lie inside.
+            Some(folder) => Self::confine(root, &Sandbox::normalise(folder)?)?,
+            None => root.to_path_buf(),
+        };
+        Ok(Self {
+            sandbox: sandbox.clone(),
+            folder,
+        })
+    }
+
     /// Resolves a read path to an existing canonical path inside the sandbox.
     pub fn resolve_read(&self, path: &str) -> Result<PathBuf, String> {
         match Self::sandbox_relative(path) {
@@ -70,6 +91,21 @@ impl Workspace {
         }
         let rel = Sandbox::normalise(Path::new(path))?;
         Self::confine(&self.folder, &rel)
+    }
+
+    /// Resolves a write path without following its last component: the parent is confined
+    /// like any write path and the leaf name is joined as it is, so a link there is the link
+    /// itself. A path naming the folder itself resolves to the folder.
+    pub fn resolve_leaf(&self, path: &str) -> Result<PathBuf, String> {
+        if Self::sandbox_relative(path).is_some() {
+            return Err(Self::WRITES_CONFINED.to_string());
+        }
+        let rel = Sandbox::normalise(Path::new(path))?;
+        let Some(name) = rel.file_name() else {
+            return Ok(self.folder.clone());
+        };
+        let parent = Self::confine(&self.folder, rel.parent().unwrap_or(Path::new("")))?;
+        Ok(parent.join(name))
     }
 
     /// Resolves a write path and creates its missing parent folders, then resolves it again
@@ -90,14 +126,14 @@ impl Workspace {
     /// elsewhere in the sandbox. Never exposes the host path.
     pub fn display(&self, resolved: &Path) -> String {
         if let Ok(rel) = resolved.strip_prefix(&self.folder) {
-            return Sandbox::slashed(rel).unwrap_or_else(|| Self::CURRENT.to_string());
+            return Sandbox::slashed(rel).unwrap_or_else(|| Sandbox::CURRENT.to_string());
         }
         match resolved
             .strip_prefix(self.sandbox.root())
             .ok()
             .and_then(Sandbox::slashed)
         {
-            Some(rel) => format!("{}{}{rel}", Self::SANDBOX_PREFIX, Self::SLASH),
+            Some(rel) => format!("{}{}{rel}", Self::SANDBOX_PREFIX, Sandbox::SEPARATOR),
             None => Self::SANDBOX_PREFIX.to_string(),
         }
     }
@@ -145,7 +181,7 @@ impl Workspace {
     /// Backslashes count as slashes on Windows.
     fn sandbox_relative(path: &str) -> Option<String> {
         let unified = if cfg!(windows) {
-            path.replace(Self::BACKSLASH, Self::SLASH)
+            path.replace(Self::BACKSLASH, Sandbox::SEPARATOR)
         } else {
             path.to_string()
         };
@@ -153,7 +189,7 @@ impl Workspace {
         if rest.is_empty() {
             return Some(String::new());
         }
-        rest.strip_prefix(Self::SLASH).map(str::to_string)
+        rest.strip_prefix(Sandbox::SEPARATOR).map(str::to_string)
     }
 
     /// `base` (canonical) joined with `rel` (plain names), checked without following links
@@ -339,11 +375,16 @@ mod tests {
             .await,
             dir.run_scoped("make_dir", json!({"path": "link/made"}), &scope)
                 .await,
-            dir.run_scoped("delete_path", json!({"path": "link"}), &scope)
+            dir.run_scoped("delete_path", json!({"path": "link/new.txt"}), &scope)
                 .await,
         ];
         let outside_entries = fs::read_dir(&outside.path).unwrap().count();
         let shared_entries = fs::read_dir(&shared).unwrap().count();
+        // Deleting the junction itself removes the link, never what it points at.
+        let unlinked = dir
+            .run_scoped("delete_path", json!({"path": "link"}), &scope)
+            .await;
+        let link_gone = fs::symlink_metadata(&link).is_err();
         // Reads through the inner junction reach the shared folder: it is in the sandbox.
         let readable = ws.resolve_read("inner").is_ok();
         // Remove the junctions themselves so cleanup never follows them.
@@ -362,6 +403,12 @@ mod tests {
             "nothing written through the inner junction"
         );
         assert!(readable);
+        assert_eq!(
+            unlinked,
+            ToolOutcome::Ok(json!({"path": "link", "deleted": "dir"}))
+        );
+        assert!(link_gone);
+        assert!(outside.path.is_dir());
     }
 
     #[test]
