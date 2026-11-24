@@ -372,7 +372,7 @@ export class TraceViewModel extends Observable
     private resetPending = false
     /** The oldest turn number any page returned: the `before` of the next older page. */
     private oldestPaged: number | null = null
-    /** The last `trace_warning` for this session: kept until a switch to another session. */
+    /** The last `trace_warning` for this session: cleared by a switch to another session and by a successful page. */
     private noteWarning = ''
     /** The last failed page load: cleared by the next successful page and by every ShowSession. */
     private pageError = ''
@@ -416,8 +416,9 @@ export class TraceViewModel extends Observable
 
     /**
      * Shows a session's trace (null to show none): clears the list, follows that session's live records and loads the
-     * first page. Called on attach, on switch and after reconnect. A `trace_warning` is kept only when the session is
-     * the same; a page failure is always dropped (the reload retries it).
+     * first page. Called on attach, on switch and after reconnect. A `trace_warning` is kept across a same-session
+     * reload until its page loads; a page failure is always dropped (the reload retries it). A successful page clears
+     * both.
      */
     public async ShowSession(client: RuntimeClient | null, id: string | null): Promise<void>
     {
@@ -539,7 +540,12 @@ export class TraceViewModel extends Observable
 
     private ApplyPage(page: TracePage): void
     {
-        this.SetPageError('')
+        // A page loaded: the log reads fine again, so both a page failure and an earlier trace_warning are cleared.
+        this.UpdateWarning(() =>
+        {
+            this.pageError = ''
+            this.noteWarning = ''
+        })
         for (const t of page.turns)
         {
             this.ApplyPagedTurn(t)

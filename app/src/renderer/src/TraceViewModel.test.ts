@@ -266,7 +266,7 @@ describe('TraceViewModel', () =>
         expect(rig.trace.WarningText).toBe('trace unavailable: unknown session: s3')
     })
 
-    it('successful_reload_clears_a_page_failure_but_keeps_a_trace_warning', async () =>
+    it('successful_reload_clears_a_page_failure_and_a_trace_warning', async () =>
     {
         const rig = new Rig()
         const failing = rig.trace.ShowSession(rig.client, 's1')
@@ -276,14 +276,18 @@ describe('TraceViewModel', () =>
         // Same-session re-show (reconnect) succeeds: the page failure is gone.
         await rig.Show('s1', { turns: [Rig.Turn(1)], more: false, reset_pending: false })
         expect(rig.trace.HasWarning).toBe(false)
-        // A trace_warning note survives a same-session reload, beside a page failure while one stands.
+        // A trace_warning after the page loaded stays visible, also beside a failed same-session reload.
         rig.Notify('trace_warning', { id: 's1', message: 'trace write failed: disk full' })
+        rig.Notify('trace_step', { id: 's1', record: Rig.Step(2, 1) })
+        expect(rig.trace.WarningText).toBe('trace write failed: disk full')
         const again = rig.trace.ShowSession(rig.client, 's1')
         rig.client.HandleFrame(JSON.stringify({ id: rig.Frames('get_trace').pop()!.id, error: { code: -32603, message: 'busy' } }))
         await again
         expect(rig.trace.WarningText).toBe('trace write failed: disk full · trace unavailable: busy')
+        // The next successful reload clears both.
         await rig.Show('s1', { turns: [], more: false, reset_pending: false })
-        expect(rig.trace.WarningText).toBe('trace write failed: disk full')
+        expect(rig.trace.WarningText).toBe('')
+        expect(rig.trace.HasWarning).toBe(false)
     })
 
     it('failed_load_older_warns_keeps_more_and_can_retry', async () =>
