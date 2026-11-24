@@ -1,6 +1,7 @@
 // Session view (host area): a header line (template · model @ host, placement, Load / Unload model, tools) over the
 // existing chat + instrument panel; an empty state when no session is shown. Merged app-global by app.mu.
 import SessionViewModel from "../SessionViewModel.js"
+import NoteRowViewModel from "../NoteRowViewModel.js"
 
 resources SessionViewResources {
     DataTemplate [ DataType = SessionViewModel ] {
@@ -26,12 +27,17 @@ resources SessionViewResources {
                 StackPanel [ DockPanel.Dock = Top, Orientation = Vertical, Margin = (12,8,12,0),
                              Visibility = $HasNotes << ToVisibility ] {
                     ToggleButton [ Variant = Text, IsChecked = $IsNotesExpanded, HorizontalAlignment = Left ] {
-                        TextBlock [ Text = "Notes", Style = @BodySm, Foreground = @Fg2 ]
+                        TextBlock [ Text = $NotesHeader, Style = @BodySm, Foreground = @Fg1 ]
                     }
-                    ItemsControl [ ItemsSource = $Notes, Visibility = $IsNotesExpanded << ToVisibility ]
+                    ItemsControl [ ItemsSource = $Notes, ItemsPanel = @VerticalStackPanel, Margin = (8,2,0,4),
+                                   Visibility = $IsNotesExpanded << ToVisibility ]
                 }
                 ContentControl [ Content = $Chat ]
             }
         }
+    }
+
+    DataTemplate [ DataType = NoteRowViewModel ] {
+        TextBlock [ Text = $Text, Style = @BodySm, Foreground = @Fg1, TextWrapping = Wrap, Margin = (0,1,0,1) ]
     }
 }

@@ -7,6 +7,7 @@ import { ChatViewModel } from './ChatViewModel'
 import type { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
 import { TextFormat } from './TextFormat'
 import { TraceViewModel } from './TraceViewModel'
+import { NoteRowViewModel } from './NoteRowViewModel'
 
 /**
  * The host-area view of the shown session: a header (template · model @ host, placement, Load / Unload, tools) over
@@ -31,17 +32,20 @@ export class SessionViewModel extends Observable
     private static readonly ToolsPrefix = 'tools: '
     private static readonly ToolsSeparator = ', '
     private static readonly EmptyText = 'Select a session, or start a new one.'
-    private static readonly NoteFormat = '{0}. {1}'
+    private static readonly NotesHeaderFormat = '{0} Notes ({1})'
+    private static readonly ExpandedMark = '▾'
+    private static readonly CollapsedMark = '▸'
+    private static readonly PropNotesHeader = 'NotesHeader'
     private static readonly PropIsNotesExpanded = 'IsNotesExpanded'
     private static readonly PropHasNotes = 'HasNotes'
-    private static readonly Props = [SessionViewModel.PropHasNotes, 'HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
+    private static readonly Props = [SessionViewModel.PropHasNotes, SessionViewModel.PropNotesHeader, 'HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
 
     public readonly Chat = new ChatViewModel()
     /** The shown session's agent trace, hosted by the instrument panel below its context bar. */
     public readonly Trace = new TraceViewModel()
 
     /** The session's working notes, each shown as `{n}. {text}`. */
-    public readonly Notes = new ObservableCollection<string>()
+    public readonly Notes = new ObservableCollection<NoteRowViewModel>()
 
     private readonly client: RuntimeClient
     private readonly loadCommand: RelayCommand
@@ -205,6 +209,13 @@ export class SessionViewModel extends Observable
         return this.Notes.Count > 0
     }
 
+    /** The notes panel's toggle label: an open/folded mark, then `Notes (n)`. */
+    public get NotesHeader(): string
+    {
+        const mark = this.notesExpanded ? SessionViewModel.ExpandedMark : SessionViewModel.CollapsedMark
+        return TextFormat.Format(SessionViewModel.NotesHeaderFormat, mark, this.Notes.Count)
+    }
+
     /** The notes panel is open (the default) or folded to its header. */
     public get IsNotesExpanded(): boolean
     {
@@ -216,8 +227,10 @@ export class SessionViewModel extends Observable
         if (this.notesExpanded !== value)
         {
             const old = this.notesExpanded
+            const oldHeader = this.NotesHeader
             this.notesExpanded = value
             this.RaisePropertyChanged(SessionViewModel.PropIsNotesExpanded, old, value)
+            this.RaisePropertyChanged(SessionViewModel.PropNotesHeader, oldHeader, this.NotesHeader)
         }
     }
 
@@ -295,16 +308,18 @@ export class SessionViewModel extends Observable
         }
     }
 
-    /** Replaces the shown notes; only HasNotes derives from them, so only it is raised. */
+    /** Replaces the shown notes; only HasNotes and NotesHeader derive from them, so only they are raised. */
     private ShowNotes(notes: string[]): void
     {
         const hadNotes = this.HasNotes
+        const oldHeader = this.NotesHeader
         this.Notes.Batch(() =>
         {
             this.Notes.Clear()
-            notes.forEach((text, i) => this.Notes.Add(TextFormat.Format(SessionViewModel.NoteFormat, i + 1, text)))
+            notes.forEach((text, i) => this.Notes.Add(new NoteRowViewModel(i + 1, text)))
         })
         this.RaisePropertyChanged(SessionViewModel.PropHasNotes, hadNotes, this.HasNotes)
+        this.RaisePropertyChanged(SessionViewModel.PropNotesHeader, oldHeader, this.NotesHeader)
     }
 
     /**

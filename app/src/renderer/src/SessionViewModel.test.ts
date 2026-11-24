@@ -263,7 +263,7 @@ describe('SessionViewModel', () =>
         await rig.Respond('get_notes', { notes: ['plan A', 'plan B'] })
         expect(rig.view.HasNotes).toBe(true)
         expect(rig.view.IsNotesExpanded).toBe(true)
-        expect(rig.view.Notes.ToArray()).toEqual(['1. plan A', '2. plan B'])
+        expect(rig.view.Notes.ToArray().map(n => n.Text)).toEqual(['1. plan A', '2. plan B'])
     })
 
     it('notes_changed_for_other_session_is_ignored', async () =>
@@ -272,7 +272,7 @@ describe('SessionViewModel', () =>
         await rig.Show({ state: PlacementState.Ready, host: 'local' })
         await rig.Respond('get_notes', { notes: ['plan A'] })
         rig.Notify('notes_changed', { id: 'other', notes: ['x', 'y'] })
-        expect(rig.view.Notes.ToArray()).toEqual(['1. plan A'])
+        expect(rig.view.Notes.ToArray().map(n => n.Text)).toEqual(['1. plan A'])
     })
 
     it('notes_changed_replaces_list_and_empty_hides_panel', async () =>
@@ -281,7 +281,7 @@ describe('SessionViewModel', () =>
         await rig.Show({ state: PlacementState.Ready, host: 'local' })
         await rig.Respond('get_notes', { notes: ['plan A'] })
         rig.Notify('notes_changed', { id: 's1', notes: ['a', 'b', 'c'] })
-        expect(rig.view.Notes.ToArray()).toEqual(['1. a', '2. b', '3. c'])
+        expect(rig.view.Notes.ToArray().map(n => n.Text)).toEqual(['1. a', '2. b', '3. c'])
         expect(rig.view.HasNotes).toBe(true)
         rig.Notify('notes_changed', { id: 's1', notes: [] })
         expect(rig.view.Notes.Count).toBe(0)
@@ -319,6 +319,19 @@ describe('SessionViewModel', () =>
         expect(raised).toBe(2)
     })
 
+    it('notes_header_counts_and_marks_folding', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
+        await rig.Respond('get_notes', { notes: ['plan A', 'plan B'] })
+        expect(rig.view.NotesHeader).toBe('▾ Notes (2)')
+        let raised = 0
+        rig.view.PropertyChanged('NotesHeader').subscribe(() => { raised++ })
+        rig.view.IsNotesExpanded = false
+        expect(rig.view.NotesHeader).toBe('▸ Notes (2)')
+        expect(raised).toBe(1)
+    })
+
     it('switching_sessions_clears_notes_at_once', async () =>
     {
         const rig = new Rig()
@@ -337,6 +350,6 @@ describe('SessionViewModel', () =>
         await done
         expect(rig.Frame('get_notes')?.params).toEqual({ id: 's2' })
         await rig.Respond('get_notes', { notes: ['plan B'] })
-        expect(rig.view.Notes.ToArray()).toEqual(['1. plan B'])
+        expect(rig.view.Notes.ToArray().map(n => n.Text)).toEqual(['1. plan B'])
     })
 })
