@@ -1,7 +1,7 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import { TypedSignal } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
-import type { AgentTemplate, CatalogInfo, SamplingConfig, TemplateLeafNode, ToolSpec } from './agents'
+import type { AgentTemplate, CatalogInfo, ContextStrategy, SamplingConfig, TemplateLeafNode, ToolSpec } from './agents'
 import type { TemplateTreeNodeViewModel } from './TemplateTreeNodeViewModel'
 import { ChoiceItem } from './ChoiceItem'
 import { ToolChoice, type IToolChoiceOwner } from './ToolChoice'
@@ -23,6 +23,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly DefaultName = 'Untitled'
     private static readonly DefaultStepBudget = 8
     private static readonly DefaultContextSize = 8192
+    private static readonly DefaultContextStrategy: ContextStrategy = 'off'
+    private static readonly DefaultCompactAtPct = 75
+    private static readonly MinCompactAtPct = 10
+    private static readonly MaxCompactAtPct = 95
     private static readonly AnyHostLabel = '(any host)'
     private static readonly RootLabel = '(root)'
     private static readonly NewHeaderFormat = 'New template in {0}'
@@ -32,6 +36,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly NameRequired = 'Name is required.'
     private static readonly StepBudgetInvalid = 'Step budget must be a whole number of at least 1.'
     private static readonly ContextSizeInvalid = 'Context size must be a whole number of tokens.'
+    private static readonly CompactAtInvalid = 'Compact at must be a whole percentage from 10 to 95.'
     private static readonly TemperatureInvalid = 'Temperature must be a number of 0 or more, or blank.'
     private static readonly TopPInvalid = 'Top P must be a number from 0 to 1, or blank.'
     private static readonly CatalogFailedFormat = 'catalog unavailable: {0}'
@@ -47,26 +52,32 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly PropRuntime = 'Runtime'
     private static readonly PropModel = 'Model'
     private static readonly PropContextSizeText = 'ContextSizeText'
+    private static readonly PropContext = 'Context'
+    private static readonly PropCompactAtText = 'CompactAtText'
     private static readonly PropEnableThinking = 'EnableThinking'
     private static readonly PropTemperatureText = 'TemperatureText'
     private static readonly PropTopPText = 'TopPText'
     private static readonly PropHost = 'Host'
     private static readonly PropPath = 'Path'
     private static readonly PropTemplateId = 'TemplateId'
+    private static readonly StrategyChoices: readonly (readonly [ContextStrategy, string])[] = [['off', 'Off'], ['trim', 'Trim'], ['summarize', 'Summarize']]
     private static readonly FieldProps = [TemplateEditorViewModel.PropName, TemplateEditorViewModel.PropSystemPrompt,
         TemplateEditorViewModel.PropStepBudgetText, TemplateEditorViewModel.PropRuntime, TemplateEditorViewModel.PropModel,
-        TemplateEditorViewModel.PropContextSizeText, TemplateEditorViewModel.PropEnableThinking,
+        TemplateEditorViewModel.PropContextSizeText, TemplateEditorViewModel.PropContext, TemplateEditorViewModel.PropCompactAtText,
+        TemplateEditorViewModel.PropEnableThinking,
         TemplateEditorViewModel.PropTemperatureText, TemplateEditorViewModel.PropTopPText, TemplateEditorViewModel.PropHost,
         TemplateEditorViewModel.PropPath, TemplateEditorViewModel.PropTemplateId]
     private static readonly DerivedProps = ['HasTemplate', 'IsEmpty', 'IsNew', 'IsDirty', 'CanSave', 'CanRevert', 'IsLoading',
         'IsEditable', 'CatalogError', 'HasCatalogError', 'HeaderText', 'ErrorText',
         'HasErrorText', 'NameError', 'HasNameError', 'StepBudgetError', 'HasStepBudgetError', 'ContextSizeError',
-        'HasContextSizeError', 'TemperatureError', 'HasTemperatureError', 'TopPError', 'HasTopPError', 'RuntimeChoice',
+        'HasContextSizeError', 'CompactAtError', 'HasCompactAtError', 'ContextChoice', 'TemperatureError', 'HasTemperatureError', 'TopPError', 'HasTopPError', 'RuntimeChoice',
         'ModelChoice', 'HostChoice']
 
     public readonly RuntimeChoices = new ObservableCollection<ChoiceItem>()
     public readonly ModelChoices = new ObservableCollection<ChoiceItem>()
     public readonly HostChoices = new ObservableCollection<ChoiceItem>()
+    /** Off, Trim, Summarize: what the session does when the prompt nears the window. */
+    public readonly ContextChoices = new ObservableCollection<ChoiceItem>()
     public readonly Tools = new ObservableCollection<ToolChoice>()
     /** A save succeeded; carries the template id (new for a draft). */
     public readonly OnSaved = new TypedSignal<string>()
@@ -102,6 +113,8 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private runtime = ''
     private model = ''
     private contextSizeText = ''
+    private context: ContextStrategy = TemplateEditorViewModel.DefaultContextStrategy
+    private compactAtText = ''
     private enableThinking = false
     private temperatureText = ''
     private topPText = ''
@@ -113,6 +126,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     {
         super()
         this.client = client
+        for (const choice of TemplateEditorViewModel.StrategyChoices)
+        {
+            this.ContextChoices.Add(new ChoiceItem(choice[0], choice[1]))
+        }
         this.saveCommand = new RelayCommand(() => void this.Save(), () => this.CanSave)
         this.revertCommand = new RelayCommand(() => this.Revert(), () => this.CanRevert)
         this.Fill(this.Defaults('', '', '', false))
@@ -346,6 +363,50 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     public get HasContextSizeError(): boolean
     {
         return this.ContextSizeError.length > 0
+    }
+
+    public get Context(): ContextStrategy
+    {
+        return this.context
+    }
+
+    public set Context(value: ContextStrategy)
+    {
+        this.SetField(TemplateEditorViewModel.PropContext, this.context, value, () => { this.context = value })
+    }
+
+    public get ContextChoice(): ChoiceItem | null
+    {
+        return TemplateEditorViewModel.FindChoice(this.ContextChoices, this.context)
+    }
+
+    public set ContextChoice(choice: ChoiceItem | null)
+    {
+        if (choice instanceof ChoiceItem)
+        {
+            this.Context = choice.Value as ContextStrategy
+        }
+    }
+
+    /** The percent of the window the prompt may fill before compaction runs (10 to 95). */
+    public get CompactAtText(): string
+    {
+        return this.compactAtText
+    }
+
+    public set CompactAtText(value: string)
+    {
+        this.SetField(TemplateEditorViewModel.PropCompactAtText, this.compactAtText, value, () => { this.compactAtText = value })
+    }
+
+    public get CompactAtError(): string
+    {
+        return this.open && TemplateEditorViewModel.ParsePercent(this.compactAtText) === null ? TemplateEditorViewModel.CompactAtInvalid : ''
+    }
+
+    public get HasCompactAtError(): boolean
+    {
+        return this.CompactAtError.length > 0
     }
 
     public get EnableThinking(): boolean
@@ -715,6 +776,8 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
             model: chosenModel,
             n_ctx: TemplateEditorViewModel.DefaultContextSize,
             enable_thinking: false,
+            context_strategy: TemplateEditorViewModel.DefaultContextStrategy,
+            compact_at_pct: TemplateEditorViewModel.DefaultCompactAtPct,
         }
     }
 
@@ -728,6 +791,8 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.runtime = template.runtime
         this.model = template.model
         this.contextSizeText = String(template.n_ctx)
+        this.context = template.context_strategy ?? TemplateEditorViewModel.DefaultContextStrategy
+        this.compactAtText = String(template.compact_at_pct ?? TemplateEditorViewModel.DefaultCompactAtPct)
         this.enableThinking = template.enable_thinking
         this.sampling = template.sampling
         this.temperatureText = template.sampling?.temperature !== undefined ? String(template.sampling.temperature) : ''
@@ -745,9 +810,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     {
         const stepBudget = TemplateEditorViewModel.ParseCount(this.stepBudgetText)
         const contextSize = TemplateEditorViewModel.ParseCount(this.contextSizeText)
+        const compactAt = TemplateEditorViewModel.ParsePercent(this.compactAtText)
         const temperature = TemplateEditorViewModel.ParseOptional(this.temperatureText)
         const topP = TemplateEditorViewModel.ParseOptional(this.topPText)
-        if (stepBudget === null || contextSize === null || temperature === null || topP === null || this.HasFieldErrors)
+        if (stepBudget === null || contextSize === null || compactAt === null || temperature === null || topP === null || this.HasFieldErrors)
         {
             return null
         }
@@ -760,6 +826,8 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
             model: this.model,
             n_ctx: contextSize,
             enable_thinking: this.enableThinking,
+            context_strategy: this.context,
+            compact_at_pct: compactAt,
         }
         if (this.sampling !== undefined || temperature !== undefined || topP !== undefined)
         {
@@ -780,7 +848,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
 
     private get HasFieldErrors(): boolean
     {
-        return this.HasNameError || this.HasStepBudgetError || this.HasContextSizeError || this.HasTemperatureError || this.HasTopPError
+        return this.HasNameError || this.HasStepBudgetError || this.HasContextSizeError || this.HasCompactAtError || this.HasTemperatureError || this.HasTopPError
     }
 
     /**
@@ -869,6 +937,18 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         return value >= 1 ? value : null
     }
 
+    /** A whole percentage from 10 to 95, or null. */
+    private static ParsePercent(text: string): number | null
+    {
+        const trimmed = text.trim()
+        if (!TemplateEditorViewModel.Whole.test(trimmed))
+        {
+            return null
+        }
+        const value = Number(trimmed)
+        return value >= TemplateEditorViewModel.MinCompactAtPct && value <= TemplateEditorViewModel.MaxCompactAtPct ? value : null
+    }
+
     /** Blank gives undefined (no value), a decimal its number, anything else null. */
     private static ParseOptional(text: string): number | undefined | null
     {
@@ -884,7 +964,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private Fingerprint(): string
     {
         return JSON.stringify([this.name, this.systemPrompt, this.stepBudgetText, this.runtime, this.model, this.contextSizeText,
-            this.enableThinking, this.temperatureText, this.topPText, this.host, [...this.enabled].sort()])
+            this.context, this.compactAtText, this.enableThinking, this.temperatureText, this.topPText, this.host, [...this.enabled].sort()])
     }
 
     private SetField<T>(prop: string, old: T, value: T, assign: () => void): void

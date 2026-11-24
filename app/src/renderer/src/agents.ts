@@ -10,6 +10,9 @@ export interface SamplingConfig
     max_tokens: number
 }
 
+/** How a session keeps its prompt inside the window: nothing, trim old results and turns, or summarize them. */
+export type ContextStrategy = 'off' | 'trim' | 'summarize'
+
 export interface AgentTemplate
 {
     name: string
@@ -20,6 +23,10 @@ export interface AgentTemplate
     model: string
     n_ctx: number
     enable_thinking: boolean
+    /** Absent in a template saved before compaction existed: read as `off`. */
+    context_strategy?: ContextStrategy
+    /** Percent of the window the prompt may fill before compaction runs (10 to 95); absent reads as 75. */
+    compact_at_pct?: number
     /** Optional sampling defaults; a missing field takes the worker default. */
     sampling?: Partial<SamplingConfig>
     host?: string
@@ -168,6 +175,23 @@ export interface ToolTiming
     bytes: number
 }
 
+/** What compaction did to a step's prompt. Present on a step only when compaction ran. */
+export interface CompactionRecord
+{
+    strategy: 'trim' | 'summarize'
+    before_tokens: number
+    after_tokens: number
+    elided_results: number
+    dropped_turns: number
+    summarized_messages: number
+    summary_ms: number | null
+    reused_summary: boolean
+    fallback: boolean
+    summary_prompt_tokens: number | null
+    summary_out_tokens: number | null
+    summary_error: string | null
+}
+
 /** One model call of a turn. `v` and `kind` are the log-line envelope; `kind` discriminates it from a TurnRecord. */
 export interface StepRecord
 {
@@ -187,6 +211,7 @@ export interface StepRecord
     end: StepEnd
     tools: ToolTiming[]
     error: string | null
+    compaction?: CompactionRecord | null
 }
 
 /** A turn's closing summary. `reason` is a loop_done reason or 'aborted'. */

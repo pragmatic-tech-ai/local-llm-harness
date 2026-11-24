@@ -1,5 +1,5 @@
 // Template editor (host area): Save / Revert over the template's fields: name, system prompt, step budget, runtime
-// and model (from the catalog, models filtered by the runtime), context size, thinking, sampling defaults (blank =
+// and model (from the catalog, models filtered by the runtime), context size, context strategy and compact-at percent, thinking, sampling defaults (blank =
 // none), preferred host and the tool checkboxes. A field that does not parse shows its error under it and disables
 // Save; load and save errors show above the form, and a catalog failure in a banner that stays until a retry works.
 // The form is read-only while the template loads. Merged app-global by app.mu.
@@ -63,6 +63,13 @@ resources TemplateEditorResources {
                             TextBlock [ Text = "Context size (tokens)", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
                             TextBox [ Text = $ContextSizeText, HorizontalAlignment = Stretch ]
                             TextBlock [ Text = $ContextSizeError, Style = @BodySm, Foreground = @StateDanger, Visibility = $HasContextSizeError << ToVisibility ]
+
+                            TextBlock [ Text = "Context", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
+                            ComboBox [ ItemsSource = $ContextChoices, SelectedItem = $ContextChoice, HorizontalAlignment = Stretch ]
+
+                            TextBlock [ Text = "Compact at %", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
+                            TextBox [ Text = $CompactAtText, HorizontalAlignment = Stretch ]
+                            TextBlock [ Text = $CompactAtError, Style = @BodySm, Foreground = @StateDanger, Visibility = $HasCompactAtError << ToVisibility ]
 
                             DockPanel [ LastChildFill = true, Margin = (0,8,0,0) ] {
                                 TextBlock [ DockPanel.Dock = Left, Text = "Thinking", Margin = (0,0,8,0), VerticalAlignment = Center ]

@@ -1,7 +1,7 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import type { IDisposable } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
-import type { StepEnd, StepRecord, TracePage, TraceTurn, TurnRecord } from './agents'
+import type { CompactionRecord, StepEnd, StepRecord, TracePage, TraceTurn, TurnRecord } from './agents'
 import { TextFormat } from './TextFormat'
 
 /** Number formatting shared by the trace rows: thin-space thousands, one-decimal seconds, integer percentages. */
@@ -69,6 +69,12 @@ export class TraceStepViewModel extends Observable
     private static readonly GenFormat = '  gen {0} s'
     private static readonly RateFormat = '  {0} t/s'
     private static readonly ToolFormat = '└ {0}  {1}  {2} ms  {3} B'
+    private static readonly TrimFormat = '⟲ trim: {0} → {1} tokens · {2} results elided · {3} turns dropped'
+    private static readonly SummarizeFormat = '⟲ summarize: {0} → {1} tokens · covers {2} messages · {3} s'
+    private static readonly ReusedFormat = '⟲ summarize (reused): {0} → {1} tokens · covers {2} messages'
+    private static readonly FallbackFormat = '⟲ summarize failed → trim: {0} → {1} tokens · {2} results elided · {3} turns dropped'
+    private static readonly FallbackErrorFormat = '  ({0})'
+    private static readonly StrategySummarize: CompactionRecord['strategy'] = 'summarize'
     private static readonly ToolOk = 'ok'
     private static readonly ToolFailed = 'failed'
     private static readonly EndRejected: StepEnd = 'rejected'
@@ -146,6 +152,40 @@ export class TraceStepViewModel extends Observable
             }
         }
         return text
+    }
+
+    /** The step's compaction line (`⟲ ...`), or '' when compaction did not run. */
+    public get CompactionText(): string
+    {
+        const c = this.record.compaction
+        if (c === undefined || c === null)
+        {
+            return ''
+        }
+        const before = TraceNumbers.Thousands(c.before_tokens)
+        const after = TraceNumbers.Thousands(c.after_tokens)
+        if (c.strategy === TraceStepViewModel.StrategySummarize && c.fallback)
+        {
+            const line = TextFormat.Format(TraceStepViewModel.FallbackFormat, before, after, c.elided_results, c.dropped_turns)
+            return c.summary_error !== null && c.summary_error.length > 0
+                ? line + TextFormat.Format(TraceStepViewModel.FallbackErrorFormat, c.summary_error)
+                : line
+        }
+        if (c.strategy === TraceStepViewModel.StrategySummarize)
+        {
+            if (c.reused_summary)
+            {
+                return TextFormat.Format(TraceStepViewModel.ReusedFormat, before, after, c.summarized_messages)
+            }
+            return TextFormat.Format(TraceStepViewModel.SummarizeFormat, before, after, c.summarized_messages,
+                TraceNumbers.Seconds(c.summary_ms ?? 0))
+        }
+        return TextFormat.Format(TraceStepViewModel.TrimFormat, before, after, c.elided_results, c.dropped_turns)
+    }
+
+    public get HasCompaction(): boolean
+    {
+        return this.CompactionText.length > 0
     }
 
     /** One row per tool the step ran, in run order. */

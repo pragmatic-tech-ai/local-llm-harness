@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { RuntimeClient } from './RuntimeClient'
 import { FakeSocket } from './FakeSocket'
 import { TraceViewModel, type TraceTurnViewModel } from './TraceViewModel'
-import type { StepRecord, TracePage, TraceTurn, TurnRecord } from './agents'
+import { TraceStepViewModel } from './TraceViewModel'
+import type { CompactionRecord, StepRecord, TracePage, TraceTurn, TurnRecord } from './agents'
 
 class Rig
 {
@@ -376,5 +377,34 @@ describe('TraceViewModel', () =>
         rig.Notify('trace_step', { id: 's1', record: Rig.Step(2, 1) })
         expect(rig.trace.Turns.Count).toBe(0)
         expect(rig.trace.HasMore).toBe(false)
+    })
+
+    it('compaction_text_formats_each_variant', () =>
+    {
+        const base: CompactionRecord = {
+            strategy: 'trim', before_tokens: 7420, after_tokens: 5980, elided_results: 3, dropped_turns: 0, summarized_messages: 0,
+            summary_ms: null, reused_summary: false, fallback: false, summary_prompt_tokens: null, summary_out_tokens: null, summary_error: null,
+        }
+        const text = (over: Partial<CompactionRecord>): string => new TraceStepViewModel(Rig.Step(1, 1, { compaction: { ...base, ...over } })).CompactionText
+        expect(text({})).toBe('⟲ trim: 7 420 → 5 980 tokens · 3 results elided · 0 turns dropped')
+        expect(text({ strategy: 'summarize', after_tokens: 3100, summarized_messages: 14, summary_ms: 18200 }))
+            .toBe('⟲ summarize: 7 420 → 3 100 tokens · covers 14 messages · 18.2 s')
+        expect(text({ strategy: 'summarize', before_tokens: 6900, after_tokens: 3300, summarized_messages: 14, reused_summary: true }))
+            .toBe('⟲ summarize (reused): 6 900 → 3 300 tokens · covers 14 messages')
+        expect(text({ strategy: 'summarize', fallback: true }))
+            .toBe('⟲ summarize failed → trim: 7 420 → 5 980 tokens · 3 results elided · 0 turns dropped')
+        expect(text({ strategy: 'summarize', fallback: true, summary_error: 'worker busy' }))
+            .toBe('⟲ summarize failed → trim: 7 420 → 5 980 tokens · 3 results elided · 0 turns dropped  (worker busy)')
+        expect(new TraceStepViewModel(Rig.Step(1, 1, { compaction: { ...base } })).HasCompaction).toBe(true)
+    })
+
+    it('step_without_compaction_has_no_line', () =>
+    {
+        for (const record of [Rig.Step(1, 1), Rig.Step(1, 1, { compaction: null })])
+        {
+            const step = new TraceStepViewModel(record)
+            expect(step.CompactionText).toBe('')
+            expect(step.HasCompaction).toBe(false)
+        }
     })
 })

@@ -54,7 +54,7 @@ resources TracePanelResources {
         TextBlock [ Text = $Text, Style = @BodySm, FontFamily = "Consolas" ]
     }
 
-    // A step: fill text + bar (the context-bar style, smaller), then out/think/load/ttft/gen/rate, tool rows, error.
+    // A step: fill text + bar (the context-bar style, smaller), then out/think/load/ttft/gen/rate, the compaction line, tool rows, error.
     DataTemplate [ DataType = TraceStepViewModel ] {
         StackPanel [ Orientation = Vertical, Margin = (0,2,0,2) ] {
             StackPanel [ Orientation = Horizontal ] {
@@ -66,6 +66,8 @@ resources TracePanelResources {
             }
             // No wrapping: the Wrap path re-joins words with single spaces, losing the double-space separators.
             TextBlock [ Text = $StatsText, Style = @BodySm, Foreground = @Fg2, FontFamily = "Consolas" ]
+            TextBlock [ Text = $CompactionText, Style = @BodySm, Foreground = @Fg2, FontFamily = "Consolas",
+                        Visibility = $HasCompaction << ToVisibility ]
             ItemsControl [ ItemsSource = $Tools, ItemsPanel = @TraceStackPanel, Margin = (12,0,0,0),
                            Visibility = $HasTools << ToVisibility ]
             TextBlock [ Text = $ErrorText, Style = @BodySm, Foreground = @StateDanger, TextWrapping = Wrap,

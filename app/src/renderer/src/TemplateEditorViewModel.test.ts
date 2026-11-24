@@ -120,7 +120,8 @@ describe('TemplateEditorViewModel', () =>
             path: 'Examples',
             template: {
                 name: 'Researcher 2', system_prompt: 'read', tools: ['read_file', 'get_time'], step_budget: 4, runtime: 'llamacpp',
-                model: 'gemma-4', n_ctx: 8192, enable_thinking: true, sampling: { temperature: 0.5, top_p: 0.95 }, host: 'hive',
+                model: 'gemma-4', n_ctx: 8192, enable_thinking: true, context_strategy: 'off', compact_at_pct: 75,
+                sampling: { temperature: 0.5, top_p: 0.95 }, host: 'hive',
             },
         })
         await rig.Respond('save_template', { id: 't1' })
@@ -139,6 +140,61 @@ describe('TemplateEditorViewModel', () =>
         expect(rig.editor.ErrorText).toBe('unknown tool: x')
         expect(rig.editor.IsDirty).toBe(true)
         expect(rig.saved).toEqual([])
+    })
+
+    it('editor_loads_and_saves_context_fields', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open({ ...Rig.Researcher, context_strategy: 'summarize', compact_at_pct: 60, sampling: { top_k: 40, seed: 7 } })
+        const e = rig.editor
+        expect(e.Context).toBe('summarize')
+        expect(e.ContextChoice?.Label).toBe('Summarize')
+        expect(e.ContextChoices.ToArray().map(c => c.Label)).toEqual(['Off', 'Trim', 'Summarize'])
+        expect(e.CompactAtText).toBe('60')
+        expect(e.IsDirty).toBe(false)
+        e.ContextChoice = e.ContextChoices.ToArray().find(c => c.Value === 'trim')!
+        e.CompactAtText = '80'
+        expect(e.IsDirty).toBe(true)
+        e.Revert()
+        expect(e.Context).toBe('summarize')
+        expect(e.CompactAtText).toBe('60')
+        expect(e.IsDirty).toBe(false)
+        e.Context = 'trim'
+        e.CompactAtText = '80'
+        e.SaveCommand.Execute(undefined)
+        const template = rig.Frames().pop()!.params.template as AgentTemplate
+        expect(template.context_strategy).toBe('trim')
+        expect(template.compact_at_pct).toBe(80)
+        expect(template.sampling).toEqual({ top_k: 40, seed: 7, temperature: 0.8, top_p: 0.95 })
+    })
+
+    it('compact_at_out_of_range_blocks_save', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open()
+        const e = rig.editor
+        for (const bad of ['9', '96', 'abc', '', '7.5'])
+        {
+            e.CompactAtText = bad
+            expect(e.HasCompactAtError).toBe(true)
+            expect(e.CanSave).toBe(false)
+        }
+        for (const good of ['10', '95'])
+        {
+            e.CompactAtText = good
+            expect(e.HasCompactAtError).toBe(false)
+            expect(e.CanSave).toBe(true)
+        }
+    })
+
+    it('old_template_without_fields_shows_off_and_75', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open()
+        expect(rig.editor.Context).toBe('off')
+        expect(rig.editor.ContextChoice?.Label).toBe('Off')
+        expect(rig.editor.CompactAtText).toBe('75')
+        expect(rig.editor.IsDirty).toBe(false)
     })
 
     it('model_choices_filter_by_runtime', async () =>
