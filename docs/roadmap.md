@@ -42,4 +42,11 @@ policy seam stays, unused.
 
 ## Postponed
 
+- Web fetch and research tools (owner idea, 2026-11-24). Open questions to settle first:
+  HTTPS support (vendor rustls or call the hive's `curl.exe`), turning HTML into text
+  (write our own or vendor a crate), how the agent finds pages (fetch only, keyless
+  DuckDuckGo scraping, or a search API with a key such as Brave), refusing
+  private and LAN addresses, and pages too large for the 8K window, which step 3 helps
+  with.
+
 - Tool approval (`Ask` policy, approval UI).
