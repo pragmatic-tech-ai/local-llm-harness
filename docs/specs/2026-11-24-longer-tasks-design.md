@@ -1,6 +1,6 @@
 # Longer tasks
 
-**Status:** draft 2026-11-24, design playback approved by the owner ("looks good").
+**Status:** approved 2026-11-24; shipped and live-proven on the hive 2026-11-24 (main @9bf7e41c, app fixes @963ccefb and @002e5620). The live proof ran on gemma-4 with the Worker template: `write_file` and then `append_file` produced `report.md` in `sandbox/sessions/{id}/`; three notes survived a trim that dropped a turn and the plan was recalled from them; the second identical failing `read_file` carried the hint and `repeat_failure`; writes to `/sandbox/x.txt` and `../x.txt` were refused; deleting the session removed its folder; a read-only template read `/sandbox/notes.txt` and was refused `write_file`. The owner confirmed the Workspace row, the "writes" tags, the Notes panel and the "repeated failure" tag. The owner's UI check found two app bugs, both fixed: the Notes panel rows did not render (plain strings had no template), and a hinted failure showed as "ok" with its tag clipped.
 **Roadmap:** step 4, longer tasks (`docs/roadmap.md`)
 **Builds on:**
 - `docs/specs/2026-11-23-agent-templates-sessions-design.md`: templates, sessions and the runtime on :8779

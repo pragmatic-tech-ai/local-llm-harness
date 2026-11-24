@@ -27,7 +27,7 @@ policy seam stays, unused.
 3. **Memory and context.** *Shipped 2026-11-24* (sessions persist transcripts; `docs/specs/2026-11-24-context-compaction-design.md` adds per-template trim/summarize compaction). Conversations survive reconnects, supervisor restarts and model
    swaps. When the window fills, old tool results are compacted or summarised instead of
    the turn failing with `window_full`.
-4. **Longer tasks.** Per-agent step budgets, a scratchpad/notes tool, and write tools in
+4. **Longer tasks.** *Shipped 2026-11-24* (`docs/specs/2026-11-24-longer-tasks-design.md`: per-template workspaces, write tools, a notes scratchpad that survives compaction, a retry hint). Per-agent step budgets, a scratchpad/notes tool, and write tools in
    the sandbox. The agent's tool list is its permission list, so no approval UI is needed.
    The agent can recover from tool errors.
 5. **Planning.** A plan/todo tool and a plan-then-execute loop, with the plan visible in
