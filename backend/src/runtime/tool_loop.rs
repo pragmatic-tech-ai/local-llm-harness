@@ -181,6 +181,33 @@ pub trait TurnLinks: Send + Sync {
     async fn link(&self, step: usize) -> Result<StepLink, LinkFailure>;
 }
 
+/// The provider-reported usage a `turn_done` may carry, as its `usage` object.
+pub(crate) struct NoteUsage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
+    pub cost: Option<f64>,
+}
+
+impl NoteUsage {
+    const FIELD_USAGE: &'static str = "usage";
+    const FIELD_COMPLETION_TOKENS: &'static str = "completion_tokens";
+    const FIELD_REASONING_TOKENS: &'static str = "reasoning_tokens";
+    const FIELD_COST: &'static str = "cost";
+
+    /// The usage of a `turn_done`'s params, or `None` when it carries none (the Pragmatic
+    /// worker never does).
+    pub(crate) fn of_done(params: &Value) -> Option<Self> {
+        let usage = params.get(Self::FIELD_USAGE).filter(|u| u.is_object())?;
+        Some(Self {
+            prompt_tokens: StepMeter::count(usage, ToolLoop::FIELD_PROMPT_TOKENS),
+            completion_tokens: StepMeter::count(usage, Self::FIELD_COMPLETION_TOKENS),
+            reasoning_tokens: StepMeter::count(usage, Self::FIELD_REASONING_TOKENS),
+            cost: usage.get(Self::FIELD_COST).and_then(Value::as_f64),
+        })
+    }
+}
+
 /// What the loop measures about one step, turned into its trace record when the step ends.
 struct StepMeter {
     /// One-based step number.
@@ -198,10 +225,18 @@ struct StepMeter {
     tools: Vec<ToolTiming>,
     /// What compaction did to this step's prompt, if it ran.
     compaction: Option<CompactionRecord>,
+    /// The provider's cost for the step, when its usage reported one.
+    cost: Option<f64>,
+    /// The prompt size is an estimate (`turn_started.estimated`) and no usage replaced it.
+    estimated: bool,
+    /// Think tokens the provider reported; they replace the Gemma counter's.
+    reported_think: Option<u32>,
 }
 
 impl StepMeter {
     const FIELD_PROMPT: &'static str = "prompt";
+    const FIELD_ESTIMATED: &'static str = "estimated";
+    const FIELD_REASONING: &'static str = "reasoning";
     const FIELD_N_CTX: &'static str = "n_ctx";
     const FIELD_TEXT: &'static str = "text";
 
@@ -219,6 +254,9 @@ impl StepMeter {
             generated: None,
             tools: Vec::new(),
             compaction: None,
+            cost: None,
+            estimated: false,
+            reported_think: None,
         }
     }
 
@@ -239,6 +277,11 @@ impl StepMeter {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 self.counter = ThinkCounters::for_prompt(prompt);
+                self.estimated = note
+                    .params
+                    .get(Self::FIELD_ESTIMATED)
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
             }
             ToolLoop::M_TURN_CHUNK => {
                 self.first_chunk.get_or_insert_with(Instant::now);
@@ -252,15 +295,41 @@ impl StepMeter {
                     .get(Self::FIELD_TEXT)
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                self.counter.push(text, tokens);
+                let reasoning = note
+                    .params
+                    .get(Self::FIELD_REASONING)
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !reasoning {
+                    self.counter.push(text, tokens);
+                }
                 let tokens = u32::try_from(tokens).unwrap_or(u32::MAX);
                 self.out_tokens = self.out_tokens.saturating_add(tokens);
             }
-            ToolLoop::M_TURN_DONE | ToolLoop::M_TURN_REJECTED | ToolLoop::M_TURN_ERROR => {
-                self.generation_ended()
+            ToolLoop::M_TURN_DONE => {
+                if let Some(usage) = NoteUsage::of_done(&note.params) {
+                    self.apply_usage(usage);
+                }
+                self.generation_ended();
             }
+            ToolLoop::M_TURN_REJECTED | ToolLoop::M_TURN_ERROR => self.generation_ended(),
             _ => {}
         }
+    }
+
+    /// The provider's counts replace the measured ones, and its cost is kept.
+    fn apply_usage(&mut self, usage: NoteUsage) {
+        if usage.prompt_tokens.is_some() {
+            self.prompt_tokens = usage.prompt_tokens;
+        }
+        if let Some(out) = usage.completion_tokens {
+            self.out_tokens = out;
+        }
+        if usage.reasoning_tokens.is_some() {
+            self.reported_think = usage.reasoning_tokens;
+        }
+        self.cost = usage.cost;
+        self.estimated = false;
     }
 
     /// Stops the generation clock (once).
@@ -290,7 +359,9 @@ impl StepMeter {
             prompt_tokens: self.prompt_tokens,
             n_ctx: self.n_ctx,
             out_tokens: self.out_tokens,
-            think_tokens: u32::try_from(self.counter.think_tokens()).unwrap_or(u32::MAX),
+            think_tokens: self
+                .reported_think
+                .unwrap_or_else(|| u32::try_from(self.counter.think_tokens()).unwrap_or(u32::MAX)),
             load_ms: self.load.map(Self::millis),
             ttft_ms,
             gen_ms,
@@ -298,6 +369,8 @@ impl StepMeter {
             tools: self.tools,
             error,
             compaction: self.compaction,
+            cost: self.cost,
+            estimated: self.estimated,
         }
     }
 
@@ -2017,6 +2090,101 @@ You are terse.<|tool>declaration:echo{";
         assert_eq!(r[0].out_tokens, 4);
         assert!(r[0].think_tokens > 0, "{:?}", r[0]);
         assert!(r[0].think_tokens <= r[0].out_tokens);
+    }
+
+    /// Notes as an OpenRouter link emits them.
+    struct UsageNotes;
+
+    impl UsageNotes {
+        fn done(usage: Value) -> Note {
+            Notes::note(
+                "turn_done",
+                json!({"content": "ok", "tool_calls": [], "usage": usage}),
+            )
+        }
+
+        fn estimated_started() -> Note {
+            Notes::note(
+                "turn_started",
+                json!({"prompt": null, "prompt_tokens": 50, "n_ctx": 100, "estimated": true}),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_overrides_counted_tokens_and_sets_cost() {
+        let mut f = Fixture::new();
+        let script = Notes::script(vec![
+            UsageNotes::estimated_started(),
+            Notes::chunk_of("a", 0),
+            UsageNotes::done(json!({
+                "prompt_tokens": 42, "completion_tokens": 9, "reasoning_tokens": 4, "cost": 0.00042
+            })),
+        ]);
+        f.run(Some(FakeLink::new(true, vec![script])))
+            .await
+            .unwrap();
+        let r = &f.trace.records[0];
+        assert_eq!(r.prompt_tokens, Some(42));
+        assert_eq!(r.out_tokens, 9);
+        assert_eq!(r.think_tokens, 4);
+        assert_eq!(r.cost, Some(0.00042));
+        assert!(!r.estimated);
+    }
+
+    #[tokio::test]
+    async fn estimated_flag_when_no_usage() {
+        let mut f = Fixture::new();
+        let script = Notes::script(vec![
+            UsageNotes::estimated_started(),
+            Notes::done("ok", vec![]),
+        ]);
+        f.run(Some(FakeLink::new(true, vec![script])))
+            .await
+            .unwrap();
+        let r = &f.trace.records[0];
+        assert!(r.estimated);
+        assert_eq!(r.prompt_tokens, Some(50));
+        assert_eq!(r.cost, None);
+    }
+
+    #[tokio::test]
+    async fn reasoning_chunks_do_not_count_as_gemma_thinking() {
+        let mut f = Fixture::new();
+        let reasoning = Notes::note(
+            "turn_chunk",
+            json!({"text": "<|channel>thought\n", "tokens": [], "stop": false, "reasoning": true}),
+        );
+        let script = Notes::script(vec![
+            Notes::started_fill(GEMMA_GENERATION_PROMPT, 10, 100),
+            reasoning,
+            Notes::chunk_of("ok", 1),
+            Notes::done("ok", vec![]),
+        ]);
+        f.run(Some(FakeLink::new(true, vec![script])))
+            .await
+            .unwrap();
+        let r = &f.trace.records[0];
+        assert_eq!(r.think_tokens, 0);
+        assert_eq!(r.out_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn pragmatic_steps_unchanged() {
+        let mut f = Fixture::new();
+        let script = Notes::script(vec![
+            Notes::started_fill("p", 10, 100),
+            Notes::chunk_of("ok", 2),
+            Notes::done("ok", vec![]),
+        ]);
+        f.run(Some(FakeLink::new(true, vec![script])))
+            .await
+            .unwrap();
+        let r = &f.trace.records[0];
+        assert_eq!(r.prompt_tokens, Some(10));
+        assert_eq!(r.out_tokens, 2);
+        assert_eq!(r.cost, None);
+        assert!(!r.estimated);
     }
 
     #[tokio::test]

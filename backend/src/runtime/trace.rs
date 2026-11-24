@@ -78,6 +78,12 @@ pub struct StepRecord {
     /// Present only on steps where compaction ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionRecord>,
+    /// The provider-reported cost of the step; absent for providers that report none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    /// The prompt size is an estimate, not a measurement.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
 }
 
 /// What compaction did to one step's prompt. Token fields are measured prompt sizes; the
@@ -96,6 +102,9 @@ pub struct CompactionRecord {
     pub summary_prompt_tokens: Option<u32>,
     pub summary_out_tokens: Option<u32>,
     pub summary_error: Option<String>,
+    /// The provider-reported cost of the summary calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_cost: Option<f64>,
 }
 
 impl CompactionRecord {
@@ -115,6 +124,7 @@ impl CompactionRecord {
             summary_prompt_tokens: None,
             summary_out_tokens: None,
             summary_error: None,
+            summary_cost: None,
         }
     }
 
@@ -719,6 +729,8 @@ mod tests {
                 }],
                 error: None,
                 compaction: None,
+                cost: None,
+                estimated: false,
             }
         }
 
@@ -1164,6 +1176,30 @@ mod tests {
         let records = TraceLog::read_records(&d.0.join(FILE)).unwrap();
         assert!(matches!(&records[1], TraceRecord::Reset(r) if r.at > 0));
         assert!(log.page(None, None).unwrap().reset_pending);
+    }
+
+    #[test]
+    fn new_fields_skipped_when_empty() {
+        let plain = serde_json::to_value(TempDir::step_record(1, 1)).unwrap();
+        assert!(plain.get("cost").is_none());
+        assert!(plain.get("estimated").is_none());
+        let mut record = TempDir::step_record(1, 1);
+        record.cost = Some(0.5);
+        record.estimated = true;
+        let full = serde_json::to_value(&record).unwrap();
+        assert_eq!(full["cost"], 0.5);
+        assert_eq!(full["estimated"], true);
+        // An old record without the fields still reads.
+        let back: StepRecord = serde_json::from_value(plain).unwrap();
+        assert_eq!(back.cost, None);
+        assert!(!back.estimated);
+        let mut c = CompactionRecord::new("summarize", 10, 5);
+        assert!(serde_json::to_value(&c)
+            .unwrap()
+            .get("summary_cost")
+            .is_none());
+        c.summary_cost = Some(0.25);
+        assert_eq!(serde_json::to_value(&c).unwrap()["summary_cost"], 0.25);
     }
 
     #[test]

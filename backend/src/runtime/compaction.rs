@@ -21,7 +21,7 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use super::notes::NotesBlock;
-use super::tool_loop::ToolLoop;
+use super::tool_loop::{NoteUsage, ToolLoop};
 use super::trace::{CompactionRecord, ToolTiming};
 use super::worker::{GenerateRequest, LinkError, PromptSize, WorkerLink};
 use crate::agents::template::{CompactionState, ContextStrategy, DEFAULT_COMPACT_AT_PCT};
@@ -648,9 +648,27 @@ struct SummaryStats {
     ms: u64,
     prompt_tokens: u32,
     out_tokens: u32,
+    /// Summed provider cost of the calls that reported one.
+    cost: Option<f64>,
 }
 
 impl SummaryStats {
+    /// Swaps one call's counted tokens for the provider's, and adds its cost.
+    fn apply_usage(&mut self, usage: NoteUsage, call_prompt: u32, call_out: u32) {
+        if let Some(prompt) = usage.prompt_tokens {
+            self.prompt_tokens = self
+                .prompt_tokens
+                .saturating_sub(call_prompt)
+                .saturating_add(prompt);
+        }
+        if let Some(out) = usage.completion_tokens {
+            self.out_tokens = self.out_tokens.saturating_sub(call_out).saturating_add(out);
+        }
+        if let Some(cost) = usage.cost {
+            self.cost = Some(self.cost.unwrap_or(0.0) + cost);
+        }
+    }
+
     /// Fills the record's summary-call fields when at least one call was made.
     fn apply(&self, record: &mut CompactionRecord) {
         if self.calls == 0 {
@@ -659,6 +677,7 @@ impl SummaryStats {
         record.summary_ms = Some(self.ms);
         record.summary_prompt_tokens = Some(self.prompt_tokens);
         record.summary_out_tokens = Some(self.out_tokens);
+        record.summary_cost = self.cost;
     }
 }
 
@@ -857,6 +876,9 @@ impl<'a> Summarizer<'a> {
         let link_error = |e: LinkError| format!("{}{e}", Self::ERR_LINK);
         let mut stream = self.link.generate(req).await.map_err(link_error)?;
         let mut out_tokens = 0usize;
+        // This call's own share of the running totals, replaced by the provider's usage.
+        let mut call_prompt = 0u32;
+        let mut call_out = 0u32;
         while let Some(item) = stream.next().await {
             let note = item.map_err(link_error)?;
             let params = &note.params;
@@ -864,6 +886,7 @@ impl<'a> Summarizer<'a> {
                 ToolLoop::M_TURN_STARTED => {
                     let tokens = Self::number(params, ToolLoop::FIELD_PROMPT_TOKENS);
                     let tokens = CompactionRecord::count(tokens);
+                    call_prompt = tokens;
                     self.stats.prompt_tokens = self.stats.prompt_tokens.saturating_add(tokens);
                 }
                 ToolLoop::M_TURN_CHUNK => {
@@ -873,9 +896,13 @@ impl<'a> Summarizer<'a> {
                         .map_or(0, Vec::len);
                     out_tokens = out_tokens.saturating_add(tokens);
                     let tokens = CompactionRecord::count(tokens);
+                    call_out = call_out.saturating_add(tokens);
                     self.stats.out_tokens = self.stats.out_tokens.saturating_add(tokens);
                 }
                 ToolLoop::M_TURN_DONE => {
+                    if let Some(usage) = NoteUsage::of_done(params) {
+                        self.stats.apply_usage(usage, call_prompt, call_out);
+                    }
                     if out_tokens >= self.max_tokens {
                         return Err(format!("{}{}", Self::ERR_MAX_TOKENS, self.max_tokens));
                     }
@@ -1800,6 +1827,29 @@ mod tests {
             .await
             .unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn summary_cost_recorded() {
+        let (messages, current) = Sx::transcript();
+        let budget = FakeMeasure::tokens(&messages);
+        let reply = Notes::script(vec![
+            Notes::started_fill("p", 10, N_CTX as u32),
+            Notes::chunk_of("S", 3),
+            Notes::note(
+                "turn_done",
+                json!({"content": "S", "tool_calls": [], "usage": {
+                    "prompt_tokens": 77, "completion_tokens": 6, "reasoning_tokens": 0, "cost": 0.002
+                }}),
+            ),
+        ]);
+        let link = Sx::link(vec![reply]);
+        let sink = RecordingSink::new();
+        let out = Sx::run(&messages, current, None, budget, N_CTX, &link, &sink).await;
+        let record = out.record.unwrap();
+        assert_eq!(record.summary_cost, Some(0.002));
+        assert_eq!(record.summary_prompt_tokens, Some(77));
+        assert_eq!(record.summary_out_tokens, Some(6));
     }
 
     #[tokio::test]
