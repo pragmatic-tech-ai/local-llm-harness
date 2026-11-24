@@ -9,7 +9,9 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use super::atomic_file::AtomicFile;
-use super::template::{AgentTemplate, RulesSource, TemplateRules};
+use super::template::{
+    AgentTemplate, ContextStrategy, RulesSource, TemplateRules, DEFAULT_COMPACT_AT_PCT,
+};
 
 const EXT: &str = "toml";
 const SEED_GROUP: &str = "Examples";
@@ -164,8 +166,8 @@ impl TemplateStore {
             enable_thinking: false,
             sampling: None,
             host: None,
-            context_strategy: Default::default(),
-            compact_at_pct: 75,
+            context_strategy: ContextStrategy::default(),
+            compact_at_pct: DEFAULT_COMPACT_AT_PCT,
         }
     }
 
@@ -570,8 +572,8 @@ mod tests {
                 enable_thinking: true,
                 sampling: Some(crate::engine::SamplingConfig::default()),
                 host: Some("hive".into()),
-            context_strategy: Default::default(),
-                compact_at_pct: 75,
+                context_strategy: ContextStrategy::default(),
+                compact_at_pct: DEFAULT_COMPACT_AT_PCT,
             }
         }
     }
@@ -580,6 +582,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn tree_flags_an_unknown_context_strategy_verbatim() {
+        let d = TempDir::new("badstrategy");
+        let s = d.store();
+        let dir = d.0.join("templates").join("grp");
+        fs::create_dir_all(&dir).unwrap();
+        let body = toml::to_string_pretty(&TempDir::sample("Bad")).unwrap();
+        let body = body.replace(
+            "context_strategy = \"off\"",
+            "context_strategy = \"shrink\"",
+        );
+        assert!(body.contains("shrink"));
+        fs::write(dir.join("Bad.toml"), body).unwrap();
+        let tree = s.tree();
+        let found = tree.iter().any(|g| match g {
+            TemplateNode::Group { children, .. } => children.iter().any(|c| matches!(c,
+                TemplateNode::Template { error: Some(e), .. } if e.contains("unknown context strategy: shrink"))),
+            _ => false,
+        });
+        assert!(found, "{tree:?}");
     }
 
     #[test]

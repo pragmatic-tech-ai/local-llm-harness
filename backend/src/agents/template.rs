@@ -14,13 +14,12 @@ const ERR_STEP_BUDGET: &str = "step_budget must be at least 1";
 const ERR_UNKNOWN_HOST: &str = "unknown host: ";
 const ERR_UNKNOWN_STRATEGY: &str = "unknown context strategy: ";
 const ERR_COMPACT_PCT: &str = "compact_at_pct must be between 10 and 95";
-const DEFAULT_COMPACT_AT_PCT: u8 = 75;
+pub(crate) const DEFAULT_COMPACT_AT_PCT: u8 = 75;
 const MIN_COMPACT_AT_PCT: u8 = 10;
 const MAX_COMPACT_AT_PCT: u8 = 95;
 
 /// How an agent keeps its prompt inside the context window.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ContextStrategy {
     #[default]
     Off,
@@ -29,13 +28,30 @@ pub enum ContextStrategy {
 }
 
 impl ContextStrategy {
+    /// Every strategy with its wire name: the one table behind serialization and parsing.
+    const ALL: [(Self, &'static str); 3] = [
+        (Self::Off, "off"),
+        (Self::Trim, "trim"),
+        (Self::Summarize, "summarize"),
+    ];
+
+    /// The wire name.
+    pub fn as_str(&self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(s, _)| s == self)
+            .map(|(_, n)| *n)
+            .unwrap_or_default()
+    }
+
     fn parse(v: &str) -> Option<Self> {
-        match v {
-            "off" => Some(Self::Off),
-            "trim" => Some(Self::Trim),
-            "summarize" => Some(Self::Summarize),
-            _ => None,
-        }
+        Self::ALL.iter().find(|(_, n)| *n == v).map(|(s, _)| *s)
+    }
+}
+
+impl Serialize for ContextStrategy {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
     }
 }
 
@@ -77,7 +93,10 @@ pub struct AgentTemplate {
     pub host: Option<String>,
     #[serde(default)]
     pub context_strategy: ContextStrategy,
-    #[serde(default = "AgentTemplate::default_compact_at_pct")]
+    #[serde(
+        default = "AgentTemplate::default_compact_at_pct",
+        deserialize_with = "AgentTemplate::deserialize_compact_at_pct"
+    )]
     pub compact_at_pct: u8,
 }
 
@@ -88,6 +107,16 @@ impl AgentTemplate {
 
     fn default_compact_at_pct() -> u8 {
         DEFAULT_COMPACT_AT_PCT
+    }
+
+    /// Reads any integer, then range-checks it, so 300 or -1 give the range message rather
+    /// than a serde type error.
+    fn deserialize_compact_at_pct<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+        let v = i64::deserialize(d)?;
+        u8::try_from(v)
+            .ok()
+            .filter(|p| (MIN_COMPACT_AT_PCT..=MAX_COMPACT_AT_PCT).contains(p))
+            .ok_or_else(|| serde::de::Error::custom(ERR_COMPACT_PCT))
     }
 }
 
@@ -199,6 +228,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(j.contains("unknown context strategy: shrink"), "{j}");
+    }
+
+    #[test]
+    fn wide_out_of_range_compact_at_pct_gives_the_range_message() {
+        for bad in ["300", "-1", "0"] {
+            let text = format!(
+                "{BASE}compact_at_pct = {bad}
+"
+            );
+            let e = toml::from_str::<AgentTemplate>(&text)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(ERR_COMPACT_PCT), "{e}");
+            let j = serde_json::from_str::<AgentTemplate>(&format!(
+                r#"{{"name":"T","runtime":"r","model":"m","n_ctx":1,"compact_at_pct":{bad}}}"#
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(j.contains(ERR_COMPACT_PCT), "{j}");
+        }
     }
 
     #[test]

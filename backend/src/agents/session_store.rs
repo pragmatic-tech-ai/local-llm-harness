@@ -296,7 +296,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::template::TemplateRules;
+    use crate::agents::template::{ContextStrategy, TemplateRules, DEFAULT_COMPACT_AT_PCT};
     use crate::agents::template_store::TemplateStore;
     use crate::engine::types::{FunctionCall, Role, ToolCall};
     use std::sync::Arc;
@@ -339,8 +339,17 @@ mod tests {
                 enable_thinking: false,
                 sampling: None,
                 host: None,
-                context_strategy: Default::default(),
-                compact_at_pct: 75,
+                context_strategy: ContextStrategy::default(),
+                compact_at_pct: DEFAULT_COMPACT_AT_PCT,
+            }
+        }
+
+        fn state() -> CompactionState {
+            CompactionState {
+                summary: "so far".into(),
+                covers: 3,
+                tokens: 42,
+                at: 7,
             }
         }
 
@@ -466,25 +475,16 @@ mod tests {
         assert_eq!(s.get(&rec.id).unwrap().transcript, rec.transcript);
     }
 
-    fn state() -> CompactionState {
-        CompactionState {
-            summary: "so far".into(),
-            covers: 3,
-            tokens: 42,
-            at: 7,
-        }
-    }
-
     #[test]
     fn set_compaction_persists_and_reopens() {
         let d = TempDir::new("comp");
         let s = d.store();
         let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
         assert_eq!(rec.compaction, None);
-        s.set_compaction(&rec.id, Some(state())).unwrap();
+        s.set_compaction(&rec.id, Some(TempDir::state())).unwrap();
         drop(s);
         let s = d.store();
-        assert_eq!(s.get(&rec.id).unwrap().compaction, Some(state()));
+        assert_eq!(s.get(&rec.id).unwrap().compaction, Some(TempDir::state()));
         s.set_compaction(&rec.id, None).unwrap();
         assert_eq!(s.get(&rec.id).unwrap().compaction, None);
         assert!(s.set_compaction("nope", None).is_err());
@@ -497,7 +497,7 @@ mod tests {
         let s = d.clocked(&ms);
         let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
         ms.store(20_000, Ordering::SeqCst);
-        s.set_compaction(&rec.id, Some(state())).unwrap();
+        s.set_compaction(&rec.id, Some(TempDir::state())).unwrap();
         assert_eq!(s.get(&rec.id).unwrap().updated, 10);
     }
 
@@ -506,7 +506,7 @@ mod tests {
         let d = TempDir::new("compreset");
         let s = d.store();
         let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
-        s.set_compaction(&rec.id, Some(state())).unwrap();
+        s.set_compaction(&rec.id, Some(TempDir::state())).unwrap();
         s.reset(&rec.id).unwrap();
         assert_eq!(s.get(&rec.id).unwrap().compaction, None);
     }

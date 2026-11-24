@@ -1932,6 +1932,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_template_unknown_context_strategy_is_rpc_error() {
+        let rt = TestRuntime::new("badstrategy", Client::idle());
+        let mut a = Client::new(&rt);
+        let mut template = serde_json::to_value(rt.template()).unwrap();
+        template["context_strategy"] = json!("shrink");
+        let err = a
+            .call(
+                C::M_SAVE_TEMPLATE,
+                json!({ "path": GROUP, "template": template }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("unknown context strategy: shrink"),
+            "{}",
+            err.message
+        );
+        assert!(a.drain().is_empty());
+    }
+
+    #[tokio::test]
     async fn template_methods_round_trip() {
         let rt = TestRuntime::new("templates", Client::idle());
         let mut a = Client::new(&rt);
