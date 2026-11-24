@@ -338,51 +338,51 @@ impl Provider for FakeHost {
 mod tests {
     use super::*;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-    struct Fixtures;
+        struct Fixtures;
 
-    impl Fixtures {
-        fn req(model: &str, n_ctx: u32) -> ModelRequirement {
-            ModelRequirement {
-                runtime: "llamacpp".to_string(),
-                model: model.to_string(),
-                n_ctx,
-                repository: ModelRequirement::DEFAULT_REPOSITORY.to_string(),
+        impl Fixtures {
+            fn req(model: &str, n_ctx: u32) -> ModelRequirement {
+                ModelRequirement {
+                    runtime: "llamacpp".to_string(),
+                    model: model.to_string(),
+                    n_ctx,
+                    repository: ModelRequirement::DEFAULT_REPOSITORY.to_string(),
+                }
             }
         }
-    }
 
-    #[tokio::test]
-    async fn fake_host_unload_if_also_stops_a_loading_model() {
-        let fake = FakeHost::serving("h", &[("llamacpp", "gemma")]);
-        fake.set_loading("llamacpp", "gemma");
-        assert!(!fake.unload_if(&Fixtures::req("other", 1)).await.unwrap());
-        assert!(fake.unload_if(&Fixtures::req("gemma", 1)).await.unwrap());
-        assert_eq!(fake.unload_calls(), 1);
-        assert_eq!(fake.state(), HostState::default());
-    }
+        #[tokio::test]
+        async fn fake_host_unload_if_also_stops_a_loading_model() {
+            let fake = FakeHost::serving("h", &[("llamacpp", "gemma")]);
+            fake.set_loading("llamacpp", "gemma");
+            assert!(!fake.unload_if(&Fixtures::req("other", 1)).await.unwrap());
+            assert!(fake.unload_if(&Fixtures::req("gemma", 1)).await.unwrap());
+            assert_eq!(fake.unload_calls(), 1);
+            assert_eq!(fake.state(), HostState::default());
+        }
 
-    #[tokio::test]
-    async fn fake_host_scripts_serves_state_and_counts() {
-        let fake = FakeHost::serving("h", &[("llamacpp", "gemma")]);
-        assert!(fake.serves(&Fixtures::req("gemma", 1)));
-        assert!(!fake.serves(&Fixtures::req("nope", 1)));
-        assert!(fake.current_link(&Fixtures::req("gemma", 1)).is_none());
-        let mut rx = fake.subscribe();
-        fake.ensure_ready(&Fixtures::req("gemma", 1)).await.unwrap();
-        assert_eq!(fake.ensure_ready_calls(), 1);
-        assert!(rx.try_recv().is_ok());
-        assert!(fake.current_link(&Fixtures::req("gemma", 1)).is_some());
-        fake.fail_ensure(Some("boom"));
-        assert_eq!(
-            fake.ensure_ready(&Fixtures::req("gemma", 1)).await.err(),
-            Some(HostError("boom".into()))
-        );
-        assert!(fake.unload_if(&Fixtures::req("gemma", 1)).await.unwrap());
-        assert_eq!(fake.unload_calls(), 1);
+        #[tokio::test]
+        async fn fake_host_scripts_serves_state_and_counts() {
+            let fake = FakeHost::serving("h", &[("llamacpp", "gemma")]);
+            assert!(fake.serves(&Fixtures::req("gemma", 1)));
+            assert!(!fake.serves(&Fixtures::req("nope", 1)));
+            assert!(fake.current_link(&Fixtures::req("gemma", 1)).is_none());
+            let mut rx = fake.subscribe();
+            fake.ensure_ready(&Fixtures::req("gemma", 1)).await.unwrap();
+            assert_eq!(fake.ensure_ready_calls(), 1);
+            assert!(rx.try_recv().is_ok());
+            assert!(fake.current_link(&Fixtures::req("gemma", 1)).is_some());
+            fake.fail_ensure(Some("boom"));
+            assert_eq!(
+                fake.ensure_ready(&Fixtures::req("gemma", 1)).await.err(),
+                Some(HostError("boom".into()))
+            );
+            assert!(fake.unload_if(&Fixtures::req("gemma", 1)).await.unwrap());
+            assert_eq!(fake.unload_calls(), 1);
+        }
     }
-}
 }

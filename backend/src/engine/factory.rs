@@ -180,10 +180,10 @@ pub async fn build_engine_with(
             // `load` once the GGUF is open); an explicit value is honored, capped at that length.
             let engine =
                 super::llamacpp::LocalLlamaEngine::load(&model, None, cfg.n_ctx, n_gpu_layers)
-                .map_err(|source| EngineBuildError::Load {
-                    engine: "llamacpp",
-                    source,
-                })?;
+                    .map_err(|source| EngineBuildError::Load {
+                        engine: "llamacpp",
+                        source,
+                    })?;
             let engine: Arc<dyn Engine> = Arc::new(engine);
             let props = engine.props().await?;
             Ok((engine, props))

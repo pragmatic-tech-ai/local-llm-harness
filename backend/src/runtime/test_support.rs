@@ -441,9 +441,9 @@ impl TestRuntime {
         use super::test_tools::TestSource;
         use crate::agents::dispatcher::Dispatcher;
         use crate::agents::host::FakeHost;
-        use crate::providers::{Provider, StaticProviders};
         use crate::agents::session_store::SessionStore;
         use crate::agents::template_store::TemplateStore;
+        use crate::providers::{Provider, StaticProviders};
 
         let sandbox = sandboxed.then(|| {
             let root = dir.0.join(Self::SANDBOX_DIR);

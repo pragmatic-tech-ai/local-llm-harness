@@ -221,10 +221,10 @@ impl Drop for Dispatcher {
 mod tests {
     use super::*;
     use crate::agents::host::{FakeHost, HostState};
-    use crate::providers::{Measure, Provider, ProviderCapabilities, StaticProviders};
     use crate::agents::template::{
         AgentTemplate, ContextStrategy, WorkspaceConfig, DEFAULT_COMPACT_AT_PCT,
     };
+    use crate::providers::{Measure, Provider, ProviderCapabilities, StaticProviders};
     use crate::runtime::test_support::FakeLink;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;

@@ -1,8 +1,8 @@
 use backend::agents::dispatcher::Dispatcher;
-use backend::providers::{LocalHarness, PragmaticProvider, Provider, StaticProviders};
 use backend::agents::session_store::SessionStore;
 use backend::agents::template_store::{TemplateNode, TemplateStore};
 use backend::engine::{build_engine, EngineConfig, EngineKind};
+use backend::providers::{LocalHarness, PragmaticProvider, Provider, StaticProviders};
 use backend::rpc;
 use backend::runtime::builtin::{BuiltinSource, Sandbox};
 use backend::runtime::catalog_source::DiscoveredCatalog;
