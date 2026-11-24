@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::SamplingConfig;
+use crate::runtime::builtin::Sandbox;
 
 /// Default per-run step budget when a template omits `step_budget`.
 const DEFAULT_STEP_BUDGET: usize = 8;
@@ -19,6 +20,7 @@ const ERR_COMPACT_PCT: &str = "compact_at_pct must be between 10 and 95";
 const ERR_UNKNOWN_WORKSPACE_MODE: &str = "unknown workspace mode: ";
 const ERR_WORKSPACE_NAME_REQUIRED: &str = "workspace name is required for named mode";
 const ERR_WORKSPACE_NAME_INVALID: &str = "workspace name must be 1-64 letters, digits, _ or -";
+const ERR_WORKSPACE_NAME_RESERVED: &str = "workspace name is a reserved Windows device name";
 const MAX_WORKSPACE_NAME_LEN: usize = 64;
 const SESSIONS_FOLDER: &str = "sessions";
 const SHARED_FOLDER: &str = "shared";
@@ -161,11 +163,14 @@ impl WorkspaceConfig {
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-        if ok {
-            Ok(())
-        } else {
-            Err(ERR_WORKSPACE_NAME_INVALID.to_string())
+        if !ok {
+            return Err(ERR_WORKSPACE_NAME_INVALID.to_string());
         }
+        // The folder must be creatable: the file tools refuse device names such as `con`.
+        if Sandbox::is_reserved_device_name(name) {
+            return Err(ERR_WORKSPACE_NAME_RESERVED.to_string());
+        }
+        Ok(())
     }
 }
 
@@ -434,6 +439,25 @@ mod tests {
         t.workspace.name = Some("aZ0_-".repeat(12) + "aZ0_");
         assert_eq!(t.workspace.name.as_ref().unwrap().len(), 64);
         assert!(rules.validate(&t).is_ok());
+    }
+
+    #[test]
+    fn reserved_device_workspace_name_is_rejected() {
+        let rules = TemplateRules::for_tests();
+        let mut t: AgentTemplate = toml::from_str(BASE).unwrap();
+        t.workspace.mode = WorkspaceMode::Named;
+        for bad in ["con", "NUL", "Aux", "prn", "com1", "LPT9"] {
+            t.workspace.name = Some(bad.to_string());
+            assert_eq!(
+                rules.validate(&t).unwrap_err(),
+                "workspace name is a reserved Windows device name",
+                "{bad}"
+            );
+        }
+        for good in ["console", "com10", "lpt", "nul_x"] {
+            t.workspace.name = Some(good.to_string());
+            assert!(rules.validate(&t).is_ok(), "{good}");
+        }
     }
 
     #[test]

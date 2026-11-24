@@ -66,6 +66,11 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly WorkspaceNamePattern = /^[A-Za-z0-9_-]{1,64}$/
     private static readonly WorkspaceNameRequired = 'workspace name is required for named mode'
     private static readonly WorkspaceNameInvalid = 'workspace name must be 1-64 letters, digits, _ or -'
+    private static readonly WorkspaceNameReserved = 'workspace name is a reserved Windows device name'
+    /** Windows device names (the backend's Sandbox::RESERVED); a folder with one of these names cannot be made. */
+    private static readonly ReservedDeviceNames: ReadonlySet<string> = new Set(['CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$',
+        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'COM¹', 'COM²', 'COM³',
+        'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9', 'LPT¹', 'LPT²', 'LPT³'])
     private static readonly WorkspaceModes: readonly (readonly [WorkspaceMode, string])[] = [['session', 'Session'], ['shared', 'Shared'], ['named', 'Named']]
     private static readonly PropPath = 'Path'
     private static readonly PropTemplateId = 'TemplateId'
@@ -434,7 +439,11 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         {
             return TemplateEditorViewModel.WorkspaceNameRequired
         }
-        return TemplateEditorViewModel.WorkspaceNamePattern.test(name) ? '' : TemplateEditorViewModel.WorkspaceNameInvalid
+        if (!TemplateEditorViewModel.WorkspaceNamePattern.test(name))
+        {
+            return TemplateEditorViewModel.WorkspaceNameInvalid
+        }
+        return TemplateEditorViewModel.ReservedDeviceNames.has(name.toUpperCase()) ? TemplateEditorViewModel.WorkspaceNameReserved : ''
     }
 
     public get HasWorkspaceNameError(): boolean

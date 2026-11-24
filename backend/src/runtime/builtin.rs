@@ -33,9 +33,39 @@ impl Sandbox {
     /// The separator of displayed paths.
     pub(crate) const SEPARATOR: &'static str = "/";
     /// Windows device names, reserved with or without an extension, in any case.
-    const RESERVED: [&'static str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    /// The superscript digits count too (`COM¹`), as do the console streams `CONIN$` and
+    /// `CONOUT$`.
+    const RESERVED: [&'static str; 30] = [
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        "COM1",
+        "COM2",
+        "COM3",
+        "COM4",
+        "COM5",
+        "COM6",
+        "COM7",
+        "COM8",
+        "COM9",
+        "COM\u{b9}",
+        "COM\u{b2}",
+        "COM\u{b3}",
+        "LPT1",
+        "LPT2",
+        "LPT3",
+        "LPT4",
+        "LPT5",
+        "LPT6",
+        "LPT7",
+        "LPT8",
+        "LPT9",
+        "LPT\u{b9}",
+        "LPT\u{b2}",
+        "LPT\u{b3}",
     ];
     /// Marks an alternate data stream (`name:stream`) or a drive.
     const STREAM_MARK: char = ':';
@@ -108,16 +138,25 @@ impl Sandbox {
     /// or a trailing dot or space (stripped, so the name would alias another).
     fn check_name(part: &std::ffi::OsStr) -> Result<(), String> {
         let name = part.to_string_lossy();
+        if Self::is_reserved_device_name(&name)
+            || name.contains(Self::STREAM_MARK)
+            || name.ends_with(Self::STRIPPED_TAIL)
+        {
+            return Err(format!("{}{name}", Self::INVALID_NAME));
+        }
+        Ok(())
+    }
+
+    /// True when `name` is a Windows device name (`CON`, `nul.txt`, `COM¹`, `conin$`): its part
+    /// before the first dot, less trailing dots and spaces, matches [`Self::RESERVED`] in any
+    /// case. Template validation shares this rule for workspace names.
+    pub fn is_reserved_device_name(name: &str) -> bool {
         let stem = name
             .split(Self::EXTENSION_MARK)
             .next()
             .unwrap_or_default()
             .trim_end_matches(Self::STRIPPED_TAIL);
-        let reserved = Self::RESERVED.iter().any(|r| r.eq_ignore_ascii_case(stem));
-        if reserved || name.contains(Self::STREAM_MARK) || name.ends_with(Self::STRIPPED_TAIL) {
-            return Err(format!("{}{name}", Self::INVALID_NAME));
-        }
-        Ok(())
+        Self::RESERVED.iter().any(|r| r.eq_ignore_ascii_case(stem))
     }
 
     pub fn no_such_path(shown: &str) -> String {
@@ -227,6 +266,14 @@ impl LocalOffset {
 /// `get_time`: current time, UTC and local.
 pub struct GetTimeTool;
 
+impl GetTimeTool {
+    const UTC: &'static str = "utc";
+    const LOCAL: &'static str = "local";
+    const UTC_OFFSET_MINUTES: &'static str = "utc_offset_minutes";
+    const UNIX: &'static str = "unix";
+    const CLOCK_BEFORE_EPOCH: &'static str = "system clock is before the Unix epoch";
+}
+
 #[async_trait]
 impl Tool for GetTimeTool {
     fn spec(&self) -> ToolSpec {
@@ -241,14 +288,14 @@ impl Tool for GetTimeTool {
     async fn call(&self, _args: Value, _ctx: &ToolContext) -> ToolOutcome {
         let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => d.as_secs(),
-            Err(_) => return ToolOutcome::Err("system clock is before the Unix epoch".to_string()),
+            Err(_) => return ToolOutcome::Err(Self::CLOCK_BEFORE_EPOCH.to_string()),
         };
         let offset = LocalOffset::current_minutes();
         ToolOutcome::Ok(json!({
-            "utc": CivilTime::utc_iso8601(secs),
-            "local": CivilTime::local_iso8601(secs, offset),
-            "utc_offset_minutes": offset,
-            "unix": secs,
+            Self::UTC: CivilTime::utc_iso8601(secs),
+            Self::LOCAL: CivilTime::local_iso8601(secs, offset),
+            Self::UTC_OFFSET_MINUTES: offset,
+            Self::UNIX: secs,
         }))
     }
 }
@@ -259,6 +306,18 @@ struct FileWork;
 impl FileWork {
     const PATH: &'static str = "path";
     const CONTENT: &'static str = "content";
+    /// Result keys and values shared by the file tools.
+    const BYTES: &'static str = "bytes";
+    const TRUNCATED: &'static str = "truncated";
+    const DELETED: &'static str = "deleted";
+    const ENTRIES: &'static str = "entries";
+    const ERRORS: &'static str = "errors";
+    const NAME: &'static str = "name";
+    const KIND: &'static str = "kind";
+    const SIZE: &'static str = "size";
+    const KIND_DIR: &'static str = "dir";
+    const KIND_FILE: &'static str = "file";
+    const KIND_OTHER: &'static str = "other";
     const PATH_NOT_STRING: &'static str = "path must be a string";
     const CONTENT_NOT_STRING: &'static str = "content must be a string";
     const TASK_FAILED: &'static str = "tool task failed: ";
@@ -396,9 +455,9 @@ impl ListDirTool {
             })
             .map(|e| {
                 let kind = match e.file_type() {
-                    Ok(t) if t.is_dir() => "dir",
-                    Ok(t) if t.is_file() => "file",
-                    _ => "other",
+                    Ok(t) if t.is_dir() => FileWork::KIND_DIR,
+                    Ok(t) if t.is_file() => FileWork::KIND_FILE,
+                    _ => FileWork::KIND_OTHER,
                 };
                 let size = e.metadata().ok().map(|m| m.len());
                 (e.file_name().to_string_lossy().into_owned(), kind, size)
@@ -410,13 +469,15 @@ impl ListDirTool {
         let empty = entries.is_empty() && errors == 0;
         let listed: Vec<Value> = entries
             .into_iter()
-            .map(|(name, kind, size)| json!({"name": name, "kind": kind, "size": size}))
+            .map(|(name, kind, size)| {
+                json!({FileWork::NAME: name, FileWork::KIND: kind, FileWork::SIZE: size})
+            })
             .collect();
         let mut result = json!({
-            "path": workspace.display(&dir),
-            "entries": listed,
-            "truncated": truncated,
-            "errors": errors,
+            FileWork::PATH: workspace.display(&dir),
+            FileWork::ENTRIES: listed,
+            FileWork::TRUNCATED: truncated,
+            FileWork::ERRORS: errors,
         });
         if empty && workspace.confined() && workspace.is_root(&dir) {
             result[Self::NOTE] = json!(Self::EMPTY_NOTE);
@@ -496,10 +557,10 @@ impl ReadFileTool {
             Err(_) => return Err(Self::NOT_UTF8.to_string()),
         };
         Ok(json!({
-            "path": workspace.display(&path),
-            "bytes": content.len(),
-            "content": content,
-            "truncated": truncated,
+            FileWork::PATH: workspace.display(&path),
+            FileWork::BYTES: content.len(),
+            FileWork::CONTENT: content,
+            FileWork::TRUNCATED: truncated,
         }))
     }
 }
@@ -565,7 +626,7 @@ impl WriteFileTool {
         let target = workspace.prepare_write(path)?;
         WriteLimits::refuse_directory(&target)?;
         Self::replace(&target, content.as_bytes())?;
-        Ok(json!({"path": workspace.display(&target), "bytes": content.len()}))
+        Ok(json!({FileWork::PATH: workspace.display(&target), FileWork::BYTES: content.len()}))
     }
 
     /// Writes a temp file beside `target`, then renames it over `target`, so an interrupted
@@ -669,7 +730,7 @@ impl AppendFileTool {
             .open(&target)
             .and_then(|mut file| file.write_all(content.as_bytes()))
             .map_err(WriteLimits::write_error)?;
-        Ok(json!({"path": workspace.display(&target), "bytes": size}))
+        Ok(json!({FileWork::PATH: workspace.display(&target), FileWork::BYTES: size}))
     }
 }
 
@@ -722,7 +783,7 @@ impl MakeDirTool {
         fs::create_dir_all(&target).map_err(|e| format!("{}{e}", Self::CANNOT_CREATE))?;
         // Resolve again: what now exists must still lie inside the write folder.
         let made = workspace.resolve_write(path)?;
-        Ok(json!({"path": workspace.display(&made)}))
+        Ok(json!({FileWork::PATH: workspace.display(&made)}))
     }
 }
 
@@ -759,8 +820,6 @@ impl DeletePathTool {
     const NOT_EMPTY: &'static str = "directory is not empty";
     const ROOT: &'static str = "cannot delete the workspace root";
     const CANNOT_DELETE: &'static str = "cannot delete: ";
-    const FILE: &'static str = "file";
-    const DIR: &'static str = "dir";
 
     fn delete(sandbox: &Sandbox, folder: Option<&Path>, path: &str) -> Result<Value, String> {
         let workspace = Workspace::open(sandbox, folder)?;
@@ -779,12 +838,12 @@ impl DeletePathTool {
                 return Err(Self::NOT_EMPTY.to_string());
             }
             fs::remove_dir(&target).map_err(cannot)?;
-            Self::DIR
+            FileWork::KIND_DIR
         } else {
             fs::remove_file(&target).map_err(cannot)?;
-            Self::FILE
+            FileWork::KIND_FILE
         };
-        Ok(json!({"path": shown, "deleted": deleted}))
+        Ok(json!({FileWork::PATH: shown, FileWork::DELETED: deleted}))
     }
 
     /// Removes the link at `link` (a symlink or, on Windows, a junction) and not its target;
@@ -795,11 +854,11 @@ impl DeletePathTool {
             use std::os::windows::fs::FileTypeExt;
             if fs::symlink_metadata(link)?.file_type().is_symlink_dir() {
                 fs::remove_dir(link)?;
-                return Ok(Self::DIR);
+                return Ok(FileWork::KIND_DIR);
             }
         }
         fs::remove_file(link)?;
-        Ok(Self::FILE)
+        Ok(FileWork::KIND_FILE)
     }
 }
 
@@ -1660,6 +1719,14 @@ pub(crate) mod tests {
             ("trailing.", "trailing."),
             ("trailing ", "trailing "),
             ("dir./x.txt", "dir."),
+            ("CONIN$", "CONIN$"),
+            ("conout$.txt", "conout$.txt"),
+            ("COM\u{b9}", "COM\u{b9}"),
+            ("com\u{b2}.log", "com\u{b2}.log"),
+            ("COM\u{b3}", "COM\u{b3}"),
+            ("LPT\u{b9}", "LPT\u{b9}"),
+            ("lpt\u{b2}", "lpt\u{b2}"),
+            ("LPT\u{b3}.txt", "LPT\u{b3}.txt"),
         ] {
             assert_eq!(
                 Sandbox::normalise(Path::new(bad)),
@@ -1670,6 +1737,8 @@ pub(crate) mod tests {
         for good in [
             "console.txt",
             "com10",
+            "com\u{b9}0",
+            "conin",
             "lpt",
             "nul_x",
             ".hidden",

@@ -20,6 +20,11 @@ impl NoteRules {
     const TEXT_ARG: &'static str = "text";
     const TEXT_MISSING: &'static str = "text must be a string";
     const TEXT_DESCRIPTION: &'static str = "The note text.";
+    /// Result keys of the note tools.
+    const NOTES: &'static str = "notes";
+    const NUMBER: &'static str = "number";
+    const COUNT: &'static str = "count";
+    const CLEARED: &'static str = "cleared";
 
     fn session(ctx: &ToolContext) -> Result<&Arc<dyn SessionHandle>, String> {
         ctx.scope
@@ -95,7 +100,7 @@ impl NoteAddTool {
         if !session.set_notes(notes) {
             return Err(NoteRules::SESSION_DELETED.to_string());
         }
-        Ok(json!({"number": count, "count": count}))
+        Ok(json!({NoteRules::NUMBER: count, NoteRules::COUNT: count}))
     }
 }
 
@@ -133,9 +138,9 @@ impl NoteListTool {
         let numbered: Vec<Value> = notes
             .iter()
             .enumerate()
-            .map(|(i, text)| json!({"number": i + 1, NoteRules::TEXT_ARG: text}))
+            .map(|(i, text)| json!({NoteRules::NUMBER: i + 1, NoteRules::TEXT_ARG: text}))
             .collect();
-        Ok(json!({"notes": numbered}))
+        Ok(json!({NoteRules::NOTES: numbered}))
     }
 }
 
@@ -168,7 +173,7 @@ impl NoteClearTool {
         if !session.set_notes(Vec::new()) {
             return Err(NoteRules::SESSION_DELETED.to_string());
         }
-        Ok(json!({"cleared": cleared}))
+        Ok(json!({NoteRules::CLEARED: cleared}))
     }
 }
 

@@ -34,7 +34,7 @@ export class SessionViewModel extends Observable
     private static readonly NoteFormat = '{0}. {1}'
     private static readonly PropIsNotesExpanded = 'IsNotesExpanded'
     private static readonly PropHasNotes = 'HasNotes'
-    private static readonly Props = ['HasNotes', 'HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
+    private static readonly Props = [SessionViewModel.PropHasNotes, 'HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
 
     public readonly Chat = new ChatViewModel()
     /** The shown session's agent trace, hosted by the instrument panel below its context bar. */

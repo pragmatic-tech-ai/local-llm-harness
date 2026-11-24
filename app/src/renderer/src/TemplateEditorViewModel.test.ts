@@ -261,6 +261,17 @@ describe('TemplateEditorViewModel', () =>
             expect(e.HasWorkspaceNameError).toBe(false)
             expect(e.CanSave).toBe(true)
         }
+        for (const reserved of ['con', 'NUL', 'Aux', 'prn', 'com1', 'LPT9'])
+        {
+            e.WorkspaceName = reserved
+            expect(e.WorkspaceNameError).toBe('workspace name is a reserved Windows device name')
+            expect(e.CanSave).toBe(false)
+        }
+        for (const near of ['console', 'com10', 'lpt', 'nul_x'])
+        {
+            e.WorkspaceName = near
+            expect(e.HasWorkspaceNameError).toBe(false)
+        }
         // Any other mode ignores the name.
         e.WorkspaceName = 'two words'
         e.Workspace = 'shared'

@@ -2423,10 +2423,12 @@ You are terse.<|tool>declaration:echo{";
     impl Retry {
         const ID: &'static str = "c";
         const ECHO: &'static str = "echo";
+        /// A tool that does not exist.
+        const NOPE: &'static str = "nope";
 
         /// A call to a tool that does not exist, so it always fails.
         fn failing(args: Value) -> Value {
-            Notes::call("c", "nope", args)
+            Notes::call(Self::ID, Self::NOPE, args)
         }
 
         /// A parsed call to `name` with `arguments`.
