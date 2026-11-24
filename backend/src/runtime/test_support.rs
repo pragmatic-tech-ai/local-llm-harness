@@ -270,9 +270,10 @@ impl Drop for TempDir {
     }
 }
 
-/// A complete `RuntimeDeps` over temp-dir stores, one `FakeHost` and a registry holding the test
-/// `echo` tool. The template store seeds its `Default` template (id [`Self::TEMPLATE_ID`]) for
-/// runtime [`Self::RUNTIME`] and model [`Self::MODEL`], which the host serves with `link`.
+/// A complete `RuntimeDeps` over temp-dir stores (trace logs in the sessions directory), one
+/// `FakeHost` and a registry holding the test `echo` tool. The template store seeds its `Default`
+/// template (id [`Self::TEMPLATE_ID`]) for runtime [`Self::RUNTIME`] and model [`Self::MODEL`],
+/// which the host serves with `link`.
 pub(crate) struct TestRuntime {
     pub(crate) deps: super::server::RuntimeDeps,
     pub(crate) host: Arc<crate::agents::host::FakeHost>,
@@ -289,6 +290,20 @@ impl TestRuntime {
     const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub(crate) fn new(tag: &str, link: Arc<FakeLink>) -> Self {
+        Self::over(TempDir::new(tag), link)
+    }
+
+    /// A fresh runtime over this one's data directory, as after a supervisor restart.
+    pub(crate) fn reopen(self, link: Arc<FakeLink>) -> Self {
+        Self::over(self.dir, link)
+    }
+
+    /// The sessions directory (session files and their trace logs).
+    pub(crate) fn sessions_dir(&self) -> std::path::PathBuf {
+        self.dir.0.join(Self::SESSIONS_DIR)
+    }
+
+    fn over(dir: TempDir, link: Arc<FakeLink>) -> Self {
         use super::executor::ToolExecutor;
         use super::policy::ReadOnlyPolicy;
         use super::registry::ToolRegistry;
@@ -298,7 +313,6 @@ impl TestRuntime {
         use crate::agents::session_store::SessionStore;
         use crate::agents::template_store::TemplateStore;
 
-        let dir = TempDir::new(tag);
         let registry =
             Arc::new(ToolRegistry::new(vec![TestSource::echo_boxed()]).expect("registry"));
         let executor = Arc::new(ToolExecutor::new(
@@ -320,6 +334,9 @@ impl TestRuntime {
             tool_loop: Arc::new(super::tool_loop::ToolLoop::new(executor, registry)),
             catalog: Arc::new(Self::catalog()),
             hub: Arc::new(super::hub::Hub::new()),
+            traces: Arc::new(super::trace::TraceStore::new(
+                dir.0.join(Self::SESSIONS_DIR),
+            )),
         };
         Self { deps, host, dir }
     }

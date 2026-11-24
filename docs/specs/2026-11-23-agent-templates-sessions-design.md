@@ -366,8 +366,10 @@ Several app windows attached to the same session all receive its notifications.
   - The session file holds `schema: 1`, the snapshot, title, times, sampling/thinking
     overrides and the `ChatMessage` transcript as committed, including any thinking text in
     assistant content.
-  - Per-turn instrument data (logprobs, timing) is **not** persisted. A reloaded session
-    shows its transcript, and its instrument panel starts empty.
+  - Logprobs are **not** persisted. Timing and token counts **are**: since the agent trace
+    (`docs/specs/2026-11-24-agent-trace-design.md`) they live in the session's trace log,
+    `{id}.trace.jsonl`, next to the session file. A reloaded session shows its transcript and
+    its trace (`get_trace`); the rest of its instrument panel starts empty.
   - `ChatMessage` round-trips through serde. The plan adds `Deserialize` where it is missing
     and a round-trip test.
 - **Files and drift.**

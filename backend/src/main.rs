@@ -12,6 +12,7 @@ use backend::runtime::policy::ReadOnlyPolicy;
 use backend::runtime::registry::ToolRegistry;
 use backend::runtime::server::{PlacementWatcher, RuntimeDeps, RuntimeServer};
 use backend::runtime::tool_loop::ToolLoop;
+use backend::runtime::trace::TraceStore;
 use backend::supervisor::catalog::{Catalog, HostConfigs};
 use backend::supervisor::control::{self, RuntimeStatus};
 use backend::supervisor::manager::{HarnessManager, ManagerConfig, ProcessLauncher, WsProbe};
@@ -113,6 +114,8 @@ struct AgentsStack {
     host_names: Vec<String>,
     templates: TemplateStore,
     sessions: SessionStore,
+    /// The sessions' trace logs, in the sessions directory.
+    traces: TraceStore,
     /// The editor's catalog and the template rules: models re-discovered on every read.
     source: Arc<DiscoveredCatalog>,
 }
@@ -156,13 +159,14 @@ impl AgentsStack {
         let templates =
             TemplateStore::open(&data_dir.join(Self::TEMPLATES_DIR), Arc::clone(&source))
                 .map_err(|e| e.to_string())?;
-        let sessions =
-            SessionStore::open(&data_dir.join(Self::SESSIONS_DIR)).map_err(|e| e.to_string())?;
+        let sessions_dir = data_dir.join(Self::SESSIONS_DIR);
+        let sessions = SessionStore::open(&sessions_dir).map_err(|e| e.to_string())?;
         Ok(Self {
             catalog: Arc::clone(catalog),
             host_names,
             templates,
             sessions,
+            traces: TraceStore::new(sessions_dir),
             source,
         })
     }
@@ -193,6 +197,7 @@ impl AgentsStack {
             tool_loop,
             catalog: self.source,
             hub: Arc::new(Hub::new()),
+            traces: Arc::new(self.traces),
         }
     }
 

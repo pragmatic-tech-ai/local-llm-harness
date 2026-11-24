@@ -103,6 +103,16 @@ struct TraceLine<'a> {
     record: &'a TraceRecord,
 }
 
+impl TraceRecord {
+    /// The record as its log line's JSON object (`"v"` and `"kind"` included).
+    pub fn line_value(&self) -> Value {
+        json!(TraceLine {
+            v: SCHEMA_VERSION,
+            record: self,
+        })
+    }
+}
+
 /// One turn on a page: its steps, its summary (absent while running or crash-cut) and
 /// whether a reset sits between it and the previous turn.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -119,6 +129,49 @@ pub struct TracePage {
     pub turns: Vec<TraceTurn>,
     pub more: bool,
     pub reset_pending: bool,
+}
+
+impl TracePage {
+    /// The page as `get_trace` sends it: the [`TracePage`] shape, with every step and summary
+    /// in its log-line shape (`"v"` and `"kind"` included).
+    pub fn wire(self) -> Value {
+        let turns = self
+            .turns
+            .into_iter()
+            .map(|t| WireTurn {
+                turn: t.turn,
+                steps: t
+                    .steps
+                    .into_iter()
+                    .map(|s| TraceRecord::Step(s).line_value())
+                    .collect(),
+                summary: t.summary.map(|s| TraceRecord::Turn(s).line_value()),
+                reset_before: t.reset_before,
+            })
+            .collect();
+        json!(WirePage {
+            turns,
+            more: self.more,
+            reset_pending: self.reset_pending,
+        })
+    }
+}
+
+/// [`TraceTurn`] on the wire: its records as log lines.
+#[derive(Serialize)]
+struct WireTurn {
+    turn: u64,
+    steps: Vec<Value>,
+    summary: Option<Value>,
+    reset_before: bool,
+}
+
+/// [`TracePage`] on the wire.
+#[derive(Serialize)]
+struct WirePage {
+    turns: Vec<WireTurn>,
+    more: bool,
+    reset_pending: bool,
 }
 
 /// What appends need to know, guarded by one lock.
@@ -486,8 +539,6 @@ impl SessionTrace {
     }
 
     /// Appends a `reset` marker to `log`.
-    // The runtime server's `reset_session` calls this once it is wired (agent-trace Task 4).
-    #[allow(dead_code)]
     pub(crate) fn reset(log: &TraceLog) -> io::Result<()> {
         log.append(&TraceRecord::Reset(ResetRecord { at: Self::now_ms() }))
     }
@@ -512,8 +563,16 @@ impl SessionTrace {
     }
 
     async fn warn(&self, message: String, sink: &mut dyn LoopSink) -> Result<(), SinkClosed> {
-        let params = json!({ (Self::FIELD_ID): self.session, (Self::FIELD_MESSAGE): message });
-        sink.notify(Self::M_TRACE_WARNING, params).await
+        sink.notify(
+            Self::M_TRACE_WARNING,
+            Self::warning(&self.session, &message),
+        )
+        .await
+    }
+
+    /// The `trace_warning` params for `session`.
+    pub(crate) fn warning(session: &str, message: &str) -> Value {
+        json!({ (Self::FIELD_ID): session, (Self::FIELD_MESSAGE): message })
     }
 
     /// Wall-clock Unix milliseconds.
@@ -1016,5 +1075,34 @@ mod tests {
         let records = TraceLog::read_records(&d.0.join(FILE)).unwrap();
         assert!(matches!(&records[1], TraceRecord::Reset(r) if r.at > 0));
         assert!(log.page(None, None).unwrap().reset_pending);
+    }
+
+    #[test]
+    fn wire_page_is_the_page_shape_with_log_line_records() {
+        let d = TempDir::new("wire");
+        let log = d.log();
+        log.append(&TempDir::step(1, 1)).unwrap();
+        log.append(&TempDir::summary(1)).unwrap();
+        log.append(&TempDir::step(2, 1)).unwrap();
+        let page = log.page(None, None).unwrap();
+        let plain = json!(&page);
+        let mut wire = page.wire();
+        assert_eq!(wire["turns"][1]["steps"][0]["v"], SCHEMA_VERSION);
+        assert_eq!(wire["turns"][1]["steps"][0]["kind"], "step");
+        assert_eq!(wire["turns"][1]["summary"]["kind"], "turn");
+        assert_eq!(wire["turns"][0]["summary"], Value::Null);
+        // Without `v` and `kind`, the wire page is exactly the page.
+        for turn in wire["turns"].as_array_mut().unwrap() {
+            for step in turn["steps"].as_array_mut().unwrap() {
+                let step = step.as_object_mut().unwrap();
+                step.remove("v");
+                step.remove("kind");
+            }
+            if let Some(summary) = turn["summary"].as_object_mut() {
+                summary.remove("v");
+                summary.remove("kind");
+            }
+        }
+        assert_eq!(wire, plain);
     }
 }

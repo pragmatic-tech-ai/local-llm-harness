@@ -6,6 +6,15 @@
 //! `no session attached` otherwise. Template, catalog and session-list methods need no
 //! attachment.
 //!
+//! Every turn is traced into the session's trace log (`{id}.trace.jsonl`, [`TraceStore`]),
+//! answered or not: the attached connections get `trace_step {id, record}` per loop step and
+//! `trace_turn {id, record}` once the commit is decided (before the `send_turn` result and
+//! `sessions_changed`), and `trace_warning {id, message}` when the log could not be written; the
+//! turn goes on either way. A turn cut off because no connection is left is still logged, with
+//! reason `aborted`. `get_trace {id, before?, limit?}` needs no attachment and pages the log
+//! newest turn first (`{turns, more, reset_pending}`, records in their log-line shape). `reset`
+//! appends a reset marker; `delete_session` deletes the log.
+//!
 //! Every frame for a connection (responses and notifications) goes through its one outbound
 //! channel in the [`Hub`], drained by a writer task, so frames never interleave and a
 //! notification caused by another connection never blocks. Requests on one connection run
@@ -42,6 +51,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures::stream::SplitSink;
@@ -56,7 +66,7 @@ pub use super::catalog_source::{CatalogSource, CatalogView};
 use super::hub::{ConnId, Hub};
 use super::registry::ToolRegistry;
 use super::tool_loop::{LoopSink, SinkClosed, StepLink, ToolLoop, TurnConfig, TurnLinks};
-use super::trace::NoTrace;
+use super::trace::{NoTrace, SessionTrace, TraceLog, TraceStore, TurnTrace};
 use super::worker::WorkerLink;
 use crate::agents::dispatcher::{Dispatcher, Placement};
 use crate::agents::host::{HarnessIdentity, ModelRequirement};
@@ -82,6 +92,8 @@ pub struct RuntimeDeps {
     pub tool_loop: Arc<ToolLoop>,
     pub catalog: Arc<dyn CatalogSource>,
     pub hub: Arc<Hub>,
+    /// The sessions' trace logs, next to their session files.
+    pub traces: Arc<TraceStore>,
 }
 
 /// Accepts websocket connections forever.
@@ -154,7 +166,7 @@ impl<'a> SessionLinks<'a> {
         self.bound.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A step link with no load time measured (Task 4 measures the step-0 load).
+    /// A step link that loaded nothing.
     fn plain(link: Arc<dyn WorkerLink>) -> StepLink {
         StepLink { link, load: None }
     }
@@ -164,9 +176,13 @@ impl<'a> SessionLinks<'a> {
 impl TurnLinks for SessionLinks<'_> {
     async fn link(&self, step: usize) -> Result<StepLink, String> {
         if step == 0 {
+            // The load time is the whole lookup, recorded only when it had to load.
+            let started = Instant::now();
+            let mut loaded = false;
             let link = self
                 .dispatcher
                 .link_for_turn(&self.req, || {
+                    loaded = true;
                     self.hub.to_session(
                         self.session,
                         RuntimeServer::SESSION_LOADING,
@@ -176,7 +192,10 @@ impl TurnLinks for SessionLinks<'_> {
                 .await
                 .map_err(|e| e.0)?;
             *self.bound() = self.dispatcher.identity(&self.req);
-            return Ok(Self::plain(link));
+            return Ok(StepLink {
+                link,
+                load: loaded.then(|| started.elapsed()),
+            });
         }
         let bound = self.bound().clone();
         if let (Some(bound), Some(now)) = (bound, self.dispatcher.identity(&self.req)) {
@@ -322,6 +341,15 @@ struct IdParams {
 }
 
 #[derive(Deserialize)]
+struct GetTraceParams {
+    id: String,
+    #[serde(default)]
+    before: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct PathParams {
     path: String,
 }
@@ -400,6 +428,7 @@ impl RuntimeConnection {
     const M_TOKENIZE: &'static str = "tokenize";
     const M_LIST_TOOLS: &'static str = "list_tools";
     const M_RESET: &'static str = "reset";
+    const M_GET_TRACE: &'static str = "get_trace";
     const ERR_NO_SESSION: &'static str = "no session attached";
     const ERR_BUSY: &'static str = "session is busy";
     const ERR_UNKNOWN_METHOD: &'static str = "unknown method: ";
@@ -412,6 +441,10 @@ impl RuntimeConnection {
     const ERR_DETACHED: &'static str = "session detached";
     /// A request's handling panicked.
     const ERR_REQUEST_FAILED: &'static str = "request failed";
+    /// Logged when the reset marker could not be appended to a session's trace.
+    const ERR_RESET_MARKER: &'static str = "trace reset marker not written for";
+    /// Logged when a deleted session's trace log could not be removed.
+    const ERR_TRACE_DELETE: &'static str = "trace log not deleted for";
 
     /// Registers a connection with the hub; the receiver yields every frame to write to it.
     pub fn new(deps: RuntimeDeps) -> (Self, mpsc::UnboundedReceiver<Value>) {
@@ -588,6 +621,15 @@ impl RuntimeConnection {
             .sessions
             .reset(&rec.id)
             .map_err(RpcError::internal)?;
+        // The trace keeps its history; a failed marker only loses the divider.
+        if let Err(e) = self
+            .deps
+            .traces
+            .log(&rec.id)
+            .and_then(|log| SessionTrace::reset(&log))
+        {
+            eprintln!("{} {}: {e}", Self::ERR_RESET_MARKER, rec.id);
+        }
         Ok(Value::Null)
     }
 
@@ -601,24 +643,30 @@ impl RuntimeConnection {
             .hub
             .hold_busy(&id)
             .ok_or_else(|| RpcError::internal(Self::ERR_BUSY))?;
+        // Taken before the record is read: a delete that lands after the read retires this
+        // handle, so the turn's records never recreate a deleted session's log.
+        let log = self.deps.traces.log(&id).map_err(|e| e.to_string());
         // Read after taking busy, so no other turn or reset changes it underneath.
         let rec = SharedRequests::record(&self.deps, &id).map_err(|_| Self::no_session())?;
         let deps = self.deps.clone();
         let conn = self.conn;
         Ok(Box::pin(async move {
             let _busy = busy;
-            Self::run_turn(&deps, conn, &id, rec, &p.content).await
+            Self::run_turn(&deps, conn, &id, rec, &p.content, log).await
         }))
     }
 
-    /// Runs the turn sent by `conn`. The transcript is committed only when the loop ends
-    /// `Answered`, after `loop_done`.
+    /// Runs the turn sent by `conn`, traced into `log` (untraced, after one `trace_warning`,
+    /// when there is no log). The transcript is committed only when the loop ends `Answered`,
+    /// after `loop_done`; the turn record follows the commit decision and goes out before the
+    /// result and `sessions_changed`.
     async fn run_turn(
         deps: &RuntimeDeps,
         conn: ConnId,
         id: &str,
         rec: SessionRecord,
         content: &str,
+        log: Result<Arc<TraceLog>, String>,
     ) -> Result<Value, RpcError> {
         let config = TurnConfig {
             step_budget: rec.snapshot.step_budget,
@@ -636,35 +684,50 @@ impl RuntimeConnection {
             hub: &deps.hub,
             session: id,
         };
+        let mut session_trace = match log {
+            Ok(log) => Some(SessionTrace::new(log, id.to_string(), content)),
+            Err(message) => {
+                // Best effort: a closed sink is noticed by the loop's first note.
+                let params = SessionTrace::warning(id, &message);
+                let _ = sink.notify(SessionTrace::M_TRACE_WARNING, params).await;
+                None
+            }
+        };
+        let mut no_trace = NoTrace;
+        let trace: &mut dyn TurnTrace = match session_trace.as_mut() {
+            Some(t) => t,
+            None => &mut no_trace,
+        };
         let ran = deps
             .tool_loop
-            .run(
-                &rec.transcript,
-                content,
-                &config,
-                &links,
-                &mut NoTrace,
-                &mut sink,
-            )
+            .run(&rec.transcript, content, &config, &links, trace, &mut sink)
             .await;
-        match ran {
-            Ok((_, Some(transcript))) => {
-                deps.sessions
-                    .commit(id, transcript)
-                    .map_err(|e| RpcError::internal(format!("{}{e}", Self::ERR_NOT_SAVED)))?;
-                // The commit bumped `updated`, so the list order changed.
-                SharedRequests::sessions_changed(deps)
-            }
-            Ok((_, None)) => Ok(Value::Null),
+        let (reason, transcript) = match ran {
+            Ok((end, transcript)) => (Ok(end.reason), transcript),
+            Err(SinkClosed) => (Err(SinkClosed), None),
+        };
+        let saved = transcript.map(|t| deps.sessions.commit(id, t));
+        if let Some(trace) = session_trace {
+            let name =
+                reason.map_or_else(|_| SessionTrace::REASON_ABORTED.to_string(), |r| r.name());
+            let committed = matches!(saved, Some(Ok(())));
+            // The record is in the log whatever the sink says.
+            let _ = trace.finish(&name, committed, &mut sink).await;
+        }
+        match (reason, saved) {
+            // The commit bumped `updated`, so the list order changed.
+            (Ok(_), Some(Ok(()))) => SharedRequests::sessions_changed(deps),
+            (Ok(_), Some(Err(e))) => Err(RpcError::internal(format!("{}{e}", Self::ERR_NOT_SAVED))),
+            (Ok(_), None) => Ok(Value::Null),
             // Deleting a session detaches its connections, which closes the turn's sink.
-            Err(SinkClosed) if !deps.sessions.contains(id) => {
+            (Err(SinkClosed), _) if !deps.sessions.contains(id) => {
                 Err(RpcError::internal(Self::ERR_DELETED))
             }
             // The sender is still connected but attached elsewhere, and no one else was.
-            Err(SinkClosed) if deps.hub.attached(conn).is_some_and(|s| s != id) => {
+            (Err(SinkClosed), _) if deps.hub.attached(conn).is_some_and(|s| s != id) => {
                 Err(RpcError::internal(Self::ERR_DETACHED))
             }
-            Err(SinkClosed) => Err(RpcError::internal(Self::CLIENT_GONE)),
+            (Err(SinkClosed), _) => Err(RpcError::internal(Self::CLIENT_GONE)),
         }
     }
 
@@ -777,8 +840,13 @@ impl SharedRequests {
                 let p: IdParams = Frames::params(params)?;
                 deps.sessions.delete(&p.id).map_err(RpcError::internal)?;
                 deps.hub.detach_session(&p.id);
+                // The session is gone either way; a leftover log is only logged.
+                if let Err(e) = deps.traces.delete(&p.id) {
+                    eprintln!("{} {}: {e}", RuntimeConnection::ERR_TRACE_DELETE, p.id);
+                }
                 Self::sessions_changed(deps)
             }
+            RuntimeConnection::M_GET_TRACE => self.get_trace(params),
             RuntimeConnection::M_LOAD_SESSION_MODEL => self.load_session_model(params).await,
             // Allowed while the session is busy: the running turn keeps its current step, and
             // its next step finds no model and ends `Error` with `no model running`.
@@ -796,6 +864,21 @@ impl SharedRequests {
                 format!("{}{other}", RuntimeConnection::ERR_UNKNOWN_METHOD),
             )),
         }
+    }
+
+    /// A page of the session's trace, newest turn first, records in their log-line shape.
+    fn get_trace(&self, params: Value) -> Result<Value, RpcError> {
+        let p: GetTraceParams = Frames::params(params)?;
+        if !self.deps.sessions.contains(&p.id) {
+            return Err(RpcError::internal(SessionError::unknown(&p.id)));
+        }
+        let page = self
+            .deps
+            .traces
+            .log(&p.id)
+            .and_then(|log| log.page(p.before, p.limit))
+            .map_err(RpcError::internal)?;
+        Ok(page.wire())
     }
 
     /// The template, its group path, and why it fails validation (`null` when it passes). Only
@@ -901,6 +984,7 @@ mod tests {
     use crate::rpc::test_support::TestClient;
     use crate::rpc::{ERR_INVALID_PARAMS, ERR_PARSE};
     use crate::runtime::test_support::{FakeLink, Notes, Scripted, TestRuntime};
+    use crate::runtime::trace::TRACE_FILE_SUFFIX;
     use std::time::Duration;
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -918,6 +1002,10 @@ mod tests {
     const PARAMS: &str = "params";
     const RESULT: &str = "result";
     const LOAD_ERROR: &str = "boom";
+    const RECORD: &str = "record";
+    const TURNS: &str = "turns";
+    const STEPS: &str = "steps";
+    const SUMMARY: &str = "summary";
 
     /// One in-process connection and the frames queued for it.
     struct Client {
@@ -992,6 +1080,18 @@ mod tests {
 
         fn answering() -> Arc<FakeLink> {
             FakeLink::new(true, vec![Self::answer(ANSWER)])
+        }
+
+        /// The first page of `id`'s trace.
+        async fn trace(&mut self, id: &str) -> Value {
+            self.call(C::M_GET_TRACE, json!({ "id": id }))
+                .await
+                .unwrap()
+        }
+
+        /// The trace log file of session `id`.
+        fn trace_file(rt: &TestRuntime, id: &str) -> std::path::PathBuf {
+            rt.sessions_dir().join(format!("{id}{TRACE_FILE_SUFFIX}"))
         }
 
         fn idle() -> Arc<FakeLink> {
@@ -1097,7 +1197,11 @@ mod tests {
         let done = Client::position(&methods, LOOP_DONE);
         assert_eq!(
             &methods[done + 1..],
-            [RuntimeServer::SESSIONS_CHANGED, Hub::SESSION_BUSY]
+            [
+                SessionTrace::M_TRACE_TURN,
+                RuntimeServer::SESSIONS_CHANGED,
+                Hub::SESSION_BUSY
+            ]
         );
         // Persisted: a fresh store over the same directory sees the committed transcript.
         let reopened = SessionStore::open(&rt.dir.0.join("sessions")).unwrap();
@@ -1993,5 +2097,210 @@ mod tests {
         a.open_session().await;
         let err = a.call(C::M_SEND_TURN, json!({})).await.unwrap_err();
         assert_eq!(err.code, ERR_INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn turn_streams_trace_step_and_trace_turn_before_result() {
+        let rt = TestRuntime::new("tracewire", Client::answering());
+        rt.load();
+        let mut a = TestClient::connect_to(Client::serve(&rt).await).await;
+        let (_, row) = a
+            .request(
+                C::M_CREATE_SESSION,
+                json!({ "template_id": TestRuntime::TEMPLATE_ID }),
+            )
+            .await;
+        let id = row[RESULT]["id"].clone();
+        a.request(C::M_ATTACH_SESSION, json!({ "id": id })).await;
+        let (notes, resp) = a
+            .request(C::M_SEND_TURN, json!({ "content": CONTENT }))
+            .await;
+        assert_eq!(resp[RESULT], Value::Null);
+        // Everything in `notes` arrived before the response.
+        let methods = TestClient::methods(&notes);
+        let step = Client::position(&methods, SessionTrace::M_TRACE_STEP);
+        let turn = Client::position(&methods, SessionTrace::M_TRACE_TURN);
+        assert!(step < turn, "{methods:?}");
+        assert!(turn < Client::position(&methods, RuntimeServer::SESSIONS_CHANGED));
+        let steps = TestClient::params_of(&notes, SessionTrace::M_TRACE_STEP);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["id"], id);
+        assert_eq!(steps[0][RECORD]["step"], 1);
+        let summary = &TestClient::params_of(&notes, SessionTrace::M_TRACE_TURN)[0];
+        assert_eq!(summary["id"], id);
+        assert_eq!(summary[RECORD]["reason"], "answered");
+        assert_eq!(summary[RECORD]["committed"], true);
+        let (_, page) = a.request(C::M_GET_TRACE, json!({ "id": id })).await;
+        let page = &page[RESULT];
+        assert_eq!(
+            (page["more"].clone(), page["reset_pending"].clone()),
+            (json!(false), json!(false))
+        );
+        let turns = page[TURNS].as_array().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0][STEPS].as_array().unwrap().len(), 1);
+        assert_eq!(turns[0][STEPS][0]["kind"], "step");
+        assert_eq!(turns[0][SUMMARY]["kind"], "turn");
+        assert_eq!(turns[0][SUMMARY]["v"], 1);
+        for field in ["turn", "reason", "committed", "total_ms", "user"] {
+            assert_eq!(turns[0][SUMMARY][field], summary[RECORD][field], "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_turn_is_traced_uncommitted() {
+        let link = FakeLink::new(
+            true,
+            vec![Notes::script(vec![Notes::started(), Notes::rejected(9, 8)])],
+        );
+        let rt = TestRuntime::new("tracefail", link);
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        a.drain();
+        assert_eq!(a.send().await.unwrap(), Value::Null);
+        let frames = a.drain();
+        let summary = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0][RECORD];
+        assert_eq!(summary["reason"], "window_full");
+        assert_eq!(summary["committed"], false);
+        let page = a.trace(&id).await;
+        assert_eq!(page[TURNS][0][STEPS][0]["end"], "rejected");
+        assert_eq!(page[TURNS][0][SUMMARY]["reason"], "window_full");
+        assert!(rt.deps.sessions.get(&id).unwrap().transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborted_turn_is_in_the_log() {
+        let rt = TestRuntime::new("traceabort", Client::answering());
+        let gate = Client::gated(&rt);
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        let turn = a.spawn_send();
+        Client::until_loading(&rt).await;
+        a.hang_up();
+        gate.add_permits(1);
+        let err = turn.await.unwrap().unwrap_err();
+        assert_eq!(err.message, C::CLIENT_GONE);
+        let mut b = Client::new(&rt);
+        let page = b.trace(&id).await;
+        let turn = &page[TURNS][0];
+        let steps = turn[STEPS].as_array().unwrap();
+        assert_eq!(steps.last().unwrap()["end"], "aborted");
+        assert_eq!(turn[SUMMARY]["reason"], SessionTrace::REASON_ABORTED);
+        assert_eq!(turn[SUMMARY]["committed"], false);
+    }
+
+    #[tokio::test]
+    async fn first_message_load_records_load_ms() {
+        let link = FakeLink::repeating(true, Client::answer(ANSWER));
+        let rt = TestRuntime::new("traceload", link);
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        // The first turn loads the model, the second finds it loaded.
+        a.send().await.unwrap();
+        a.send().await.unwrap();
+        assert_eq!(rt.host.ensure_ready_calls(), 1);
+        let page = a.trace(&id).await;
+        let (second, first) = (&page[TURNS][0], &page[TURNS][1]);
+        assert_eq!(
+            (first["turn"].clone(), second["turn"].clone()),
+            (json!(1), json!(2))
+        );
+        assert!(first[STEPS][0]["load_ms"].is_u64(), "{first}");
+        assert_eq!(second[STEPS][0]["load_ms"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn unwritable_log_warns_and_turn_still_commits() {
+        let rt = TestRuntime::new("tracewarn", Client::answering());
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        std::fs::create_dir(Client::trace_file(&rt, &id)).unwrap();
+        a.drain();
+        assert_eq!(a.send().await.unwrap(), Value::Null);
+        let frames = a.drain();
+        let warnings = TestClient::params_of(&frames, SessionTrace::M_TRACE_WARNING);
+        assert!(!warnings.is_empty(), "{:?}", Client::methods(&frames));
+        assert_eq!(warnings[0]["id"], id.as_str());
+        assert!(!warnings[0]["message"].as_str().unwrap().is_empty());
+        assert_eq!(rt.deps.sessions.get(&id).unwrap().transcript.len(), 2);
+        let summary = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0][RECORD];
+        assert_eq!(summary["committed"], true);
+    }
+
+    #[tokio::test]
+    async fn get_trace_unknown_session_errors() {
+        let rt = TestRuntime::new("traceunknown", Client::idle());
+        let mut a = Client::new(&rt);
+        let missing = "nope";
+        let err = a
+            .call(C::M_GET_TRACE, json!({ "id": missing }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::rpc::ERR_INTERNAL);
+        assert_eq!(err.message, SessionError::unknown(missing).0);
+    }
+
+    #[tokio::test]
+    async fn get_trace_needs_no_attach() {
+        let rt = TestRuntime::new("tracenoattach", Client::idle());
+        let mut a = Client::new(&rt);
+        let id = a.create().await;
+        assert_eq!(
+            a.trace(&id).await,
+            json!({ "turns": [], "more": false, "reset_pending": false })
+        );
+        let page = a
+            .call(C::M_GET_TRACE, json!({ "id": id, "before": 5, "limit": 3 }))
+            .await
+            .unwrap();
+        assert_eq!(page[TURNS], json!([]));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_trace_and_reset_appends_marker() {
+        let rt = TestRuntime::new("tracedelete", Client::answering());
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        a.send().await.unwrap();
+        a.call(C::M_RESET, Value::Null).await.unwrap();
+        let page = a.trace(&id).await;
+        assert_eq!(page["reset_pending"], true);
+        assert_eq!(page[TURNS].as_array().unwrap().len(), 1);
+        let file = Client::trace_file(&rt, &id);
+        assert!(file.is_file());
+        a.call(C::M_DELETE_SESSION, json!({ "id": id }))
+            .await
+            .unwrap();
+        assert!(!file.exists());
+    }
+
+    #[tokio::test]
+    async fn turn_numbers_continue_after_restart() {
+        let rt = TestRuntime::new("tracerestart", Client::answering());
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        a.send().await.unwrap();
+        drop(a);
+        let rt = rt.reopen(Client::answering());
+        rt.load();
+        let mut b = Client::new(&rt);
+        b.attach(&id).await;
+        b.drain();
+        b.send().await.unwrap();
+        let frames = b.drain();
+        let summary = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0][RECORD];
+        assert_eq!(summary["turn"], 2);
+        let page = b.trace(&id).await;
+        let turns: Vec<&Value> = page[TURNS]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| &t["turn"])
+            .collect();
+        assert_eq!(turns, [&json!(2), &json!(1)]);
     }
 }

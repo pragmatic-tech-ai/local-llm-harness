@@ -47,6 +47,13 @@ pub enum EndReason {
     NoHarness,
 }
 
+impl EndReason {
+    /// The reason as `loop_done` sends it (snake_case, e.g. `window_full`).
+    pub fn name(self) -> String {
+        json!(self).as_str().unwrap_or_default().to_string()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopEnd {
     pub steps: usize,
