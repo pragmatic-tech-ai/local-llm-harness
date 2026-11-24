@@ -155,15 +155,17 @@ impl AgentsStack {
         host_names: Vec<String>,
         registry: &ToolRegistry,
     ) -> Result<Self, String> {
+        let specs = registry.specs();
+        let writing_tools = specs
+            .iter()
+            .filter(|s| s.side_effects)
+            .map(|s| s.name.clone())
+            .collect();
+        let tools = specs.into_iter().map(|s| s.name).collect();
         let source = Arc::new(DiscoveredCatalog::new(
             Arc::clone(catalog),
-            registry.specs().into_iter().map(|s| s.name).collect(),
-            registry
-                .specs()
-                .into_iter()
-                .filter(|s| s.side_effects)
-                .map(|s| s.name)
-                .collect(),
+            tools,
+            writing_tools,
             host_names.clone(),
         ));
         let data_dir = catalog.agents.data_dir();

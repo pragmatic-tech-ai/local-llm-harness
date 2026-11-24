@@ -1281,4 +1281,25 @@ n_ctx = 4096
         s.save(Some("a"), "\u{e9}", &t).unwrap();
         assert_eq!(s.get("a").unwrap().0.system_prompt, "new content");
     }
+
+    #[test]
+    fn save_drops_name_on_a_non_named_workspace() {
+        let d = TempDir::new("wsnormalize");
+        let s = d.store();
+        let mut t = TempDir::sample("Shared");
+        t.workspace = WorkspaceConfig {
+            mode: crate::agents::template::WorkspaceMode::Shared,
+            name: Some("research".into()),
+        };
+        let id = s.save(None, "grp", &t).unwrap();
+        let (saved, _) = s.get(&id).unwrap();
+        assert_eq!(
+            saved.workspace.mode,
+            crate::agents::template::WorkspaceMode::Shared
+        );
+        assert_eq!(saved.workspace.name, None);
+        let file = fs::read_to_string(d.0.join("templates").join("grp").join(format!("{id}.toml")))
+            .unwrap();
+        assert!(!file.contains("research"), "{file}");
+    }
 }

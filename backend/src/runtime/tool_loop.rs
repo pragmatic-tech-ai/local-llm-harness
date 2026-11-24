@@ -100,22 +100,41 @@ pub struct TurnConfig {
 /// again gets the retry hint. Any `ToolOutcome::Err` counts, executor refusals included.
 #[derive(Debug, Default)]
 struct RepeatGuard {
-    last_failed: Option<(String, Value)>,
+    last_failed: Option<CallKey>,
+}
+
+/// What makes two calls identical: the name and arguments, and for a call that did not parse,
+/// its raw text and parse error too (its arguments are then usually null).
+#[derive(Debug, Clone, PartialEq)]
+struct CallKey {
+    name: String,
+    arguments: Value,
+    unparsed: Option<(String, String)>,
+}
+
+impl CallKey {
+    fn of(call: &ParsedCall) -> Self {
+        Self {
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            unparsed: call
+                .parse_error
+                .as_ref()
+                .map(|e| (call.raw.clone(), e.clone())),
+        }
+    }
 }
 
 impl RepeatGuard {
     const FIELD_HINT: &'static str = "hint";
     const HINT: &'static str = "This call already failed twice; try something different.";
 
-    /// True when this call failed and the remembered failure was the same name with equal
-    /// arguments. Remembers the call when it failed and forgets otherwise.
-    fn observe(&mut self, name: &str, args: &Value, ok: bool) -> bool {
-        let repeat = !ok
-            && self
-                .last_failed
-                .as_ref()
-                .is_some_and(|(n, a)| n == name && a == args);
-        self.last_failed = (!ok).then(|| (name.to_string(), args.clone()));
+    /// True when this call failed and the remembered failure was the same call (see
+    /// [`CallKey`]). Remembers the call when it failed and forgets otherwise.
+    fn observe(&mut self, call: &ParsedCall, ok: bool) -> bool {
+        let key = (!ok).then(|| CallKey::of(call));
+        let repeat = key.is_some() && self.last_failed == key;
+        self.last_failed = key;
         repeat
     }
 
@@ -480,7 +499,7 @@ impl ToolLoop {
                     .execute(&Self::request_of(call), &config.tools, &config.scope)
                     .await;
                 let ms = StepMeter::millis(started.elapsed());
-                let repeat = guard.observe(&call.name, &call.arguments, outcome.is_ok());
+                let repeat = guard.observe(call, outcome.is_ok());
                 let mut result = outcome.result_value();
                 if repeat {
                     RepeatGuard::hint(&mut result);
@@ -780,7 +799,9 @@ mod tests {
     use crate::runtime::compaction::{Summarize, SummaryNote, SummarySink, Trim};
     use crate::runtime::notes::NoteAddTool;
     use crate::runtime::policy::EnabledPolicy;
-    use crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink, Scripted};
+    use crate::runtime::test_support::{
+        FakeConnector, FakeLink, FakeSession, Notes, RecordingSink, Scripted,
+    };
     use crate::runtime::test_tools::TestSource;
     use crate::runtime::tool::{SessionHandle, ToolSource};
     use crate::runtime::trace::NoTrace;
@@ -2396,36 +2417,38 @@ You are terse.<|tool>declaration:echo{";
         assert_eq!(f.transcript[..4], Compaction::long_turns()[..]);
     }
 
-    /// A live session whose notes the test and the note tools share.
-    #[derive(Default)]
-    struct FakeSession {
-        notes: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl SessionHandle for FakeSession {
-        fn notes(&self) -> Option<Vec<String>> {
-            Some(self.notes.lock().unwrap().clone())
-        }
-
-        fn set_notes(&self, notes: Vec<String>) -> bool {
-            *self.notes.lock().unwrap() = notes;
-            true
-        }
-
-        fn exists(&self) -> bool {
-            true
-        }
-    }
-
     /// Retry-guard fixtures.
     struct Retry;
 
     impl Retry {
-        const HINT: &'static str = "This call already failed twice; try something different.";
+        const ID: &'static str = "c";
+        const ECHO: &'static str = "echo";
 
         /// A call to a tool that does not exist, so it always fails.
         fn failing(args: Value) -> Value {
             Notes::call("c", "nope", args)
+        }
+
+        /// A parsed call to `name` with `arguments`.
+        fn parsed(name: &str, arguments: Value) -> ParsedCall {
+            ParsedCall {
+                id: Self::ID.into(),
+                name: name.into(),
+                arguments,
+                raw: String::new(),
+                parse_error: None,
+            }
+        }
+
+        /// A call to `echo` whose text `raw` did not parse, failing with `error`.
+        fn unparsed(raw: &str, error: &str) -> ParsedCall {
+            ParsedCall {
+                id: Self::ID.into(),
+                name: Self::ECHO.into(),
+                arguments: Value::Null,
+                raw: raw.into(),
+                parse_error: Some(error.into()),
+            }
         }
 
         /// Whether each `tool_result` carries the hint, in order.
@@ -2476,7 +2499,7 @@ You are terse.<|tool>declaration:echo{";
     async fn notes_block_is_sent_on_every_step_and_never_committed() {
         let source = TestSource::new(vec![Arc::new(NoteAddTool)]);
         let mut f = Fixture::with_sources(vec![Box::new(source)], &["note_add"]);
-        let session = Arc::new(FakeSession::default());
+        let session = FakeSession::alive();
         f.config.scope = ToolScope {
             workspace: None,
             session: Some(session.clone()),
@@ -2522,7 +2545,7 @@ You are terse.<|tool>declaration:echo{";
         assert_eq!(hinted["ok"], false);
         assert_eq!(
             hinted["content"],
-            json!({"error": "unknown tool: nope", "hint": Retry::HINT})
+            json!({"error": "unknown tool: nope", "hint": RepeatGuard::HINT})
         );
         // The transcript stores exactly what the model and the client saw.
         let sent: Vec<Value> = f
@@ -2592,12 +2615,36 @@ You are terse.<|tool>declaration:echo{";
     #[test]
     fn repeat_guard_compares_name_and_arguments() {
         let mut guard = RepeatGuard::default();
-        assert!(!guard.observe("a", &json!({"x": 1}), false));
-        assert!(!guard.observe("b", &json!({"x": 1}), false));
-        assert!(guard.observe("b", &json!({"x": 1}), false));
-        assert!(!guard.observe("b", &json!({"x": 1}), true));
-        assert!(!guard.observe("b", &json!({"x": 1}), false));
-        assert!(!guard.observe("b", &json!({"x": 2}), false));
-        assert_eq!(guard.last_failed, Some(("b".into(), json!({"x": 2}))));
+        assert!(!guard.observe(&Retry::parsed("a", json!({"x": 1})), false));
+        assert!(!guard.observe(&Retry::parsed("b", json!({"x": 1})), false));
+        assert!(guard.observe(&Retry::parsed("b", json!({"x": 1})), false));
+        assert!(!guard.observe(&Retry::parsed("b", json!({"x": 1})), true));
+        assert!(!guard.observe(&Retry::parsed("b", json!({"x": 1})), false));
+        assert!(!guard.observe(&Retry::parsed("b", json!({"x": 2})), false));
+        assert_eq!(
+            guard.last_failed,
+            Some(CallKey::of(&Retry::parsed("b", json!({"x": 2}))))
+        );
+    }
+
+    #[test]
+    fn repeat_guard_tells_unparsed_calls_apart_by_raw_text() {
+        let mut guard = RepeatGuard::default();
+        assert!(!guard.observe(&Retry::unparsed("{bad", "eof"), false));
+        assert!(guard.observe(&Retry::unparsed("{bad", "eof"), false));
+        // Same name, same (null) arguments, different text: not a repeat.
+        assert!(!guard.observe(&Retry::unparsed("{worse", "eof"), false));
+        assert!(!guard.observe(&Retry::unparsed("{worse", "key"), false));
+        // A parsed call with null arguments differs from an unparsed one.
+        assert!(!guard.observe(&Retry::parsed("echo", Value::Null), false));
+    }
+
+    #[test]
+    fn retry_hint_text_is_verbatim() {
+        assert_eq!(
+            RepeatGuard::HINT,
+            "This call already failed twice; try something different."
+        );
+        assert_eq!(RepeatGuard::FIELD_HINT, "hint");
     }
 }

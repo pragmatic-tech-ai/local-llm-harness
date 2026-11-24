@@ -2584,10 +2584,17 @@ mod tests {
         let calls = link.requests();
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].messages[1].content.contains(NotesBlock::HEADER));
-        assert!(link
-            .measured()
+        let measured = link.measured();
+        let summary_measures: Vec<_> = measured
             .iter()
             .filter(|r| r.messages[0].content == Summarize::SYSTEM_PROMPT)
+            .collect();
+        assert!(
+            !summary_measures.is_empty(),
+            "the summary call is measured too"
+        );
+        assert!(summary_measures
+            .iter()
             .all(|r| !r.messages[1].content.contains(NotesBlock::HEADER)));
     }
 

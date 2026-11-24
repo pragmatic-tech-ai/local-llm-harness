@@ -291,6 +291,9 @@ struct SessionNotes {
 }
 
 impl SessionNotes {
+    /// Logged when notes could not be saved on a session that still exists (a disk error).
+    const ERR_NOTES_NOT_SAVED: &'static str = "notes not saved for";
+
     /// Sends `notes_changed {id, notes}` to the connections attached to session `id`.
     fn announce(hub: &Hub, id: &str, notes: &[String]) {
         hub.to_session(
@@ -303,15 +306,16 @@ impl SessionNotes {
 
 impl SessionHandle for SessionNotes {
     fn notes(&self) -> Option<Vec<String>> {
-        self.sessions.get(&self.session).map(|rec| rec.notes)
+        self.sessions.notes(&self.session)
     }
 
+    /// False when the save failed; a failure on a session that still exists is logged, so a
+    /// disk error is not mistaken for a deletion.
     fn set_notes(&self, notes: Vec<String>) -> bool {
-        if self
-            .sessions
-            .set_notes(&self.session, notes.clone())
-            .is_err()
-        {
+        if let Err(e) = self.sessions.set_notes(&self.session, notes.clone()) {
+            if self.sessions.contains(&self.session) {
+                eprintln!("{} {}: {e}", Self::ERR_NOTES_NOT_SAVED, self.session);
+            }
             return false;
         }
         Self::announce(&self.hub, &self.session, &notes);
@@ -2891,6 +2895,9 @@ mod tests {
         const WRITE_FILE: &'static str = "write_file";
         const LINK: &'static str = "link";
         const SHARED: &'static str = "shared";
+        const SHARED_AGENT: &'static str = "SharedAgent";
+        const NAMED_AGENT: &'static str = "NamedAgent";
+        const MISSING: &'static str = "nope";
 
         /// A link whose first step calls `name` with `args`, then answers.
         fn calling(name: &str, args: Value) -> Arc<FakeLink> {
@@ -2976,13 +2983,12 @@ mod tests {
             .unwrap();
         let notes = a.call(C::M_GET_NOTES, json!({ "id": id })).await.unwrap();
         assert_eq!(notes, json!({ Workspaces::NOTES: [Workspaces::NOTE] }));
-        let missing = "nope";
         let err = a
-            .call(C::M_GET_NOTES, json!({ "id": missing }))
+            .call(C::M_GET_NOTES, json!({ "id": Workspaces::MISSING }))
             .await
             .unwrap_err();
         assert_eq!(err.code, crate::rpc::ERR_INTERNAL);
-        assert_eq!(err.message, SessionError::unknown(missing).0);
+        assert_eq!(err.message, SessionError::unknown(Workspaces::MISSING).0);
     }
 
     #[tokio::test]
@@ -3040,7 +3046,10 @@ mod tests {
             mode: WorkspaceMode::Named,
             name: Some(Workspaces::TEAM.into()),
         };
-        for (name, workspace) in [("SharedAgent", shared), ("NamedAgent", named)] {
+        for (name, workspace) in [
+            (Workspaces::SHARED_AGENT, shared),
+            (Workspaces::NAMED_AGENT, named),
+        ] {
             let template_id = Workspaces::template_with(&rt, name, workspace.clone());
             let id = Workspaces::create_from(&mut a, &template_id).await;
             let folder = Workspaces::folder_with_file(&rt, &workspace.folder(&id));

@@ -19,6 +19,7 @@ impl NoteRules {
     const LIMIT: &'static str = "note limit reached (20); use note_clear to start over";
     const TEXT_ARG: &'static str = "text";
     const TEXT_MISSING: &'static str = "text must be a string";
+    const TEXT_DESCRIPTION: &'static str = "The note text.";
 
     fn session(ctx: &ToolContext) -> Result<&Arc<dyn SessionHandle>, String> {
         ctx.scope
@@ -33,6 +34,30 @@ impl NoteRules {
             .ok_or_else(|| Self::SESSION_DELETED.to_string())
     }
 
+    /// A note as stored: every run of line breaks collapsed into one space, so a note is one
+    /// line of the numbered block.
+    fn one_line(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut in_break = false;
+        for c in text.chars() {
+            if c == '\r' || c == '\n' {
+                if !in_break {
+                    out.push(' ');
+                }
+                in_break = true;
+            } else {
+                out.push(c);
+                in_break = false;
+            }
+        }
+        out
+    }
+
+    /// The parameters of a tool that takes no arguments.
+    fn no_arguments() -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+
     fn outcome(result: Result<Value, String>) -> ToolOutcome {
         match result {
             Ok(v) => ToolOutcome::Ok(v),
@@ -45,12 +70,16 @@ impl NoteRules {
 pub struct NoteAddTool;
 
 impl NoteAddTool {
+    const NAME: &'static str = "note_add";
+    const DESCRIPTION: &'static str = "Add a short note (up to 300 characters, 20 notes max) to your scratchpad. Notes stay visible to you on every turn.";
+
     fn add(args: &Value, ctx: &ToolContext) -> Result<Value, String> {
         let session = NoteRules::session(ctx)?;
         let mut notes = NoteRules::current(session)?;
         let text = args
             .get(NoteRules::TEXT_ARG)
             .and_then(Value::as_str)
+            .map(NoteRules::one_line)
             .ok_or_else(|| NoteRules::TEXT_MISSING.to_string())?;
         if text.trim().is_empty() {
             return Err(NoteRules::EMPTY.to_string());
@@ -61,7 +90,7 @@ impl NoteAddTool {
         if notes.len() >= NoteRules::MAX_NOTES {
             return Err(NoteRules::LIMIT.to_string());
         }
-        notes.push(text.to_string());
+        notes.push(text);
         let count = notes.len();
         if !session.set_notes(notes) {
             return Err(NoteRules::SESSION_DELETED.to_string());
@@ -74,12 +103,14 @@ impl NoteAddTool {
 impl Tool for NoteAddTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "note_add".into(),
-            description: "Add a short note (up to 300 characters, 20 notes max) to your scratchpad. Notes stay visible to you on every turn.".into(),
+            name: Self::NAME.into(),
+            description: Self::DESCRIPTION.into(),
             parameters: json!({
                 "type": "object",
-                "properties": {"text": {"type": "string", "description": "The note text."}},
-                "required": ["text"]
+                "properties": {
+                    NoteRules::TEXT_ARG: {"type": "string", "description": NoteRules::TEXT_DESCRIPTION}
+                },
+                "required": [NoteRules::TEXT_ARG]
             }),
             side_effects: false,
         }
@@ -94,12 +125,15 @@ impl Tool for NoteAddTool {
 pub struct NoteListTool;
 
 impl NoteListTool {
+    const NAME: &'static str = "note_list";
+    const DESCRIPTION: &'static str = "List the notes on your scratchpad, numbered.";
+
     fn list(ctx: &ToolContext) -> Result<Value, String> {
         let notes = NoteRules::current(NoteRules::session(ctx)?)?;
         let numbered: Vec<Value> = notes
             .iter()
             .enumerate()
-            .map(|(i, text)| json!({"number": i + 1, "text": text}))
+            .map(|(i, text)| json!({"number": i + 1, NoteRules::TEXT_ARG: text}))
             .collect();
         Ok(json!({"notes": numbered}))
     }
@@ -109,9 +143,9 @@ impl NoteListTool {
 impl Tool for NoteListTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "note_list".into(),
-            description: "List the notes on your scratchpad, numbered.".into(),
-            parameters: json!({"type": "object", "properties": {}}),
+            name: Self::NAME.into(),
+            description: Self::DESCRIPTION.into(),
+            parameters: NoteRules::no_arguments(),
             side_effects: false,
         }
     }
@@ -125,6 +159,9 @@ impl Tool for NoteListTool {
 pub struct NoteClearTool;
 
 impl NoteClearTool {
+    const NAME: &'static str = "note_clear";
+    const DESCRIPTION: &'static str = "Remove every note from your scratchpad.";
+
     fn clear(ctx: &ToolContext) -> Result<Value, String> {
         let session = NoteRules::session(ctx)?;
         let cleared = NoteRules::current(session)?.len();
@@ -139,9 +176,9 @@ impl NoteClearTool {
 impl Tool for NoteClearTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "note_clear".into(),
-            description: "Remove every note from your scratchpad.".into(),
-            parameters: json!({"type": "object", "properties": {}}),
+            name: Self::NAME.into(),
+            description: Self::DESCRIPTION.into(),
+            parameters: NoteRules::no_arguments(),
             side_effects: false,
         }
     }
@@ -197,40 +234,8 @@ impl NotesBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::test_support::FakeSession;
     use crate::runtime::tool::ToolScope;
-    use std::sync::Mutex;
-
-    /// A session whose notes are None once deleted.
-    struct FakeSession {
-        notes: Mutex<Option<Vec<String>>>,
-    }
-
-    impl FakeSession {
-        fn alive() -> Arc<Self> {
-            Arc::new(Self {
-                notes: Mutex::new(Some(Vec::new())),
-            })
-        }
-    }
-
-    impl SessionHandle for FakeSession {
-        fn notes(&self) -> Option<Vec<String>> {
-            self.notes.lock().unwrap().clone()
-        }
-
-        fn set_notes(&self, notes: Vec<String>) -> bool {
-            let mut guard = self.notes.lock().unwrap();
-            if guard.is_none() {
-                return false;
-            }
-            *guard = Some(notes);
-            true
-        }
-
-        fn exists(&self) -> bool {
-            self.notes.lock().unwrap().is_some()
-        }
-    }
 
     struct Calls;
 
@@ -348,11 +353,55 @@ mod tests {
     async fn notes_on_deleted_session_fail() {
         let session = FakeSession::alive();
         let ctx = Calls::ctx(Some(session.clone()));
-        *session.notes.lock().unwrap() = None;
+        session.delete();
         let want = Calls::err("session deleted");
         assert_eq!(Calls::add(&ctx, "a").await, want);
         assert_eq!(NoteListTool.call(json!({}), &ctx).await, want);
         assert_eq!(NoteClearTool.call(json!({}), &ctx).await, want);
+    }
+
+    #[tokio::test]
+    async fn failed_save_reports_session_deleted() {
+        let session = FakeSession::refusing_saves();
+        let ctx = Calls::ctx(Some(session.clone()));
+        let want = Calls::err("session deleted");
+        assert_eq!(Calls::add(&ctx, "a").await, want);
+        assert_eq!(NoteClearTool.call(json!({}), &ctx).await, want);
+        assert_eq!(session.notes(), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn line_breaks_collapse_to_one_space() {
+        let session = FakeSession::alive();
+        let ctx = Calls::ctx(Some(session.clone()));
+        assert!(Calls::add(&ctx, "plan:\r\n\n1. read\n2. write")
+            .await
+            .is_ok());
+        assert_eq!(
+            session.notes(),
+            Some(vec!["plan: 1. read 2. write".to_string()])
+        );
+        assert_eq!(
+            NotesBlock::text(&session.notes().unwrap()),
+            Some("[Your notes]\n1. plan: 1. read 2. write".into())
+        );
+        // The length is checked after collapsing: 300 chars split by a line break fit.
+        let split = format!("{}\r\n{}", "a".repeat(150), "b".repeat(149));
+        assert!(Calls::add(&ctx, &split).await.is_ok());
+        assert_eq!(
+            Calls::add(&ctx, "\n\r\n").await,
+            Calls::err("note text is empty")
+        );
+    }
+
+    #[test]
+    fn rule_texts_match_the_limits() {
+        let chars = NoteRules::MAX_CHARS.to_string();
+        let notes = format!("({})", NoteRules::MAX_NOTES);
+        assert!(NoteRules::TOO_LONG.contains(&chars));
+        assert!(NoteRules::LIMIT.contains(&notes));
+        assert!(NoteAddTool::DESCRIPTION.contains(&format!("{chars} characters")));
+        assert!(NoteAddTool::DESCRIPTION.contains(&format!("{} notes", NoteRules::MAX_NOTES)));
     }
 
     #[test]

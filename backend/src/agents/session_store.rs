@@ -183,6 +183,11 @@ impl SessionStore {
         self.lock().get(id).cloned()
     }
 
+    /// The session's notes alone, without cloning the rest of the record.
+    pub fn notes(&self, id: &str) -> Option<Vec<String>> {
+        self.lock().get(id).map(|r| r.notes.clone())
+    }
+
     /// Retitles the session and bumps `updated`.
     pub fn rename(&self, id: &str, title: &str) -> Result<(), SessionError> {
         self.mutate(id, Bump::Updated, |r| r.title = title.to_string())
@@ -747,6 +752,8 @@ mod tests {
         drop(s);
         let s = d.store();
         assert_eq!(s.get(&rec.id).unwrap().notes, notes);
+        assert_eq!(s.notes(&rec.id), Some(notes));
+        assert_eq!(s.notes("nope"), None);
     }
 
     #[test]

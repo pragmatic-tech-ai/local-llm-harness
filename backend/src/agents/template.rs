@@ -388,10 +388,7 @@ mod tests {
 
     #[test]
     fn workspace_named_round_trips() {
-        let text = format!("{BASE}[workspace]
-mode = \"named\"
-name = \"research\"
-");
+        let text = format!("{BASE}[workspace]\nmode = \"named\"\nname = \"research\"\n");
         let t: AgentTemplate = toml::from_str(&text).unwrap();
         assert_eq!(t.workspace.mode, WorkspaceMode::Named);
         assert_eq!(t.workspace.name.as_deref(), Some("research"));
@@ -401,9 +398,7 @@ name = \"research\"
 
     #[test]
     fn unknown_workspace_mode_is_rejected() {
-        let text = format!("{BASE}[workspace]
-mode = \"bogus\"
-");
+        let text = format!("{BASE}[workspace]\nmode = \"bogus\"\n");
         let e = toml::from_str::<AgentTemplate>(&text)
             .unwrap_err()
             .to_string();
@@ -473,7 +468,9 @@ mode = \"bogus\"
         assert_eq!(shared.folder("s-1-0"), std::path::PathBuf::from("shared"));
         assert_eq!(
             named.folder("s-1-0"),
-            ["workspaces", "research"].iter().collect::<std::path::PathBuf>()
+            ["workspaces", "research"]
+                .iter()
+                .collect::<std::path::PathBuf>()
         );
     }
 }
