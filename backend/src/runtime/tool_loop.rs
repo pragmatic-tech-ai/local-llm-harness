@@ -1,4 +1,6 @@
 //! The tool loop: generate, run the requested tools, generate again, until the model answers.
+//! Each step's prompt first goes through the turn's [`Compactor`], which may send a compacted
+//! copy of the transcript; the transcript itself is never compacted.
 
 use std::fmt;
 use std::sync::Arc;
@@ -10,11 +12,13 @@ use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use super::compaction::Compactor;
 use super::executor::ToolExecutor;
 use super::registry::ToolRegistry;
 use super::tool::ToolCallRequest;
-use super::trace::{StepOutcome, StepRecord, ToolTiming, TurnTrace};
+use super::trace::{CompactionRecord, StepOutcome, StepRecord, ToolTiming, TurnTrace};
 use super::worker::{GenerateRequest, LinkError, Note, WorkerLink};
+use crate::agents::template::ContextStrategy;
 use crate::engine::tool_format::{NoThinkCounter, ParsedCall, ThinkCounter, ThinkCounters};
 use crate::engine::types::{FunctionCall, ToolCall};
 use crate::engine::{ChatMessage, Role, SamplingConfig};
@@ -82,6 +86,10 @@ pub struct TurnConfig {
     pub tools: Vec<String>,
     pub enable_thinking: bool,
     pub sampling: SamplingConfig,
+    /// How the prompt is kept inside the window (the session's snapshot).
+    pub context_strategy: ContextStrategy,
+    /// The budget, as a percentage of the window, past which the prompt is compacted.
+    pub compact_at_pct: u8,
 }
 
 /// The link for one step, and the time spent loading the model to get it.
@@ -134,6 +142,8 @@ struct StepMeter {
     /// When the note ending generation arrived (or the stream broke).
     generated: Option<Instant>,
     tools: Vec<ToolTiming>,
+    /// What compaction did to this step's prompt, if it ran.
+    compaction: Option<CompactionRecord>,
 }
 
 impl StepMeter {
@@ -154,6 +164,7 @@ impl StepMeter {
             first_chunk: None,
             generated: None,
             tools: Vec::new(),
+            compaction: None,
         }
     }
 
@@ -232,7 +243,7 @@ impl StepMeter {
             end,
             tools: self.tools,
             error,
-            compaction: None,
+            compaction: self.compaction,
         }
     }
 
@@ -306,6 +317,12 @@ impl ToolLoop {
     /// link error: without it we cannot know whether to send tools, and guessing would either
     /// break a tool-less model or silently disable tools.
     ///
+    /// Before each step's `generate`, `compactor` prepares the prompt from the scratch
+    /// transcript (with the step's tools and thinking flag); the compacted messages are sent
+    /// and the compaction record goes on that step's trace record. The scratch transcript,
+    /// and so the transcript returned for commit, is never compacted. Any summary call made
+    /// on the way is consumed internally; none of its notes reach `sink`.
+    ///
     /// Every step is measured and reported to `trace` once, when it ends (after its tools, if
     /// any, and before the loop's own closing notes). A step that fails before reaching the
     /// worker is reported with no fill. When the sink closes inside a step, that step is
@@ -316,11 +333,13 @@ impl ToolLoop {
         transcript: &[ChatMessage],
         content: &str,
         config: &TurnConfig,
+        compactor: &mut Compactor,
         links: &dyn TurnLinks,
         trace: &mut dyn TurnTrace,
         sink: &mut dyn LoopSink,
     ) -> Result<(LoopEnd, Option<Vec<ChatMessage>>), SinkClosed> {
         let mut scratch = transcript.to_vec();
+        let current_turn_start = scratch.len();
         scratch.push(ChatMessage::new(Role::User, content));
 
         let mut steps = 0;
@@ -347,8 +366,19 @@ impl ToolLoop {
                 Err(e) => return Self::failed_step(trace, sink, meter, steps, e.0).await,
             };
             steps += 1;
+            let compacted = compactor
+                .prepare(
+                    &scratch,
+                    current_turn_start,
+                    &tools,
+                    config.enable_thinking,
+                    config.sampling.max_tokens,
+                    link.as_ref(),
+                )
+                .await;
+            meter.compaction = compacted.record;
             let request = GenerateRequest {
-                messages: scratch.clone(),
+                messages: compacted.messages,
                 tools,
                 enable_thinking: config.enable_thinking,
                 sampling: config.sampling.clone(),
@@ -688,12 +718,15 @@ impl ToolLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::template::{CompactionState, DEFAULT_COMPACT_AT_PCT};
     use crate::engine::template::ChatTemplate;
+    use crate::runtime::compaction::{Summarize, SummaryNote, SummarySink, Trim};
     use crate::runtime::policy::ReadOnlyPolicy;
     use crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink, Scripted};
     use crate::runtime::test_tools::TestSource;
     use crate::runtime::tool::ToolSource;
     use crate::runtime::trace::NoTrace;
+    use crate::runtime::worker::PromptSize;
     use std::time::Duration;
 
     const CAP: usize = 8;
@@ -783,6 +816,7 @@ mod tests {
         /// The committed transcript, as the caller of `run` keeps it.
         transcript: Vec<ChatMessage>,
         config: TurnConfig,
+        compactor: Compactor,
         sink: RecordingSink,
         trace: RecordingTrace,
     }
@@ -808,7 +842,10 @@ mod tests {
                     tools: enabled.iter().map(|n| n.to_string()).collect(),
                     enable_thinking: false,
                     sampling: SamplingConfig::default(),
+                    context_strategy: ContextStrategy::default(),
+                    compact_at_pct: DEFAULT_COMPACT_AT_PCT,
                 },
+                compactor: Compactor::off(),
                 sink: RecordingSink::new(),
                 trace: RecordingTrace::default(),
             }
@@ -826,6 +863,7 @@ mod tests {
                     &self.transcript,
                     "q",
                     &self.config,
+                    &mut self.compactor,
                     connector,
                     &mut self.trace,
                     &mut self.sink,
@@ -1570,7 +1608,15 @@ You are terse.<|tool>declaration:echo{";
         let mut sink = RecordingSink::new();
         let (end, committed) = f
             .tool_loop
-            .run(&[], "q", &f.config, &links, &mut NoTrace, &mut sink)
+            .run(
+                &[],
+                "q",
+                &f.config,
+                &mut Compactor::off(),
+                &links,
+                &mut NoTrace,
+                &mut sink,
+            )
             .await
             .unwrap();
         assert_eq!(end.reason, EndReason::Answered);
@@ -1586,6 +1632,7 @@ You are terse.<|tool>declaration:echo{";
                 &[],
                 "q",
                 &f.config,
+                &mut Compactor::off(),
                 &links,
                 &mut NoTrace,
                 &mut RecordingSink::new(),
@@ -1601,6 +1648,7 @@ You are terse.<|tool>declaration:echo{";
                 &[],
                 "q",
                 &f.config,
+                &mut Compactor::off(),
                 &FakeConnector::new(None),
                 &mut NoTrace,
                 &mut RecordingSink::new(),
@@ -1629,7 +1677,15 @@ You are terse.<|tool>declaration:echo{";
         let mut sink = RecordingSink::new();
         let (end, _) = f
             .tool_loop
-            .run(&[], "q", &f.config, &links, &mut NoTrace, &mut sink)
+            .run(
+                &[],
+                "q",
+                &f.config,
+                &mut Compactor::off(),
+                &links,
+                &mut NoTrace,
+                &mut sink,
+            )
             .await
             .unwrap();
         assert_eq!(end.steps, 3);
@@ -1911,5 +1967,322 @@ You are terse.<|tool>declaration:echo{";
                 "loop_done"
             ]
         );
+    }
+
+    /// A summary sink that records every saved state.
+    #[derive(Default)]
+    struct SavedStates {
+        states: std::sync::Mutex<Vec<CompactionState>>,
+    }
+
+    #[async_trait]
+    impl SummarySink for SavedStates {
+        async fn save(&self, state: CompactionState) -> Result<(), String> {
+            self.states.lock().unwrap().push(state);
+            Ok(())
+        }
+    }
+
+    impl SavedStates {
+        fn states(&self) -> Vec<CompactionState> {
+            self.states.lock().unwrap().clone()
+        }
+    }
+
+    /// Loop-level compaction fixtures.
+    struct Compaction;
+
+    impl Compaction {
+        /// The window the measures report.
+        const N_CTX: usize = 2000;
+        /// The window of [`Self::by_bytes_wide`].
+        const WIDE_N_CTX: usize = 3000;
+        /// The size of the big earlier echo result.
+        const BIG: usize = 3000;
+        /// The length of each long question in [`Self::long_turns`].
+        const LONG: usize = 1200;
+        const ECHO: &'static str = "echo";
+        const CALL_ID: &'static str = "call_1";
+        const SUMMARY: &'static str = "S";
+
+        /// One token per byte of the request's serialized messages, in an [`Self::N_CTX`]
+        /// window.
+        fn by_bytes(req: &GenerateRequest) -> PromptSize {
+            Self::sized(req, Self::N_CTX)
+        }
+
+        /// Like [`Self::by_bytes`], in a [`Self::WIDE_N_CTX`] window.
+        fn by_bytes_wide(req: &GenerateRequest) -> PromptSize {
+            Self::sized(req, Self::WIDE_N_CTX)
+        }
+
+        fn sized(req: &GenerateRequest, n_ctx: usize) -> PromptSize {
+            PromptSize {
+                prompt_tokens: serde_json::to_string(&req.messages).unwrap().len(),
+                n_ctx,
+            }
+        }
+
+        /// A fixed measure of `prompt_tokens` in an [`Self::N_CTX`] window.
+        fn size(prompt_tokens: usize) -> PromptSize {
+            PromptSize {
+                prompt_tokens,
+                n_ctx: Self::N_CTX,
+            }
+        }
+
+        /// The default budget of an [`Self::N_CTX`] window.
+        fn budget() -> usize {
+            Self::N_CTX * usize::from(DEFAULT_COMPACT_AT_PCT) / 100
+        }
+
+        fn big_result() -> Value {
+            json!({ "text": "x".repeat(Self::BIG) })
+        }
+
+        /// An earlier turn: a question, an echo call, its big result and an answer.
+        fn big_turn() -> Vec<ChatMessage> {
+            let mut call = ChatMessage::new(Role::Assistant, "");
+            call.tool_calls = Some(vec![ToolCall {
+                id: Self::CALL_ID.into(),
+                kind: ToolLoop::KIND_FUNCTION.into(),
+                function: FunctionCall {
+                    name: Self::ECHO.into(),
+                    arguments: json!({}),
+                },
+            }]);
+            vec![
+                ChatMessage::new(Role::User, "old"),
+                call,
+                ToolLoop::tool_message(Self::CALL_ID, Self::big_result()),
+                ChatMessage::new(Role::Assistant, "ok"),
+            ]
+        }
+
+        /// Two earlier plain turns with long questions.
+        fn long_turns() -> Vec<ChatMessage> {
+            vec![
+                ChatMessage::new(Role::User, "a".repeat(Self::LONG)),
+                ChatMessage::new(Role::Assistant, "r1"),
+                ChatMessage::new(Role::User, "b".repeat(Self::LONG)),
+                ChatMessage::new(Role::Assistant, "r2"),
+            ]
+        }
+
+        fn compactor(strategy: ContextStrategy) -> Compactor {
+            Self::saving(strategy, 0, Arc::new(SavedStates::default()))
+        }
+
+        fn saving(
+            strategy: ContextStrategy,
+            committed_len: usize,
+            sink: Arc<SavedStates>,
+        ) -> Compactor {
+            Compactor::new(
+                strategy,
+                DEFAULT_COMPACT_AT_PCT,
+                None,
+                committed_len,
+                SamplingConfig::default(),
+                sink,
+            )
+        }
+
+        /// A summary reply of `text`, one token long.
+        fn summary_reply(text: &str) -> Scripted {
+            Notes::script(vec![
+                Notes::started(),
+                Notes::chunk_of(text, 1),
+                Notes::done(text, vec![]),
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn off_strategy_sends_full_transcript_and_no_compaction_record() {
+        let mut f = Fixture::new();
+        f.transcript = Compaction::big_turn();
+        f.compactor = Compaction::compactor(ContextStrategy::Off);
+        let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+        link.set_measure_by(Compaction::by_bytes);
+        f.run(Some(link.clone())).await.unwrap();
+        let sent = &link.requests()[0].messages;
+        assert_eq!(sent[..4], Compaction::big_turn()[..]);
+        assert_eq!(sent.len(), 5);
+        assert!(link.measured().is_empty());
+        assert_eq!(f.trace.records[0].compaction, None);
+    }
+
+    #[tokio::test]
+    async fn under_budget_sends_unchanged() {
+        let mut f = Fixture::new();
+        f.transcript = Compaction::big_turn();
+        f.config.enable_thinking = true;
+        f.compactor = Compaction::compactor(ContextStrategy::Trim);
+        let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+        link.set_measure(Compaction::size(10));
+        f.run(Some(link.clone())).await.unwrap();
+        let request = &link.requests()[0];
+        assert_eq!(request.messages[..4], Compaction::big_turn()[..]);
+        // The measure renders what the step's generate sends, tools and thinking included.
+        let measured = link.measured();
+        assert_eq!(measured.len(), 1);
+        assert_eq!(measured[0].messages, request.messages);
+        assert_eq!(measured[0].tools, request.tools);
+        assert_eq!(measured[0].tools.len(), 1);
+        assert!(measured[0].enable_thinking);
+        assert_eq!(f.trace.records[0].compaction, None);
+    }
+
+    #[tokio::test]
+    async fn trim_step_sends_compacted_messages_and_records_it() {
+        let mut f = Fixture::new();
+        f.transcript = Compaction::big_turn();
+        f.compactor = Compaction::compactor(ContextStrategy::Trim);
+        let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+        link.set_measure_by(Compaction::by_bytes);
+        f.run(Some(link.clone())).await.unwrap();
+
+        let request = &link.requests()[0];
+        let bytes = ToolTiming::result_bytes(&Compaction::big_result());
+        let stub = format!("[echo result elided: {bytes} bytes]");
+        assert_eq!(request.messages.len(), 5);
+        assert_eq!(request.messages[2].tool_result, Some(Value::String(stub)));
+        let mut original = Compaction::big_turn();
+        original.push(ChatMessage::new(Role::User, "q"));
+        let before = Compaction::by_bytes(&GenerateRequest {
+            messages: original,
+            ..request.clone()
+        });
+        let after = Compaction::by_bytes(request);
+        assert!(before.prompt_tokens > Compaction::budget());
+        assert!(after.prompt_tokens <= Compaction::budget());
+        let record = f.trace.records[0].compaction.clone().expect("a record");
+        assert_eq!(record.strategy, Trim::STRATEGY);
+        assert_eq!(record.before_tokens as usize, before.prompt_tokens);
+        assert_eq!(record.after_tokens as usize, after.prompt_tokens);
+        assert_eq!((record.elided_results, record.dropped_turns), (1, 0));
+        // The committed transcript keeps the full result; the notes are as without compaction.
+        assert_eq!(f.transcript.len(), 6);
+        assert_eq!(f.transcript[2].tool_result, Some(Compaction::big_result()));
+        assert_eq!(
+            f.sink.methods(),
+            ["turn_started", "turn_chunk", "turn_done", "loop_done"]
+        );
+    }
+
+    #[tokio::test]
+    async fn measure_failure_sends_uncompacted_and_continues() {
+        let mut f = Fixture::new();
+        f.transcript = Compaction::big_turn();
+        f.compactor = Compaction::compactor(ContextStrategy::Trim);
+        // No measure set: every measure_prompt fails, as on an old worker.
+        let link = FakeLink::new(
+            true,
+            vec![
+                Fixture::step("", vec![Fixture::echo_call("call_1")]),
+                Fixture::step("done", vec![]),
+            ],
+        );
+        let end = f.run(Some(link.clone())).await.unwrap();
+        assert_eq!(end.reason, EndReason::Answered);
+        let requests = link.requests();
+        assert_eq!(requests[0].messages[..4], Compaction::big_turn()[..]);
+        assert_eq!(requests[1].messages.len(), 7);
+        assert_eq!(link.measured().len(), 2);
+        assert!(f.trace.records.iter().all(|r| r.compaction.is_none()));
+    }
+
+    #[tokio::test]
+    async fn current_turn_overflow_ends_window_full_with_record() {
+        let mut f = Fixture::new();
+        f.compactor = Compaction::compactor(ContextStrategy::Trim);
+        let link = FakeLink::new(
+            true,
+            vec![Notes::script(vec![
+                Notes::started(),
+                Notes::rejected(1900, 2000),
+            ])],
+        );
+        link.set_measure(Compaction::size(1900));
+        let end = f.run(Some(link.clone())).await.unwrap();
+        assert_eq!(end.reason, EndReason::WindowFull);
+        // Trim had nothing earlier to remove: the prompt went out as it was, measured once.
+        assert_eq!(link.requests()[0].messages.len(), 1);
+        assert_eq!(link.measured().len(), 1);
+        let step = &f.trace.records[0];
+        assert_eq!(step.end, StepOutcome::Rejected);
+        let record = step.compaction.clone().expect("a record");
+        assert_eq!(record.strategy, Trim::STRATEGY);
+        assert_eq!((record.before_tokens, record.after_tokens), (1900, 1900));
+        assert_eq!((record.elided_results, record.dropped_turns), (0, 0));
+        assert!(f.transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn summary_saved_mid_turn_is_reused_by_later_steps() {
+        let mut f = Fixture::new();
+        f.transcript = Compaction::long_turns();
+        let sink = Arc::new(SavedStates::default());
+        f.compactor =
+            Compaction::saving(ContextStrategy::Summarize, f.transcript.len(), sink.clone());
+        let link = FakeLink::new(
+            true,
+            vec![
+                Compaction::summary_reply(Compaction::SUMMARY),
+                Fixture::step("", vec![Fixture::echo_call("call_1")]),
+                Fixture::step("done", vec![]),
+            ],
+        );
+        link.set_measure_by(Compaction::by_bytes_wide);
+        let end = f.run(Some(link.clone())).await.unwrap();
+        assert_eq!(end.reason, EndReason::Answered);
+
+        let requests = link.requests();
+        assert_eq!(requests.len(), 3, "one summary call, then the two steps");
+        assert!(requests[0].tools.is_empty());
+        assert_eq!(requests[0].messages[0].content, Summarize::SYSTEM_PROMPT);
+        for step in &requests[1..] {
+            assert_eq!(step.messages[0], SummaryNote::message(Compaction::SUMMARY));
+            assert_eq!(step.messages[1].content, "b".repeat(Compaction::LONG));
+        }
+        let saved = sink.states();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            (saved[0].summary.as_str(), saved[0].covers),
+            (Compaction::SUMMARY, 2)
+        );
+        assert_eq!(f.compactor.saved(), Some(&saved[0]));
+
+        let first = f.trace.records[0]
+            .compaction
+            .clone()
+            .expect("step 1 record");
+        assert_eq!(first.strategy, Summarize::STRATEGY);
+        assert!(!first.reused_summary);
+        assert_eq!(first.summarized_messages, 2);
+        let second = f.trace.records[1]
+            .compaction
+            .clone()
+            .expect("step 2 record");
+        assert!(second.reused_summary);
+        assert_eq!(second.summary_ms, None);
+        // The summary call's notes are not relayed; the committed transcript is whole.
+        assert_eq!(
+            f.sink.methods(),
+            [
+                "turn_started",
+                "turn_chunk",
+                "tool_call",
+                "turn_done",
+                "tool_result",
+                "turn_started",
+                "turn_chunk",
+                "turn_done",
+                "loop_done"
+            ]
+        );
+        assert_eq!(f.transcript.len(), 8);
+        assert_eq!(f.transcript[..4], Compaction::long_turns()[..]);
     }
 }

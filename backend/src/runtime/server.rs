@@ -16,6 +16,13 @@
 //! each in its log-line shape, `v` and `kind` included. `reset` appends a reset marker;
 //! `delete_session` deletes the log.
 //!
+//! Each turn compacts its prompt by the session's snapshot (`context_strategy`,
+//! `compact_at_pct`; editing the template later does not change a session). Its [`Compactor`]
+//! starts from the session's saved summary, and a fresh summary is saved back on the session
+//! straight away, whatever the turn's outcome, through the store's own short lock (never the
+//! hub's); a session deleted meanwhile is left alone. A step's `trace_step` record carries
+//! `compaction` when compaction ran. `reset` clears the saved summary with the transcript.
+//!
 //! Every frame for a connection (responses and notifications) goes through its one outbound
 //! channel in the [`Hub`], drained by a writer task, so frames never interleave and a
 //! notification caused by another connection never blocks. Requests on one connection run
@@ -64,6 +71,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 pub use super::catalog_source::{CatalogSource, CatalogView};
+use super::compaction::{Compactor, SummarySink};
 use super::hub::{ConnId, Hub};
 use super::registry::ToolRegistry;
 use super::tool_loop::{
@@ -75,7 +83,7 @@ use crate::agents::dispatcher::{Dispatcher, Placement};
 use crate::agents::host::{HarnessIdentity, ModelRequirement};
 use crate::agents::session::{SessionRecord, SessionSummary};
 use crate::agents::session_store::{SessionError, SessionStore};
-use crate::agents::template::AgentTemplate;
+use crate::agents::template::{AgentTemplate, CompactionState};
 use crate::agents::template_store::{TemplateError, TemplateStore};
 use crate::engine::SamplingConfig;
 use crate::rpc::{
@@ -234,6 +242,28 @@ impl LoopSink for SessionSink<'_> {
     }
 }
 
+/// Saves a turn's fresh summary on its session. Called by compaction outside the hub's lock;
+/// the store's write takes only its own short lock. A session deleted meanwhile is left alone.
+struct SessionCompactionSink {
+    sessions: Arc<SessionStore>,
+    session: String,
+}
+
+#[async_trait]
+impl SummarySink for SessionCompactionSink {
+    async fn save(&self, state: CompactionState) -> Result<(), String> {
+        if !self.sessions.contains(&self.session) {
+            return Ok(());
+        }
+        match self.sessions.set_compaction(&self.session, Some(state)) {
+            Ok(()) => Ok(()),
+            // Deleted between the check and the write.
+            Err(_) if !self.sessions.contains(&self.session) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 /// A `list_sessions` row: the summary's fields plus the live placement and busy flag.
 #[derive(Debug, Serialize)]
 struct SessionRow {
@@ -258,6 +288,36 @@ impl SessionView {
     /// The override, else the snapshot's setting.
     fn thinking(rec: &SessionRecord) -> bool {
         rec.enable_thinking.unwrap_or(rec.snapshot.enable_thinking)
+    }
+
+    /// What one turn of `rec` runs with: the snapshot's budget, tools and context strategy,
+    /// and the session's sampling and thinking.
+    fn turn_config(rec: &SessionRecord) -> TurnConfig {
+        TurnConfig {
+            step_budget: rec.snapshot.step_budget,
+            tools: rec.snapshot.tools.clone(),
+            enable_thinking: Self::thinking(rec),
+            sampling: Self::sampling(rec),
+            context_strategy: rec.snapshot.context_strategy,
+            compact_at_pct: rec.snapshot.compact_at_pct,
+        }
+    }
+
+    /// The compactor of one turn of `rec` under `config`: it starts from the session's saved
+    /// summary and saves a fresh one back on the session.
+    fn compactor(deps: &RuntimeDeps, rec: &SessionRecord, config: &TurnConfig) -> Compactor {
+        let sink = SessionCompactionSink {
+            sessions: Arc::clone(&deps.sessions),
+            session: rec.id.clone(),
+        };
+        Compactor::new(
+            config.context_strategy,
+            config.compact_at_pct,
+            rec.compaction.clone(),
+            rec.transcript.len(),
+            config.sampling.clone(),
+            Arc::new(sink),
+        )
     }
 
     fn row(deps: &RuntimeDeps, summary: SessionSummary, req: &ModelRequirement) -> SessionRow {
@@ -686,12 +746,8 @@ impl RuntimeConnection {
         content: &str,
         log: Result<Arc<TraceLog>, String>,
     ) -> Result<Value, RpcError> {
-        let config = TurnConfig {
-            step_budget: rec.snapshot.step_budget,
-            tools: rec.snapshot.tools.clone(),
-            enable_thinking: SessionView::thinking(&rec),
-            sampling: SessionView::sampling(&rec),
-        };
+        let config = SessionView::turn_config(&rec);
+        let mut compactor = SessionView::compactor(deps, &rec, &config);
         let links = SessionLinks::new(
             &deps.dispatcher,
             &deps.hub,
@@ -724,7 +780,15 @@ impl RuntimeConnection {
         };
         let ran = deps
             .tool_loop
-            .run(&rec.transcript, content, &config, &links, trace, &mut sink)
+            .run(
+                &rec.transcript,
+                content,
+                &config,
+                &mut compactor,
+                &links,
+                trace,
+                &mut sink,
+            )
             .await;
         let (reason, transcript) = match ran {
             Ok((end, transcript)) => (Ok(end.reason), transcript),
@@ -1024,10 +1088,14 @@ impl SharedRequests {
 mod tests {
     use super::*;
     use crate::agents::host::HostState;
+    use crate::agents::template::ContextStrategy;
+    use crate::engine::{ChatMessage, Role};
     use crate::rpc::test_support::TestClient;
     use crate::rpc::{ERR_INVALID_PARAMS, ERR_PARSE};
+    use crate::runtime::compaction::{Summarize, SummaryNote, Trim};
     use crate::runtime::test_support::{FakeLink, Notes, Scripted, TestRuntime};
     use crate::runtime::trace::TRACE_FILE_SUFFIX;
+    use crate::runtime::worker::{GenerateRequest, PromptSize};
     use std::time::Duration;
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -1737,6 +1805,8 @@ mod tests {
             tools: rec.snapshot.tools.clone(),
             enable_thinking: false,
             sampling: SamplingConfig::default(),
+            context_strategy: rec.snapshot.context_strategy,
+            compact_at_pct: rec.snapshot.compact_at_pct,
         };
         let mut sink = crate::runtime::test_support::RecordingSink::new();
         let (end, transcript) = rt
@@ -1746,6 +1816,7 @@ mod tests {
                 &rec.transcript,
                 CONTENT,
                 &config,
+                &mut Compactor::off(),
                 &links,
                 &mut NoTrace,
                 &mut sink,
@@ -2484,5 +2555,208 @@ mod tests {
         let page = a.trace(&id).await;
         assert_eq!(page[TURNS].as_array().unwrap().len(), 1);
         assert!(Client::trace_file(&rt, &id).is_file());
+    }
+
+    /// Session-level compaction fixtures.
+    struct Compacting;
+
+    impl Compacting {
+        /// The window the measures report; the default budget is 75% of it.
+        const N_CTX: usize = 3000;
+        /// The length of each long question in [`Self::long_turns`].
+        const LONG: usize = 1200;
+        const SUMMARY: &'static str = "S";
+        const COMPACTION: &'static str = "compaction";
+        const STRATEGY: &'static str = "strategy";
+        const REUSED: &'static str = "reused_summary";
+        const SUMMARIZED: &'static str = "summarized_messages";
+        const SUMMARY_MS: &'static str = "summary_ms";
+
+        /// One token per byte of the request's serialized messages.
+        fn by_bytes(req: &GenerateRequest) -> PromptSize {
+            PromptSize {
+                prompt_tokens: serde_json::to_string(&req.messages).unwrap().len(),
+                n_ctx: Self::N_CTX,
+            }
+        }
+
+        /// Two earlier plain turns with long questions, as a committed transcript.
+        fn long_turns() -> Vec<ChatMessage> {
+            vec![
+                ChatMessage::new(Role::User, "a".repeat(Self::LONG)),
+                ChatMessage::new(Role::Assistant, "r1"),
+                ChatMessage::new(Role::User, "b".repeat(Self::LONG)),
+                ChatMessage::new(Role::Assistant, "r2"),
+            ]
+        }
+
+        /// A summary reply of [`Self::SUMMARY`], one token long.
+        fn summary_reply() -> Scripted {
+            Notes::script(vec![
+                Notes::started(),
+                Notes::chunk_of(Self::SUMMARY, 1),
+                Notes::done(Self::SUMMARY, vec![]),
+            ])
+        }
+
+        /// A link answering a summary call and then `answers` turns, measured by bytes.
+        fn summarizing(answers: usize) -> Arc<FakeLink> {
+            let mut scripts = vec![Self::summary_reply()];
+            scripts.extend((0..answers).map(|_| Client::answer(ANSWER)));
+            let link = FakeLink::new(true, scripts);
+            link.set_measure_by(Self::by_bytes);
+            link
+        }
+
+        /// Saves the seeded template with `strategy`.
+        fn set_strategy(rt: &TestRuntime, strategy: ContextStrategy) {
+            let mut template = rt.template();
+            template.context_strategy = strategy;
+            rt.deps
+                .templates
+                .save(Some(TestRuntime::TEMPLATE_ID), GROUP, &template)
+                .unwrap();
+        }
+
+        /// The `compaction` of each `trace_step` in `frames`.
+        fn records(frames: &[Value]) -> Vec<Value> {
+            TestClient::params_of(frames, SessionTrace::M_TRACE_STEP)
+                .iter()
+                .map(|p| p[RECORD][Self::COMPACTION].clone())
+                .collect()
+        }
+
+        fn state(summary: &str, covers: usize) -> CompactionState {
+            CompactionState {
+                summary: summary.into(),
+                covers,
+                tokens: 1,
+                at: 1,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn summarize_session_saves_summary_and_reuses_it_next_turn() {
+        let rt = TestRuntime::new("summarize", Compacting::summarizing(2));
+        Compacting::set_strategy(&rt, ContextStrategy::Summarize);
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        rt.deps
+            .sessions
+            .commit(&id, Compacting::long_turns())
+            .unwrap();
+        a.drain();
+
+        a.send().await.unwrap();
+        let frames = a.drain();
+        let saved = rt.deps.sessions.get(&id).unwrap().compaction;
+        let saved = saved.expect("turn 1 saves the summary");
+        assert_eq!(
+            (saved.summary.as_str(), saved.covers),
+            (Compacting::SUMMARY, 2)
+        );
+        let records = Compacting::records(&frames);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0][Compacting::STRATEGY], Summarize::STRATEGY);
+        assert_eq!(records[0][Compacting::REUSED], false);
+        assert_eq!(records[0][Compacting::SUMMARIZED], 2);
+        assert!(records[0][Compacting::SUMMARY_MS].is_u64());
+        // The summary call's own notes stay inside the compactor.
+        let methods = Client::methods(&frames);
+        assert_eq!(methods.iter().filter(|m| *m == TURN_STARTED).count(), 1);
+
+        a.send().await.unwrap();
+        let records = Compacting::records(&a.drain());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0][Compacting::REUSED], true);
+        assert_eq!(records[0][Compacting::SUMMARY_MS], Value::Null);
+        let requests = rt.host.link().requests();
+        assert_eq!(requests.len(), 3, "one summary call over two turns");
+        assert_eq!(
+            requests[2].messages[0],
+            SummaryNote::message(Compacting::SUMMARY)
+        );
+        // The reused summary is unchanged, and the stored transcript is whole.
+        let rec = rt.deps.sessions.get(&id).unwrap();
+        assert_eq!(rec.compaction, Some(saved));
+        assert_eq!(rec.transcript.len(), 8);
+        assert_eq!(rec.transcript[..4], Compacting::long_turns()[..]);
+    }
+
+    #[tokio::test]
+    async fn reset_clears_saved_summary() {
+        let rt = TestRuntime::new("resetsummary", Compacting::summarizing(1));
+        Compacting::set_strategy(&rt, ContextStrategy::Summarize);
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        rt.deps
+            .sessions
+            .set_compaction(&id, Some(Compacting::state("OLD", 2)))
+            .unwrap();
+        a.call(C::M_RESET, Value::Null).await.unwrap();
+        assert_eq!(rt.deps.sessions.get(&id).unwrap().compaction, None);
+        let reopened = SessionStore::open(&rt.sessions_dir()).unwrap();
+        assert_eq!(reopened.get(&id).unwrap().compaction, None);
+
+        // The next compaction summarises afresh from message 0, with no old summary folded in.
+        rt.deps
+            .sessions
+            .commit(&id, Compacting::long_turns())
+            .unwrap();
+        a.send().await.unwrap();
+        let summary_call = &rt.host.link().requests()[0];
+        let span = &summary_call.messages[1].content;
+        assert!(span.starts_with("user: aaa"), "{span}");
+        assert!(!span.contains("OLD"));
+        let saved = rt.deps.sessions.get(&id).unwrap().compaction.unwrap();
+        assert_eq!(
+            (saved.summary.as_str(), saved.covers),
+            (Compacting::SUMMARY, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn template_edit_after_create_does_not_change_session_strategy() {
+        let link = Client::answering();
+        link.set_measure(PromptSize {
+            prompt_tokens: Compacting::N_CTX - 100,
+            n_ctx: Compacting::N_CTX,
+        });
+        let rt = TestRuntime::new("snapstrategy", link);
+        Compacting::set_strategy(&rt, ContextStrategy::Trim);
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        Compacting::set_strategy(&rt, ContextStrategy::Off);
+        a.drain();
+        a.send().await.unwrap();
+        let records = Compacting::records(&a.drain());
+        assert_eq!(records[0][Compacting::STRATEGY], Trim::STRATEGY);
+        let rec = rt.deps.sessions.get(&id).unwrap();
+        assert_eq!(rec.snapshot.context_strategy, ContextStrategy::Trim);
+        assert_eq!(rt.host.link().measured().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn compaction_sink_leaves_a_deleted_session_alone() {
+        let rt = TestRuntime::new("sinkgone", Client::idle());
+        let rec = rt
+            .deps
+            .sessions
+            .create(TestRuntime::TEMPLATE_ID, &rt.template())
+            .unwrap();
+        let sink = SessionCompactionSink {
+            sessions: Arc::clone(&rt.deps.sessions),
+            session: rec.id.clone(),
+        };
+        sink.save(Compacting::state("kept", 1)).await.unwrap();
+        let kept = rt.deps.sessions.get(&rec.id).unwrap().compaction;
+        assert_eq!(kept, Some(Compacting::state("kept", 1)));
+        rt.deps.sessions.delete(&rec.id).unwrap();
+        assert_eq!(sink.save(Compacting::state("late", 1)).await, Ok(()));
+        assert!(!rt.deps.sessions.contains(&rec.id));
     }
 }

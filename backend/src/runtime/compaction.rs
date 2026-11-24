@@ -2,7 +2,13 @@
 //! summary-note helpers, the **trim** strategy (stub out old tool results, then drop old
 //! turns, until the prompt fits a budget) and the **summarize** strategy (replace the older
 //! span with a saved summary note, trimming on top or instead when needed).
+//!
+//! The [`Compactor`] is the front the tool loop calls once per step, before `generate`: it
+//! measures the prompt through the step's worker link and runs the session's strategy only
+//! when the prompt is over budget. The loop sends what it returns and puts the record on the
+//! step's trace record; the transcript the loop commits is never compacted.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -12,7 +18,7 @@ use serde_json::Value;
 use super::tool_loop::ToolLoop;
 use super::trace::{CompactionRecord, ToolTiming};
 use super::worker::{GenerateRequest, LinkError, PromptSize, WorkerLink};
-use crate::agents::template::CompactionState;
+use crate::agents::template::{CompactionState, ContextStrategy, DEFAULT_COMPACT_AT_PCT};
 use crate::engine::template::OpenChannel;
 use crate::engine::{ChatMessage, Role, SamplingConfig};
 
@@ -835,6 +841,200 @@ impl<'a> Summarizer<'a> {
             Some(end) if OpenChannel::at_tail(&content[..=end]).is_some() => &content[end + 1..],
             _ => content,
         }
+    }
+}
+
+/// One turn's compaction front, called by the loop once per step before `generate`. It holds
+/// the session's strategy, its threshold and its newest saved summary: a summary saved by an
+/// earlier step of the turn is reused by the later ones without reading the store again.
+pub struct Compactor {
+    strategy: ContextStrategy,
+    compact_at_pct: u8,
+    saved: Option<CompactionState>,
+    /// The length of the committed transcript the turn started from.
+    committed_len: usize,
+    /// The session's sampling; a summary call copies it, overriding a few fields.
+    sampling: SamplingConfig,
+    sink: Arc<dyn SummarySink>,
+}
+
+impl Compactor {
+    const PERCENT: usize = 100;
+
+    pub fn new(
+        strategy: ContextStrategy,
+        compact_at_pct: u8,
+        saved: Option<CompactionState>,
+        committed_len: usize,
+        sampling: SamplingConfig,
+        sink: Arc<dyn SummarySink>,
+    ) -> Self {
+        Self {
+            strategy,
+            compact_at_pct,
+            saved,
+            committed_len,
+            sampling,
+            sink,
+        }
+    }
+
+    /// A compactor that never compacts (and never measures).
+    pub fn off() -> Self {
+        Self::new(
+            ContextStrategy::Off,
+            DEFAULT_COMPACT_AT_PCT,
+            None,
+            0,
+            SamplingConfig::default(),
+            Arc::new(DiscardSink),
+        )
+    }
+
+    /// The newest summary this turn knows: the session's saved one, or one saved since.
+    pub fn saved(&self) -> Option<&CompactionState> {
+        self.saved.as_ref()
+    }
+
+    /// The prompt to send for one step over `messages` (the committed transcript plus the
+    /// current turn's scratch from `current_turn_start`), measured through `link` with the
+    /// step's `tools` and `enable_thinking`.
+    ///
+    /// The budget is `floor(n_ctx * compact_at_pct / 100)` and the reservation
+    /// `max(max_tokens, 0)`. The messages come back unchanged, with no record, when the
+    /// strategy is off, when the prompt plus the reservation fits the budget, or when a
+    /// measure fails (an old worker without `measure_prompt`, or a link error): the step then
+    /// goes out uncompacted and the turn continues. Otherwise the strategy's result is
+    /// returned, with its record. A summary saved through the sink is also kept here, even
+    /// when a later measure of the same step fails.
+    pub async fn prepare(
+        &mut self,
+        messages: &[ChatMessage],
+        current_turn_start: usize,
+        tools: &[Value],
+        enable_thinking: bool,
+        max_tokens: i32,
+        link: &dyn WorkerLink,
+    ) -> Compacted {
+        if self.strategy == ContextStrategy::Off {
+            return Self::unchanged(messages);
+        }
+        let measure = LinkMeasure {
+            link,
+            tools,
+            enable_thinking,
+            sampling: &self.sampling,
+        };
+        let Ok(size) = measure.measure(messages).await else {
+            return Self::unchanged(messages);
+        };
+        let budget = size.n_ctx.saturating_mul(usize::from(self.compact_at_pct)) / Self::PERCENT;
+        let reservation = usize::try_from(max_tokens.max(0)).unwrap_or(usize::MAX);
+        let before = size.prompt_tokens;
+        if Trim::fits(before, reservation, budget) {
+            return Self::unchanged(messages);
+        }
+        let outcome = match self.strategy {
+            ContextStrategy::Off => return Self::unchanged(messages),
+            ContextStrategy::Trim => {
+                Trim::compact(
+                    messages,
+                    current_turn_start,
+                    budget,
+                    reservation,
+                    before,
+                    &measure,
+                )
+                .await
+            }
+            ContextStrategy::Summarize => {
+                let keeping = KeepingSink {
+                    inner: self.sink.as_ref(),
+                    kept: Mutex::new(None),
+                };
+                let outcome = Summarize::compact(
+                    messages,
+                    self.committed_len,
+                    current_turn_start,
+                    self.saved.as_ref(),
+                    budget,
+                    reservation,
+                    before,
+                    size.n_ctx,
+                    &self.sampling,
+                    link,
+                    &measure,
+                    &keeping,
+                )
+                .await;
+                if let Some(state) = keeping.into_kept() {
+                    self.saved = Some(state);
+                }
+                outcome
+            }
+        };
+        outcome.unwrap_or_else(|_| Self::unchanged(messages))
+    }
+
+    /// `messages` as they are, with no record.
+    fn unchanged(messages: &[ChatMessage]) -> Compacted {
+        Compacted {
+            messages: messages.to_vec(),
+            record: None,
+        }
+    }
+}
+
+/// Measures through the step's worker link, with the tools and thinking flag its `generate`
+/// will use.
+struct LinkMeasure<'a> {
+    link: &'a dyn WorkerLink,
+    tools: &'a [Value],
+    enable_thinking: bool,
+    sampling: &'a SamplingConfig,
+}
+
+#[async_trait]
+impl PromptMeasure for LinkMeasure<'_> {
+    async fn measure(&self, messages: &[ChatMessage]) -> Result<PromptSize, String> {
+        let req = GenerateRequest {
+            messages: messages.to_vec(),
+            tools: self.tools.to_vec(),
+            enable_thinking: self.enable_thinking,
+            sampling: self.sampling.clone(),
+        };
+        self.link.measure_prompt(&req).await.map_err(|e| e.0)
+    }
+}
+
+/// Passes each save on to the session's sink and keeps the state it saved.
+struct KeepingSink<'a> {
+    inner: &'a dyn SummarySink,
+    kept: Mutex<Option<CompactionState>>,
+}
+
+impl KeepingSink<'_> {
+    fn into_kept(self) -> Option<CompactionState> {
+        self.kept.into_inner().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[async_trait]
+impl SummarySink for KeepingSink<'_> {
+    async fn save(&self, state: CompactionState) -> Result<(), String> {
+        self.inner.save(state.clone()).await?;
+        *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+        Ok(())
+    }
+}
+
+/// The sink of a compactor that never summarises.
+struct DiscardSink;
+
+#[async_trait]
+impl SummarySink for DiscardSink {
+    async fn save(&self, _state: CompactionState) -> Result<(), String> {
+        Ok(())
     }
 }
 

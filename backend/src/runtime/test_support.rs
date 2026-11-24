@@ -81,17 +81,40 @@ pub(crate) struct FakeLink {
     scripts: Mutex<VecDeque<Scripted>>,
     repeat_last: bool,
     requests: Mutex<Vec<GenerateRequest>>,
-    measure: Mutex<Result<PromptSize, LinkError>>,
+    measure: Mutex<MeasureScript>,
+    measured: Mutex<Vec<GenerateRequest>>,
+}
+
+/// How a [`FakeLink`] answers `measure_prompt`.
+enum MeasureScript {
+    /// Every call answers this.
+    Fixed(Result<PromptSize, LinkError>),
+    /// Each call answers what the function computes from the request.
+    By(fn(&GenerateRequest) -> PromptSize),
 }
 
 impl FakeLink {
     const MEASURE_UNAVAILABLE: &'static str = "measure_prompt unavailable";
 
-    /// Every `measure_prompt` call answers `size` (the default is an error). Unused until Task 5, which
-    /// uses it and removes the attribute.
-    #[allow(dead_code)]
+    /// Every `measure_prompt` call answers `size` (the default is an error).
     pub(crate) fn set_measure(&self, size: PromptSize) {
-        *self.measure.lock().expect("measure") = Ok(size);
+        *self.measure.lock().expect("measure") = MeasureScript::Fixed(Ok(size));
+    }
+
+    /// Every `measure_prompt` call answers `sizer(request)`.
+    pub(crate) fn set_measure_by(&self, sizer: fn(&GenerateRequest) -> PromptSize) {
+        *self.measure.lock().expect("measure") = MeasureScript::By(sizer);
+    }
+
+    /// Every `measure_prompt` request so far, in order.
+    pub(crate) fn measured(&self) -> Vec<GenerateRequest> {
+        self.measured.lock().expect("measured").clone()
+    }
+
+    fn unavailable() -> Mutex<MeasureScript> {
+        Mutex::new(MeasureScript::Fixed(Err(LinkError(
+            Self::MEASURE_UNAVAILABLE.into(),
+        ))))
     }
 
     /// One script per `generate` call, in order; a call past the end fails the test.
@@ -101,7 +124,8 @@ impl FakeLink {
             scripts: Mutex::new(scripts.into()),
             repeat_last: false,
             requests: Mutex::new(Vec::new()),
-            measure: Mutex::new(Err(LinkError(Self::MEASURE_UNAVAILABLE.into()))),
+            measure: Self::unavailable(),
+            measured: Mutex::new(Vec::new()),
         })
     }
 
@@ -112,7 +136,8 @@ impl FakeLink {
             scripts: Mutex::new(scripts.into()),
             repeat_last: false,
             requests: Mutex::new(Vec::new()),
-            measure: Mutex::new(Err(LinkError(Self::MEASURE_UNAVAILABLE.into()))),
+            measure: Self::unavailable(),
+            measured: Mutex::new(Vec::new()),
         })
     }
 
@@ -123,7 +148,8 @@ impl FakeLink {
             scripts: Mutex::new(VecDeque::from([script])),
             repeat_last: true,
             requests: Mutex::new(Vec::new()),
-            measure: Mutex::new(Err(LinkError(Self::MEASURE_UNAVAILABLE.into()))),
+            measure: Self::unavailable(),
+            measured: Mutex::new(Vec::new()),
         })
     }
 
@@ -134,7 +160,8 @@ impl FakeLink {
             scripts: Mutex::new(VecDeque::new()),
             repeat_last: false,
             requests: Mutex::new(Vec::new()),
-            measure: Mutex::new(Err(LinkError(Self::MEASURE_UNAVAILABLE.into()))),
+            measure: Self::unavailable(),
+            measured: Mutex::new(Vec::new()),
         })
     }
 
@@ -153,8 +180,12 @@ impl WorkerLink for FakeLink {
         Ok(json!({"count": 0}))
     }
 
-    async fn measure_prompt(&self, _req: &GenerateRequest) -> Result<PromptSize, LinkError> {
-        self.measure.lock().expect("measure").clone()
+    async fn measure_prompt(&self, req: &GenerateRequest) -> Result<PromptSize, LinkError> {
+        self.measured.lock().expect("measured").push(req.clone());
+        match &*self.measure.lock().expect("measure") {
+            MeasureScript::Fixed(size) => size.clone(),
+            MeasureScript::By(sizer) => Ok(sizer(req)),
+        }
     }
 
     async fn generate(
