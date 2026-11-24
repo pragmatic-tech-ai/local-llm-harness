@@ -139,7 +139,10 @@ Summarize keeps the most recent part verbatim and replaces the older part with a
     optional.
 - **Fallback.** If the summary call fails (an error, a rejection, an empty reply, or a reply
   longer than its `max_tokens`), that step uses trim instead. The saved summary is left as it
-  was, and the trace records the fallback.
+  was, and the trace records the fallback. A summary that was made and saved, but whose prompt
+  then fails to measure (for example a template rejecting it), stays saved because it is valid
+  in itself. That step and later steps that reuse it fall back to trim with `summary_error`
+  set, and make no new summary call.
 - **The summary system prompt** (fixed copy):
   `Summarize the conversation below for your own later use. Keep facts, file names, numbers,
   decisions and open questions. Write plain sentences, no preamble.`
