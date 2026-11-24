@@ -1,5 +1,6 @@
 import ChatResources from "./views/Chat.mu.js"
 import InstrumentPanelResources from "./views/InstrumentPanel.mu.js"
+import TracePanelResources from "./views/TracePanel.mu.js"
 import SessionsPanelResources from "./views/SessionsPanel.mu.js"
 import SessionViewResources from "./views/SessionView.mu.js"
 import NewSessionDialogResources from "./views/NewSessionDialog.mu.js"
@@ -37,6 +38,7 @@ Application [ Theme = Pragmatic, Scheme = PragmaticDark ] {
         merge SettingsResources
         merge ChatResources
         merge InstrumentPanelResources
+        merge TracePanelResources
         merge SessionsPanelResources
         merge SessionViewResources
         merge NewSessionDialogResources

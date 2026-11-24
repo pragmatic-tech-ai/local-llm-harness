@@ -176,8 +176,9 @@ export interface StepRecord
     turn: number
     step: number
     at: number
-    prompt_tokens: number
-    n_ctx: number
+    /** Null for a step that never reached the worker (a step-0 link or load failure). */
+    prompt_tokens: number | null
+    n_ctx: number | null
     out_tokens: number
     think_tokens: number
     load_ms: number | null

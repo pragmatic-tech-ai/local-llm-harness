@@ -6,6 +6,7 @@ import { PlacementText } from './PlacementText'
 import { ChatViewModel } from './ChatViewModel'
 import type { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
 import { TextFormat } from './TextFormat'
+import { TraceViewModel } from './TraceViewModel'
 
 /**
  * The host-area view of the shown session: a header (template · model @ host, placement, Load / Unload, tools) over
@@ -33,6 +34,8 @@ export class SessionViewModel extends Observable
     private static readonly Props = ['HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
 
     public readonly Chat = new ChatViewModel()
+    /** The shown session's agent trace, hosted by the instrument panel below its context bar. */
+    public readonly Trace = new TraceViewModel()
 
     private readonly client: RuntimeClient
     private readonly loadCommand: RelayCommand
@@ -79,6 +82,7 @@ export class SessionViewModel extends Observable
             client.OnTurnStarted.Subscribe(() => this.EndTurnLoading()),
             client.OnLoopDone.Subscribe(() => this.EndTurnLoading()),
         ]
+        this.Panel.HostTrace(this.Trace)
     }
 
     public get Panel(): InstrumentPanelViewModel
@@ -228,6 +232,8 @@ export class SessionViewModel extends Observable
         this.Chat.Bind(this.client)
         this.Chat.LoadHistory(attached.transcript)
         this.Panel.ApplySession(attached.sampling, attached.enable_thinking)
+        // Attach, switch and re-attach after a reconnect all reload the trace's first page.
+        void this.Trace.ShowSession(this.client, id)
     }
 
     /**
@@ -264,11 +270,13 @@ export class SessionViewModel extends Observable
         {
             s.Dispose()
         }
+        this.Trace.dispose()
     }
 
     private Reset(): void
     {
         this.Chat.Clear()
+        void this.Trace.ShowSession(null, null)
         this.Update(() =>
         {
             this.snapshot = null

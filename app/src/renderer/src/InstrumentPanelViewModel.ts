@@ -3,6 +3,7 @@ import { RuntimeClient, type IDisposable } from './RuntimeClient'
 import type { SamplingConfig } from './agents'
 import { LogprobVM } from './LogprobVM'
 import { TextFormat } from './TextFormat'
+import type { TraceViewModel } from './TraceViewModel'
 
 /** Low-level state of the model: sampling knobs, raw prompt, context fill, logprobs, tokenization. */
 export class InstrumentPanelViewModel extends Observable
@@ -17,6 +18,7 @@ export class InstrumentPanelViewModel extends Observable
     private static readonly PercentScale = 100
     /** Pixel width of the context-fill track; the fill Border is bound to a fraction of it. */
     private static readonly BarPixels = 300
+    private static readonly PropTrace = 'Trace'
 
     private _temperature = 0.8
     private _topP = 0.95
@@ -38,6 +40,7 @@ export class InstrumentPanelViewModel extends Observable
     public readonly Logprobs = new ObservableCollection<LogprobVM>()
 
     private client: RuntimeClient | null = null
+    private trace: TraceViewModel | null = null
     /** The sampling the session runs with (JSON), as last applied; null = unknown, so the next send applies the knobs. */
     private appliedSampling: string | null = null
     /** The thinking flag the session runs with; null = unknown. */
@@ -261,6 +264,18 @@ export class InstrumentPanelViewModel extends Observable
     public get ContextBarTrackWidth(): number
     {
         return InstrumentPanelViewModel.BarPixels
+    }
+
+    /** The agent trace shown below the context bar (owned and driven by the session view), or null. */
+    public get Trace(): TraceViewModel | null
+    {
+        return this.trace
+    }
+
+    /** Places the session view's trace in the panel. */
+    public HostTrace(trace: TraceViewModel | null): void
+    {
+        this.Change(InstrumentPanelViewModel.PropTrace, this.trace, trace, x => this.trace = x)
     }
 
     /** Called when a new turn is attempted; a failed set_sampling then re-raises its own warning. */

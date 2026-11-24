@@ -1,4 +1,4 @@
-// Instrument panel: sampling knobs, thinking toggle, context fill, raw prompt,
+// Instrument panel: sampling knobs, thinking toggle, context fill, agent trace, raw prompt,
 // per-token logprobs, tokenization. Merged app-global by app.mu.
 import InstrumentPanelViewModel from "../InstrumentPanelViewModel.js"
 import LogprobVM from "../LogprobVM.js"
@@ -54,6 +54,9 @@ resources InstrumentPanelResources {
                 }
                 TextBlock [ Text = $Warning, Foreground = @StateDanger, TextWrapping = Wrap,
                             Visibility = $HasWarning << ToVisibility, Margin = (0,0,0,8) ]
+
+                // Agent trace (TracePanel.mu): its own scroll region below the context bar.
+                ContentControl [ Content = $Trace ]
 
                 TextBlock [ Text = "Raw prompt", Style = @BodySm, Foreground = @Fg2 ]
                 Border [ Stroke = Pen [ Brush = @Border ], CornerRadius = 4, Padding = (6,4,6,4), Margin = (0,0,0,8), ClipToBounds = true ] {

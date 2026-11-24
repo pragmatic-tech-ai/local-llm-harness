@@ -219,5 +219,25 @@ describe('SessionViewModel', () =>
         rig.view.SetStale(false)
         expect(rig.view.CanLoad).toBe(true)
     })
+    it('attach_loads_trace_and_reconnect_reloads', async () =>
+    {
+        const rig = new Rig()
+        const turn = (n: number) => ({ turn: n, steps: [], summary: null, reset_before: false })
+        expect(rig.view.Panel.Trace).toBe(rig.view.Trace)
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
+        expect(rig.Frame('get_trace')?.params).toEqual({ id: 's1' })
+        await rig.Respond('get_trace', { turns: [turn(1)], more: false, reset_pending: false })
+        expect(rig.view.Trace.Turns.Count).toBe(1)
+        // The connection drops and comes back: the re-attach reloads the first page.
+        rig.view.Detach()
+        await rig.Show({ state: PlacementState.Ready, host: 'local' })
+        expect(rig.socket.sent.filter(f => JSON.parse(f).method === 'get_trace').length).toBe(2)
+        await rig.Respond('get_trace', { turns: [turn(2), turn(1)], more: false, reset_pending: false })
+        expect(rig.view.Trace.Turns.ToArray().map(t => t.Turn)).toEqual([2, 1])
+        // Switching sessions clears the trace at once; clearing the view leaves it empty.
+        void rig.view.Attach('s2')
+        expect(rig.view.Trace.Turns.Count).toBe(0)
+        rig.view.Clear()
+        expect(rig.view.Trace.Turns.Count).toBe(0)
+    })
 })
-
