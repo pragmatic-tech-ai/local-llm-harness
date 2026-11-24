@@ -533,8 +533,7 @@ impl SessionTrace {
             committed,
             user: std::mem::take(&mut self.user),
         };
-        let live = json!(&record);
-        self.deliver(TraceRecord::Turn(record), live, Self::M_TRACE_TURN, sink)
+        self.deliver(TraceRecord::Turn(record), Self::M_TRACE_TURN, sink)
             .await
     }
 
@@ -543,11 +542,11 @@ impl SessionTrace {
         log.append(&TraceRecord::Reset(ResetRecord { at: Self::now_ms() }))
     }
 
-    /// Appends `record`, warns about anything that failed, then sends `live` as `method`.
+    /// Appends `record`, warns about anything that failed, then sends it as `method`, in its
+    /// log-line shape (the same record the log and `get_trace` hold).
     async fn deliver(
         &mut self,
         record: TraceRecord,
-        live: Value,
         method: &str,
         sink: &mut dyn LoopSink,
     ) -> Result<(), SinkClosed> {
@@ -558,6 +557,7 @@ impl SessionTrace {
         if let Err(e) = appended {
             self.warn(e.to_string(), sink).await?;
         }
+        let live = record.line_value();
         let params = json!({ (Self::FIELD_ID): self.session, (Self::FIELD_RECORD): live });
         sink.notify(method, params).await
     }
@@ -600,8 +600,7 @@ impl TurnTrace for SessionTrace {
                 self.peak_fill = self.peak_fill.max(f64::from(used) / f64::from(total));
             }
         }
-        let live = json!(&record);
-        self.deliver(TraceRecord::Step(record), live, Self::M_TRACE_STEP, sink)
+        self.deliver(TraceRecord::Step(record), Self::M_TRACE_STEP, sink)
             .await
     }
 }
@@ -936,7 +935,10 @@ mod tests {
             [SessionTrace::M_TRACE_STEP, SessionTrace::M_TRACE_TURN]
         );
         assert_eq!(sink.notes[1].params["id"], SESSION);
-        assert_eq!(sink.notes[1].params["record"], json!(turn));
+        assert_eq!(
+            sink.notes[1].params["record"],
+            TraceRecord::Turn(turn.clone()).line_value()
+        );
     }
 
     #[tokio::test]

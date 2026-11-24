@@ -12,8 +12,9 @@
 //! `sessions_changed`), and `trace_warning {id, message}` when the log could not be written; the
 //! turn goes on either way. A turn cut off because no connection is left is still logged, with
 //! reason `aborted`. `get_trace {id, before?, limit?}` needs no attachment and pages the log
-//! newest turn first (`{turns, more, reset_pending}`, records in their log-line shape). `reset`
-//! appends a reset marker; `delete_session` deletes the log.
+//! newest turn first (`{turns, more, reset_pending}`). Live and paged records are the same:
+//! each in its log-line shape, `v` and `kind` included. `reset` appends a reset marker;
+//! `delete_session` deletes the log.
 //!
 //! Every frame for a connection (responses and notifications) goes through its one outbound
 //! channel in the [`Hub`], drained by a writer task, so frames never interleave and a
@@ -616,19 +617,27 @@ impl RuntimeConnection {
             .hub
             .hold_busy(&id)
             .ok_or_else(|| RpcError::internal(Self::ERR_BUSY))?;
-        let rec = SharedRequests::record(&self.deps, &id).map_err(|_| Self::no_session())?;
-        self.deps
-            .sessions
-            .reset(&rec.id)
-            .map_err(RpcError::internal)?;
+        // Taken before the record is read and the session reset, for the reason `start_turn`
+        // gives: `delete_session` (which takes no busy flag) deletes the session before its
+        // trace, so a delete racing this reset either makes the read or the reset fail, or
+        // retires this handle and drops the marker. Taking it after the reset could recreate
+        // a deleted session's log.
+        let log = self.deps.traces.log(&id);
+        let reset = SharedRequests::record(&self.deps, &id)
+            .map_err(|_| Self::no_session())
+            .and_then(|rec| {
+                self.deps
+                    .sessions
+                    .reset(&rec.id)
+                    .map_err(RpcError::internal)
+            });
+        if let Err(e) = reset {
+            SharedRequests::forget_trace_if_gone(&self.deps, &id);
+            return Err(e);
+        }
         // The trace keeps its history; a failed marker only loses the divider.
-        if let Err(e) = self
-            .deps
-            .traces
-            .log(&rec.id)
-            .and_then(|log| SessionTrace::reset(&log))
-        {
-            eprintln!("{} {}: {e}", Self::ERR_RESET_MARKER, rec.id);
+        if let Err(e) = log.and_then(|log| SessionTrace::reset(&log)) {
+            eprintln!("{} {id}: {e}", Self::ERR_RESET_MARKER);
         }
         Ok(Value::Null)
     }
@@ -647,7 +656,10 @@ impl RuntimeConnection {
         // handle, so the turn's records never recreate a deleted session's log.
         let log = self.deps.traces.log(&id).map_err(|e| e.to_string());
         // Read after taking busy, so no other turn or reset changes it underneath.
-        let rec = SharedRequests::record(&self.deps, &id).map_err(|_| Self::no_session())?;
+        let rec = SharedRequests::record(&self.deps, &id).map_err(|_| {
+            SharedRequests::forget_trace_if_gone(&self.deps, &id);
+            Self::no_session()
+        })?;
         let deps = self.deps.clone();
         let conn = self.conn;
         Ok(Box::pin(async move {
@@ -869,16 +881,32 @@ impl SharedRequests {
     /// A page of the session's trace, newest turn first, records in their log-line shape.
     fn get_trace(&self, params: Value) -> Result<Value, RpcError> {
         let p: GetTraceParams = Frames::params(params)?;
+        // Taken before the check, so a session deleted in between never leaves a cached handle.
+        let log = self.deps.traces.log(&p.id);
         if !self.deps.sessions.contains(&p.id) {
+            Self::forget_trace_if_gone(&self.deps, &p.id);
             return Err(RpcError::internal(SessionError::unknown(&p.id)));
         }
-        let page = self
-            .deps
-            .traces
-            .log(&p.id)
+        let page = log
             .and_then(|log| log.page(p.before, p.limit))
             .map_err(RpcError::internal)?;
         Ok(page.wire())
+    }
+
+    /// Evicts (and retires) the trace handle of a session that is not in the store, so a
+    /// request that raced its delete leaves no cached handle or stray log behind. A session
+    /// still in the store is left alone: its log is never touched here. Ids are never reused,
+    /// so a session found gone stays gone.
+    fn forget_trace_if_gone(deps: &RuntimeDeps, id: &str) {
+        if deps.sessions.contains(id) {
+            return;
+        }
+        if let Err(e) = deps.traces.delete(id) {
+            // An id that is no plain file name never had a log; anything else is logged.
+            if e.kind() != std::io::ErrorKind::InvalidInput {
+                eprintln!("{} {id}: {e}", RuntimeConnection::ERR_TRACE_DELETE);
+            }
+        }
     }
 
     /// The template, its group path, and why it fails validation (`null` when it passes). Only
@@ -1006,6 +1034,17 @@ mod tests {
     const TURNS: &str = "turns";
     const STEPS: &str = "steps";
     const SUMMARY: &str = "summary";
+    const REASON: &str = "reason";
+    const COMMITTED: &str = "committed";
+    const END: &str = "end";
+    const KIND: &str = "kind";
+    const TURN: &str = "turn";
+    const LOAD_MS: &str = "load_ms";
+    const V: &str = "v";
+    /// A step record's field, and its `kind`.
+    const STEP: &str = "step";
+    const RESET_PENDING: &str = "reset_pending";
+    const WINDOW_FULL: &str = "window_full";
 
     /// One in-process connection and the frames queued for it.
     struct Client {
@@ -2125,24 +2164,24 @@ mod tests {
         let steps = TestClient::params_of(&notes, SessionTrace::M_TRACE_STEP);
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0]["id"], id);
-        assert_eq!(steps[0][RECORD]["step"], 1);
+        assert_eq!(steps[0][RECORD][STEP], 1);
         let summary = &TestClient::params_of(&notes, SessionTrace::M_TRACE_TURN)[0];
         assert_eq!(summary["id"], id);
-        assert_eq!(summary[RECORD]["reason"], "answered");
-        assert_eq!(summary[RECORD]["committed"], true);
+        assert_eq!(summary[RECORD][REASON], "answered");
+        assert_eq!(summary[RECORD][COMMITTED], true);
         let (_, page) = a.request(C::M_GET_TRACE, json!({ "id": id })).await;
         let page = &page[RESULT];
         assert_eq!(
-            (page["more"].clone(), page["reset_pending"].clone()),
+            (page["more"].clone(), page[RESET_PENDING].clone()),
             (json!(false), json!(false))
         );
         let turns = page[TURNS].as_array().unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0][STEPS].as_array().unwrap().len(), 1);
-        assert_eq!(turns[0][STEPS][0]["kind"], "step");
-        assert_eq!(turns[0][SUMMARY]["kind"], "turn");
-        assert_eq!(turns[0][SUMMARY]["v"], 1);
-        for field in ["turn", "reason", "committed", "total_ms", "user"] {
+        assert_eq!(turns[0][STEPS][0][KIND], STEP);
+        assert_eq!(turns[0][SUMMARY][KIND], "turn");
+        assert_eq!(turns[0][SUMMARY][V], 1);
+        for field in [TURN, REASON, COMMITTED, "total_ms", "user"] {
             assert_eq!(turns[0][SUMMARY][field], summary[RECORD][field], "{field}");
         }
     }
@@ -2161,11 +2200,11 @@ mod tests {
         assert_eq!(a.send().await.unwrap(), Value::Null);
         let frames = a.drain();
         let summary = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0][RECORD];
-        assert_eq!(summary["reason"], "window_full");
-        assert_eq!(summary["committed"], false);
+        assert_eq!(summary[REASON], WINDOW_FULL);
+        assert_eq!(summary[COMMITTED], false);
         let page = a.trace(&id).await;
-        assert_eq!(page[TURNS][0][STEPS][0]["end"], "rejected");
-        assert_eq!(page[TURNS][0][SUMMARY]["reason"], "window_full");
+        assert_eq!(page[TURNS][0][STEPS][0][END], "rejected");
+        assert_eq!(page[TURNS][0][SUMMARY][REASON], WINDOW_FULL);
         assert!(rt.deps.sessions.get(&id).unwrap().transcript.is_empty());
     }
 
@@ -2185,9 +2224,9 @@ mod tests {
         let page = b.trace(&id).await;
         let turn = &page[TURNS][0];
         let steps = turn[STEPS].as_array().unwrap();
-        assert_eq!(steps.last().unwrap()["end"], "aborted");
-        assert_eq!(turn[SUMMARY]["reason"], SessionTrace::REASON_ABORTED);
-        assert_eq!(turn[SUMMARY]["committed"], false);
+        assert_eq!(steps.last().unwrap()[END], "aborted");
+        assert_eq!(turn[SUMMARY][REASON], SessionTrace::REASON_ABORTED);
+        assert_eq!(turn[SUMMARY][COMMITTED], false);
     }
 
     #[tokio::test]
@@ -2203,11 +2242,11 @@ mod tests {
         let page = a.trace(&id).await;
         let (second, first) = (&page[TURNS][0], &page[TURNS][1]);
         assert_eq!(
-            (first["turn"].clone(), second["turn"].clone()),
+            (first[TURN].clone(), second[TURN].clone()),
             (json!(1), json!(2))
         );
-        assert!(first[STEPS][0]["load_ms"].is_u64(), "{first}");
-        assert_eq!(second[STEPS][0]["load_ms"], Value::Null);
+        assert!(first[STEPS][0][LOAD_MS].is_u64(), "{first}");
+        assert_eq!(second[STEPS][0][LOAD_MS], Value::Null);
     }
 
     #[tokio::test]
@@ -2226,7 +2265,7 @@ mod tests {
         assert!(!warnings[0]["message"].as_str().unwrap().is_empty());
         assert_eq!(rt.deps.sessions.get(&id).unwrap().transcript.len(), 2);
         let summary = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0][RECORD];
-        assert_eq!(summary["committed"], true);
+        assert_eq!(summary[COMMITTED], true);
     }
 
     #[tokio::test]
@@ -2267,7 +2306,7 @@ mod tests {
         a.send().await.unwrap();
         a.call(C::M_RESET, Value::Null).await.unwrap();
         let page = a.trace(&id).await;
-        assert_eq!(page["reset_pending"], true);
+        assert_eq!(page[RESET_PENDING], true);
         assert_eq!(page[TURNS].as_array().unwrap().len(), 1);
         let file = Client::trace_file(&rt, &id);
         assert!(file.is_file());
@@ -2293,14 +2332,61 @@ mod tests {
         b.send().await.unwrap();
         let frames = b.drain();
         let summary = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0][RECORD];
-        assert_eq!(summary["turn"], 2);
+        assert_eq!(summary[TURN], 2);
         let page = b.trace(&id).await;
         let turns: Vec<&Value> = page[TURNS]
             .as_array()
             .unwrap()
             .iter()
-            .map(|t| &t["turn"])
+            .map(|t| &t[TURN])
             .collect();
         assert_eq!(turns, [&json!(2), &json!(1)]);
+    }
+
+    #[tokio::test]
+    async fn live_trace_step_is_byte_equal_to_the_paged_step() {
+        let rt = TestRuntime::new("tracesame", Client::answering());
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        a.drain();
+        a.send().await.unwrap();
+        let frames = a.drain();
+        let live = &TestClient::params_of(&frames, SessionTrace::M_TRACE_STEP)[0][RECORD];
+        let live_turn = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0][RECORD];
+        let page = a.trace(&id).await;
+        assert_eq!(live[V], 1);
+        assert_eq!(live[KIND], STEP);
+        assert_eq!(
+            serde_json::to_string(live).unwrap(),
+            serde_json::to_string(&page[TURNS][0][STEPS][0]).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(live_turn).unwrap(),
+            serde_json::to_string(&page[TURNS][0][SUMMARY]).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_trace_on_a_gone_session_forgets_its_log_only() {
+        let rt = TestRuntime::new("tracegone", Client::answering());
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        a.send().await.unwrap();
+        // A stray log of a session the store does not hold is evicted and removed...
+        let gone = "s-0-0";
+        let stray = Client::trace_file(&rt, gone);
+        std::fs::write(&stray, "").unwrap();
+        let err = a
+            .call(C::M_GET_TRACE, json!({ "id": gone }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, SessionError::unknown(gone).0);
+        assert!(!stray.exists());
+        // ...while a live session's log is left alone.
+        let page = a.trace(&id).await;
+        assert_eq!(page[TURNS].as_array().unwrap().len(), 1);
+        assert!(Client::trace_file(&rt, &id).is_file());
     }
 }
