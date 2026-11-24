@@ -156,3 +156,85 @@ export interface SessionBusy
     id: string
     busy: boolean
 }
+
+export type StepEnd = 'tool_calls' | 'answered' | 'budget' | 'rejected' | 'error' | 'aborted'
+
+export interface ToolTiming
+{
+    name: string
+    id: string
+    ok: boolean
+    ms: number
+    bytes: number
+}
+
+/** One model call of a turn. `v` and `kind` are the log-line envelope: ignore a record whose kind is unknown. */
+export interface StepRecord
+{
+    v: number
+    kind: 'step' | 'turn'
+    turn: number
+    step: number
+    at: number
+    prompt_tokens: number
+    n_ctx: number
+    out_tokens: number
+    think_tokens: number
+    load_ms: number | null
+    ttft_ms: number | null
+    gen_ms: number | null
+    end: StepEnd
+    tools: ToolTiming[]
+    error: string | null
+}
+
+/** A turn's closing summary. `reason` is a loop_done reason or 'aborted'. */
+export interface TurnRecord
+{
+    v: number
+    kind: 'step' | 'turn'
+    turn: number
+    at: number
+    steps: number
+    reason: string
+    total_ms: number
+    out_tokens: number
+    think_tokens: number
+    peak_fill: number
+    committed: boolean
+    user: string
+}
+
+/** A turn as paged by get_trace; `summary` is null while running or after a crash. */
+export interface TraceTurn
+{
+    turn: number
+    steps: StepRecord[]
+    summary: TurnRecord | null
+    reset_before: boolean
+}
+
+export interface TracePage
+{
+    turns: TraceTurn[]
+    more: boolean
+    reset_pending: boolean
+}
+
+export interface TraceStepNote
+{
+    id: string
+    record: StepRecord
+}
+
+export interface TraceTurnNote
+{
+    id: string
+    record: TurnRecord
+}
+
+export interface TraceWarning
+{
+    id: string
+    message: string
+}

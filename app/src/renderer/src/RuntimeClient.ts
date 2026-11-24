@@ -8,6 +8,10 @@ import type {
     SessionBusy,
     SessionLoading,
     SessionSummary,
+    TraceStepNote,
+    TracePage,
+    TraceTurnNote,
+    TraceWarning,
     TemplateNode,
     SamplingConfig,
     TemplateRecord,
@@ -112,6 +116,10 @@ export class RuntimeClient extends JsonRpcConnection
     private static readonly MethodLoadSessionModel = 'load_session_model'
     private static readonly MethodUnloadSessionModel = 'unload_session_model'
     private static readonly MethodSetThinking = 'set_thinking'
+    private static readonly MethodGetTrace = 'get_trace'
+    private static readonly NoteTraceStep = 'trace_step'
+    private static readonly NoteTraceTurn = 'trace_turn'
+    private static readonly NoteTraceWarning = 'trace_warning'
     private static readonly NoteSessionsChanged = 'sessions_changed'
     private static readonly NoteTemplatesChanged = 'templates_changed'
     private static readonly NotePlacementChanged = 'placement_changed'
@@ -139,6 +147,9 @@ export class RuntimeClient extends JsonRpcConnection
     public readonly OnPlacementChanged = new TypedSignal<PlacementChanged>()
     public readonly OnSessionLoading = new TypedSignal<SessionLoading>()
     public readonly OnSessionBusy = new TypedSignal<SessionBusy>()
+    public readonly OnTraceStep = new TypedSignal<TraceStepNote>()
+    public readonly OnTraceTurn = new TypedSignal<TraceTurnNote>()
+    public readonly OnTraceWarning = new TypedSignal<TraceWarning>()
 
     public ModelProps(): Promise<ModelProps>
     {
@@ -266,6 +277,21 @@ export class RuntimeClient extends JsonRpcConnection
         await this.Request<null>(RuntimeClient.MethodSetThinking, { enable })
     }
 
+    /** A page of the session's trace, newest turns first; `before` is a turn number to page back from. Needs no attach. */
+    public GetTrace(id: string, before?: number, limit?: number): Promise<TracePage>
+    {
+        const params: { id: string, before?: number, limit?: number } = { id }
+        if (before !== undefined)
+        {
+            params.before = before
+        }
+        if (limit !== undefined)
+        {
+            params.limit = limit
+        }
+        return this.Request<TracePage>(RuntimeClient.MethodGetTrace, params)
+    }
+
     protected Dispatch(method: string, params: unknown): void
     {
         switch (method)
@@ -284,6 +310,15 @@ export class RuntimeClient extends JsonRpcConnection
                 break
             case RuntimeClient.NoteSessionBusy:
                 this.OnSessionBusy.Raise(params as SessionBusy)
+                break
+            case RuntimeClient.NoteTraceStep:
+                this.OnTraceStep.Raise(params as TraceStepNote)
+                break
+            case RuntimeClient.NoteTraceTurn:
+                this.OnTraceTurn.Raise(params as TraceTurnNote)
+                break
+            case RuntimeClient.NoteTraceWarning:
+                this.OnTraceWarning.Raise(params as TraceWarning)
                 break
             case RuntimeClient.NoteTurnStarted:
                 this.OnTurnStarted.Raise(params as TurnStarted)

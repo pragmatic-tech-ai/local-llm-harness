@@ -224,6 +224,9 @@ describe('RuntimeClient', () =>
         const specs = [{ name: 'echo', description: 'd', parameters: {}, side_effects: false }]
         const props = { n_ctx: 4096, model_name: 'm' }
         const tokens = { tokens: [1, 2], count: 2 }
+        const step = { v: 1, kind: 'step', turn: 3, step: 1, at: 1, prompt_tokens: 10, n_ctx: 8192, out_tokens: 5, think_tokens: 0, load_ms: null, ttft_ms: 9, gen_ms: 8, end: 'tool_calls', tools: [{ name: 'read_file', id: 'c1', ok: true, ms: 4, bytes: 26 }], error: null }
+        const summaryRecord = { v: 1, kind: 'turn', turn: 3, at: 2, steps: 1, reason: 'answered', total_ms: 20, out_tokens: 5, think_tokens: 0, peak_fill: 0.4, committed: true, user: 'hi' }
+        const page = { turns: [{ turn: 3, steps: [step], summary: summaryRecord, reset_before: false }, { turn: 2, steps: [], summary: null, reset_before: true }], more: false, reset_pending: false }
         // reply is the wire result; result is what the method must resolve to (defaults to the reply).
         const table: { call: (c: RuntimeClient) => Promise<unknown>, method: string, params: unknown, reply: unknown, result?: unknown }[] = [
             { call: c => c.ListTemplates(), method: 'list_templates', params: {}, reply: nodes },
@@ -249,7 +252,9 @@ describe('RuntimeClient', () =>
             { call: c => c.SetSampling(sampling), method: 'set_sampling', params: { config: sampling }, reply: null, result: undefined },
             { call: c => c.SendTurn('hi'), method: 'send_turn', params: { content: 'hi' }, reply: null, result: undefined },
             { call: c => c.ModelProps(), method: 'model_props', params: {}, reply: props },
-            { call: c => c.Tokenize('abc'), method: 'tokenize', params: { text: 'abc' }, reply: tokens }
+            { call: c => c.Tokenize('abc'), method: 'tokenize', params: { text: 'abc' }, reply: tokens },
+            { call: c => c.GetTrace('s'), method: 'get_trace', params: { id: 's' }, reply: page },
+            { call: c => c.GetTrace('s', 3, 20), method: 'get_trace', params: { id: 's', before: 3, limit: 20 }, reply: page }
         ]
         for (const row of table)
         {
@@ -283,5 +288,21 @@ describe('RuntimeClient', () =>
         client.HandleFrame(JSON.stringify({ method: 'session_loading', params: { id: 's' } }))
         client.HandleFrame(JSON.stringify({ method: 'session_busy', params: { id: 's', busy: true } }))
         expect(seen).toEqual(['sessions', 'templates', placement, { id: 's' }, { id: 's', busy: true }])
+    })
+
+    it('trace_notifications_raise_signals', () =>
+    {
+        const client = new RuntimeClient()
+        const seen: unknown[] = []
+        client.OnTraceStep.Subscribe(p => seen.push(p))
+        client.OnTraceTurn.Subscribe(p => seen.push(p))
+        client.OnTraceWarning.Subscribe(p => seen.push(p))
+        const step = { id: 's', record: { v: 1, kind: 'step', turn: 1, step: 1, at: 1, prompt_tokens: 1, n_ctx: 2, out_tokens: 1, think_tokens: 0, load_ms: null, ttft_ms: 1, gen_ms: 1, end: 'answered', tools: [], error: null } }
+        const turn = { id: 's', record: { v: 1, kind: 'turn', turn: 1, at: 2, steps: 1, reason: 'answered', total_ms: 5, out_tokens: 1, think_tokens: 0, peak_fill: 0.1, committed: true, user: 'q' } }
+        const warning = { id: 's', message: 'disk full' }
+        client.HandleFrame(JSON.stringify({ method: 'trace_step', params: step }))
+        client.HandleFrame(JSON.stringify({ method: 'trace_turn', params: turn }))
+        client.HandleFrame(JSON.stringify({ method: 'trace_warning', params: warning }))
+        expect(seen).toEqual([step, turn, warning])
     })
 })
