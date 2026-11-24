@@ -20,6 +20,8 @@
 pub mod openrouter;
 pub mod pragmatic;
 pub mod registry;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::sync::Arc;
 
@@ -27,11 +29,35 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::agents::host::{HarnessIdentity, HostError, HostState, ModelRequirement};
+use crate::agents::host::ModelRequirement;
 use crate::runtime::worker::WorkerLink;
 
 pub use pragmatic::{LocalHarness, PragmaticProvider};
 pub use registry::RepositoryRegistry;
+
+/// What a provider has loaded right now. `loaded` is `(runtime, model, n_ctx)` and is only set
+/// while the harness is Ready; `n_ctx` is `None` when it was started without an explicit
+/// override.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostState {
+    pub loaded: Option<(String, String, Option<u32>)>,
+    pub loading: bool,
+}
+
+/// The harness a provider is serving right now: its runtime, model and context size, plus
+/// which start of it this is (a reload of the same model is a new `instance`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessIdentity {
+    pub runtime: String,
+    pub model: String,
+    pub n_ctx: Option<u32>,
+    pub instance: u64,
+}
+
+/// A provider operation failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct HostError(pub String);
 
 /// How exactly a provider can measure a prompt's size in tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

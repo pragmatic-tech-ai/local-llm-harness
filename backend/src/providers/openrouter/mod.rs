@@ -2,12 +2,14 @@
 //!
 //! [`api`] is the HTTP client (the model list and the streaming chat call, with a small SSE
 //! reader), [`link`] is the [`WorkerLink`](crate::runtime::worker::WorkerLink) a session's steps
-//! run through, and [`provider`] is the always-ready [`Provider`](crate::providers::Provider)
-//! that hands those links out for one OpenRouter repository.
+//! run through (each `generate` stream is a `turn`), and [`provider`] is the always-ready
+//! [`Provider`](crate::providers::Provider) that hands those links out for one OpenRouter
+//! repository.
 
 pub mod api;
 pub mod link;
 pub mod provider;
+mod turn;
 
 pub use api::{ApiError, OpenRouterApi, OpenRouterModel, SseReader, SseStream};
 pub use link::{Calibration, OpenRouterLink};

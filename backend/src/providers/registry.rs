@@ -39,8 +39,10 @@ use crate::providers::openrouter::{OpenRouterApi, OpenRouterModel, OpenRouterPro
 use crate::providers::{Provider, ProviderCapabilities, ProviderSource};
 use crate::runtime::catalog_source::CatalogSource;
 
-/// One OpenRouter repository as stored in `repositories.toml`.
+/// One OpenRouter repository as stored in `repositories.toml`. Unknown keys are refused, so a
+/// typo (`apikey =`) is reported instead of silently lost on the next save.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenRouterConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,6 +85,7 @@ impl OpenRouterConfig {
 
 /// The whole `repositories.toml`.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RepositoriesFile {
     #[serde(default)]
     openrouter: Vec<OpenRouterConfig>,
@@ -179,7 +182,6 @@ impl OpenRouterEntry {
             config.name.clone(),
             Arc::clone(&api),
             Arc::clone(&served),
-            api.has_key(),
         ));
         let entry = OpenRouterEntry {
             config,
@@ -490,8 +492,7 @@ impl RepositoryRegistry {
     }
 
     /// Refuses when templates use `name`.
-    fn check_unused(name: &str, used_by: &dyn Fn(&str) -> Vec<String>) -> Result<(), String> {
-        let users = used_by(name);
+    fn check_unused(users: &[String]) -> Result<(), String> {
         if users.is_empty() {
             Ok(())
         } else {
@@ -618,6 +619,12 @@ impl RepositoryRegistry {
         if self.is_pragmatic(target) {
             return Err(format!("{}{target}", Self::ERR_NOT_EDITABLE));
         }
+        // Before the lock: `used_by` walks and parses the templates.
+        let users = if target != name {
+            used_by(target)
+        } else {
+            Vec::new()
+        };
         let mut entries = self.lock();
         let existing = entries.iter().position(|e| e.config.name == target);
         if existing.is_none() && previous_name.is_some() {
@@ -633,7 +640,7 @@ impl RepositoryRegistry {
         }
         let renaming = existing.is_some() && target != name;
         if renaming {
-            Self::check_unused(target, used_by)?;
+            Self::check_unused(&users)?;
         }
         let previous = existing.map(|i| Arc::clone(&entries[i]));
         let api_key = api_key
@@ -697,12 +704,14 @@ impl RepositoryRegistry {
         if self.is_pragmatic(name) {
             return Err(format!("{}{name}", Self::ERR_NOT_EDITABLE));
         }
+        // Before the lock: `used_by` walks and parses the templates.
+        let users = used_by(name);
         let mut entries = self.lock();
         let index = entries
             .iter()
             .position(|e| e.config.name == name)
             .ok_or_else(|| Self::not_found(name))?;
-        Self::check_unused(name, used_by)?;
+        Self::check_unused(&users)?;
         let configs = entries
             .iter()
             .enumerate()
@@ -751,8 +760,8 @@ impl ProviderSource for RepositoryRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::host::FakeHost;
     use crate::providers::openrouter::{Canned, FakeHttp};
+    use crate::providers::test_support::FakeHost;
     use crate::runtime::catalog_source::CatalogView;
     use crate::runtime::test_support::TempDir;
     use serde_json::json;
@@ -922,6 +931,35 @@ mod tests {
             keyless.unavailable().as_deref(),
             Some("repository or1 has no API key")
         );
+    }
+
+    #[tokio::test]
+    async fn used_by_runs_outside_the_registry_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = TempDir::new("repos-used-by-unlocked");
+        let (base, _requests) = FakeHttp::serve(vec![
+            Fixtures::models(&["google/a"]),
+            Fixtures::models(&["google/a"]),
+        ])
+        .await;
+        let registry = Fixtures::registry(&dir.0, &base);
+        registry
+            .save(Fixtures::REPO, None, vec![], None, &Fixtures::unused)
+            .await
+            .unwrap();
+        let unlocked = AtomicBool::new(true);
+        let used = |_: &str| {
+            if registry.openrouter.try_lock().is_err() {
+                unlocked.store(false, Ordering::SeqCst);
+            }
+            Vec::new()
+        };
+        registry
+            .save("or2", Some(Fixtures::REPO), vec![], None, &used)
+            .await
+            .unwrap();
+        registry.delete("or2", &used).unwrap();
+        assert!(unlocked.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1179,6 +1217,40 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "repositories file: does not parse at line 3"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_are_refused_by_line() {
+        let dir = TempDir::new("repos-unknown-key");
+        let hive = vec!["hive".to_string()];
+        let file = dir.0.join(RepositoryRegistry::FILE_NAME);
+        let typo = format!(
+            "[[openrouter]]
+name = \"or1\"
+apikey = \"{}\"
+",
+            Fixtures::KEY
+        );
+        fs::write(&file, typo).unwrap();
+        let err = RepositoryRegistry::load(&dir.0, &hive).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "repositories file: does not parse at line 3"
+        );
+        fs::write(
+            &file,
+            "
+openroutr = []
+",
+        )
+        .unwrap();
+        assert_eq!(
+            RepositoryRegistry::load(&dir.0, &hive)
+                .unwrap_err()
+                .to_string(),
+            "repositories file: does not parse at line 2"
         );
     }
 

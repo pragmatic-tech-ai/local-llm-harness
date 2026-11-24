@@ -39,6 +39,9 @@ const ERR_GROUP_EXISTS: &str = "group already exists";
 const ERR_DUPLICATE: &str = "duplicate template id: ";
 const RENAME_TMP: &str = "rename-tmp";
 const ERR_LOCK: &str = "template store lock poisoned";
+const KEY_NAME: &str = "name";
+const KEY_REPOSITORY: &str = "repository";
+const KEY_HOST: &str = "host";
 
 /// An error from the template store; the message is user-presentable.
 #[derive(Debug, Clone, PartialEq)]
@@ -175,8 +178,14 @@ impl TemplateStore {
     }
 
     /// What the seeds share: the runtime, the model picked for it, the context size and every
-    /// tool.
+    /// tool. The repository is the one [`TemplateRules::pragmatic_models`] picks from, left
+    /// unset when that is `hive` (the default).
     fn seed_base(rules: &TemplateRules) -> AgentTemplate {
+        let repository = rules
+            .seed_repository()
+            .map(|r| r.name.as_str())
+            .filter(|name| *name != ModelRequirement::DEFAULT_REPOSITORY)
+            .map(str::to_string);
         let models = rules.pragmatic_models();
         let capable = |m: &&RuleModel| m.runtimes.iter().any(|r| r == SEED_RUNTIME);
         let model = models
@@ -196,7 +205,7 @@ impl TemplateStore {
             n_ctx: SEED_N_CTX,
             enable_thinking: false,
             sampling: None,
-            repository: None,
+            repository,
             context_strategy: ContextStrategy::default(),
             compact_at_pct: DEFAULT_COMPACT_AT_PCT,
             workspace: WorkspaceConfig::default(),
@@ -268,7 +277,9 @@ impl TemplateStore {
     }
 
     /// The names of the templates whose repository is `repository` (a template naming none
-    /// uses `hive`), sorted. Files that do not parse use nothing.
+    /// uses `hive`), sorted. A file that is TOML but not a valid template still counts, by its
+    /// `name` (else its file stem), so a broken template keeps its repository; a file that is
+    /// not TOML at all uses nothing.
     pub fn templates_using(&self, repository: &str) -> Vec<String> {
         let mut names = Vec::new();
         Self::collect_users(&self.root, repository, &mut names);
@@ -289,17 +300,19 @@ impl TemplateStore {
             if p.extension().and_then(|e| e.to_str()) != Some(EXT) {
                 continue;
             }
-            let parsed = fs::read_to_string(&p)
+            let Some(table) = fs::read_to_string(&p)
                 .ok()
-                .and_then(|s| toml::from_str::<AgentTemplate>(&s).ok());
-            if let Some(t) = parsed {
-                let uses = t
-                    .repository
-                    .as_deref()
-                    .unwrap_or(ModelRequirement::DEFAULT_REPOSITORY);
-                if uses == repository {
-                    names.push(t.name);
-                }
+                .and_then(|s| toml::from_str::<toml::Table>(&s).ok())
+            else {
+                continue;
+            };
+            let text = |key: &str| table.get(key).and_then(toml::Value::as_str);
+            let uses = text(KEY_REPOSITORY)
+                .or_else(|| text(KEY_HOST))
+                .unwrap_or(ModelRequirement::DEFAULT_REPOSITORY);
+            if uses == repository {
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                names.push(text(KEY_NAME).unwrap_or(stem).to_string());
             }
         }
     }
@@ -689,6 +702,37 @@ mod tests {
     }
 
     #[test]
+    fn broken_templates_still_count_as_users() {
+        let d = TempDir::new("users-broken");
+        let s = d.store();
+        let dir = d.0.join("templates").join("grp");
+        fs::create_dir_all(&dir).unwrap();
+        // Valid TOML, invalid templates (no runtime/model/n_ctx).
+        fs::write(
+            dir.join("a.toml"),
+            "name = \"Named\"
+repository = \"or1\"
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("legacy.toml"),
+            "host = \"or1\"
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("plain.toml"),
+            "name = \"Plain\"
+",
+        )
+        .unwrap();
+        fs::write(dir.join("broken.toml"), "not toml [").unwrap();
+        assert_eq!(s.templates_using("or1"), ["Named", "legacy"]);
+        assert_eq!(s.templates_using("hive"), ["Default", "Plain", "Worker"]);
+    }
+
+    #[test]
     fn tree_flags_an_unknown_context_strategy_verbatim() {
         let d = TempDir::new("badstrategy");
         let s = d.store();
@@ -974,22 +1018,26 @@ n_ctx = 4096
             s.save(None, "", &t).unwrap_err().0,
             "unknown model: dropped-in"
         );
-        shared.lock().unwrap().repositories[0]
-            .models
-            .as_mut()
-            .unwrap()
-            .push(RuleModel::of("dropped-in", &["llamacpp"]));
+        {
+            let mut rules = shared.lock().unwrap();
+            let models = &mut rules.repositories[0].models;
+            let mut list = models.as_deref().unwrap().to_vec();
+            list.push(RuleModel::of("dropped-in", &["llamacpp"]));
+            *models = Some(list.into());
+        }
         let id = s.save(None, "", &t).unwrap();
         assert!(s
             .tree()
             .iter()
             .any(|n| matches!(n, TemplateNode::Template { id: i, error: None, .. } if *i == id)));
         // Removed again: the tree flags it without a restart.
-        shared.lock().unwrap().repositories[0]
-            .models
-            .as_mut()
-            .unwrap()
-            .pop();
+        {
+            let mut rules = shared.lock().unwrap();
+            let models = &mut rules.repositories[0].models;
+            let mut list = models.as_deref().unwrap().to_vec();
+            list.pop();
+            *models = Some(list.into());
+        }
         assert!(s.tree().iter().any(
             |n| matches!(n, TemplateNode::Template { id: i, error: Some(_), .. } if *i == id)
         ));
@@ -1232,16 +1280,37 @@ n_ctx = 4096
             repositories: vec![RepositoryRules {
                 name: "hive".into(),
                 kind: RepositoryKind::Pragmatic,
-                models: Some(vec![
-                    RuleModel::of("only-candle", &["candle"]),
-                    RuleModel::of("alpha", &["candle", "llamacpp"]),
-                    RuleModel::of("beta", &["llamacpp"]),
-                ]),
+                models: Some(
+                    vec![
+                        RuleModel::of("only-candle", &["candle"]),
+                        RuleModel::of("alpha", &["candle", "llamacpp"]),
+                        RuleModel::of("beta", &["llamacpp"]),
+                    ]
+                    .into(),
+                ),
             }],
             writing_tools: vec![],
         };
         let s = TemplateStore::open(&d.0.join("templates"), rules).unwrap();
         assert_eq!(s.get("default").unwrap().0.model, "alpha");
+    }
+
+    #[test]
+    fn seeds_name_the_first_pragmatic_repository_when_there_is_no_hive() {
+        let d = TempDir::new("seed-nohive");
+        let mut rules = TemplateRules::for_tests();
+        rules.repositories[0].name = "lab".into();
+        let check = rules.clone();
+        let s = TemplateStore::open(&d.0.join("templates"), rules).unwrap();
+        for id in ["default", "worker"] {
+            let seed = s.get(id).unwrap().0;
+            assert_eq!(seed.repository.as_deref(), Some("lab"));
+            assert_eq!(check.validate(&seed), Ok(()));
+        }
+        // With `hive` among the repositories the seeds name none (the default).
+        let d = TempDir::new("seed-hive");
+        let s = d.store();
+        assert_eq!(s.get("default").unwrap().0.repository, None);
     }
 
     #[test]

@@ -12,9 +12,11 @@ use futures::stream::{self, StreamExt};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::agents::host::{HarnessIdentity, ModelRequirement};
+use crate::agents::host::ModelRequirement;
 use crate::agents::session::SessionRecord;
-use crate::providers::{Provider, ProviderCapabilities, ProviderSource};
+use crate::providers::{
+    HarnessIdentity, HostError, Provider, ProviderCapabilities, ProviderSource,
+};
 use crate::runtime::worker::WorkerLink;
 
 /// Where a requirement stands right now. Serialized as `{"state":"ready","host":..}`,
@@ -39,6 +41,12 @@ pub enum Placement {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct DispatchError(pub String);
+
+impl From<HostError> for DispatchError {
+    fn from(error: HostError) -> Self {
+        DispatchError(error.0)
+    }
+}
 
 pub struct Dispatcher {
     source: Arc<dyn ProviderSource>,
@@ -148,7 +156,7 @@ impl Dispatcher {
         provider
             .ensure_ready(req)
             .await
-            .map_err(|e| DispatchError(e.0))
+            .map_err(DispatchError::from)
     }
 
     /// The link for a turn's first step. If the model is not loaded, calls `notify_loading` once
@@ -167,7 +175,7 @@ impl Dispatcher {
         provider
             .ensure_ready(req)
             .await
-            .map_err(|e| DispatchError(e.0))
+            .map_err(DispatchError::from)
     }
 
     /// Unload `req`'s model from its provider. Does nothing if that provider has some other model
@@ -179,7 +187,7 @@ impl Dispatcher {
             .unload_if(req)
             .await
             .map(|_| ())
-            .map_err(|e| DispatchError(e.0))
+            .map_err(DispatchError::from)
     }
 
     /// Fires whenever any provider's state changes. Must be called inside a tokio runtime.
@@ -224,11 +232,11 @@ impl Drop for Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::host::{FakeHost, HostState};
     use crate::agents::template::{
         AgentTemplate, ContextStrategy, WorkspaceConfig, DEFAULT_COMPACT_AT_PCT,
     };
-    use crate::providers::{FixedProviders, Measure, Provider, ProviderCapabilities};
+    use crate::providers::test_support::FakeHost;
+    use crate::providers::{FixedProviders, HostState, Measure, Provider, ProviderCapabilities};
     use crate::runtime::test_support::FakeLink;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;

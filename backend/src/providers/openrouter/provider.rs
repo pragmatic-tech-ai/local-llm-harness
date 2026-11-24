@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use crate::agents::host::{HarnessIdentity, HostError, HostState, ModelRequirement};
+use crate::agents::host::ModelRequirement;
 use crate::providers::openrouter::api::{OpenRouterApi, OpenRouterModel};
 use crate::providers::openrouter::link::{Calibration, OpenRouterLink};
-use crate::providers::{Measure, Provider, ProviderCapabilities};
+use crate::providers::{
+    HarnessIdentity, HostError, HostState, Measure, Provider, ProviderCapabilities,
+};
 use crate::runtime::worker::WorkerLink;
 
 /// The provider of one OpenRouter repository.
@@ -22,6 +24,7 @@ pub struct OpenRouterProvider {
     api: Arc<OpenRouterApi>,
     /// The repository's model list; `None` while unknown. Shared with whoever refreshes it.
     models: Arc<RwLock<Option<Vec<OpenRouterModel>>>>,
+    /// The API has a key (fixed for the provider's life: a key change builds a new one).
     has_key: bool,
     /// The prompt-size calibration of each model id, shared by all its links.
     calibrations: Mutex<HashMap<String, Arc<Calibration>>>,
@@ -49,13 +52,12 @@ impl OpenRouterProvider {
         repository: String,
         api: Arc<OpenRouterApi>,
         models: Arc<RwLock<Option<Vec<OpenRouterModel>>>>,
-        has_key: bool,
     ) -> Self {
         OpenRouterProvider {
             repository,
+            has_key: api.has_key(),
             api,
             models,
-            has_key,
             calibrations: Mutex::new(HashMap::new()),
             events: broadcast::channel(Self::EVENT_CAPACITY).0,
         }
@@ -224,7 +226,6 @@ mod tests {
                 Self::REPOSITORY.into(),
                 api,
                 Arc::clone(&models),
-                has_key,
             ));
             (provider, models)
         }

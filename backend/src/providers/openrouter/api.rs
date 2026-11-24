@@ -375,6 +375,7 @@ impl OpenRouterApi {
     const DEBUG_NAME: &'static str = "OpenRouterApi";
     const DEBUG_BASE_URL: &'static str = "base_url";
     const DEBUG_KEY: &'static str = "key";
+    const CLIENT_BUILD: &'static str = "reqwest client construction";
 
     pub fn new(base_url: String, key: Option<String>) -> Self {
         OpenRouterApi {
@@ -384,7 +385,7 @@ impl OpenRouterApi {
                 .connect_timeout(Self::CONNECT_TIMEOUT)
                 .read_timeout(Self::READ_TIMEOUT)
                 .build()
-                .expect("reqwest client construction"),
+                .expect(Self::CLIENT_BUILD),
         }
     }
 

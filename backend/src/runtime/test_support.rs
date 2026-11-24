@@ -390,7 +390,7 @@ impl Drop for TempDir {
 /// repositories reach [`Self::OFFLINE`] unless [`Self::openrouter`] gives a base url.
 pub(crate) struct TestRuntime {
     pub(crate) deps: super::server::RuntimeDeps,
-    pub(crate) host: Arc<crate::agents::host::FakeHost>,
+    pub(crate) host: Arc<crate::providers::test_support::FakeHost>,
     pub(crate) dir: TempDir,
 }
 
@@ -450,9 +450,9 @@ impl TestRuntime {
         use super::registry::ToolRegistry;
         use super::test_tools::TestSource;
         use crate::agents::dispatcher::Dispatcher;
-        use crate::agents::host::FakeHost;
         use crate::agents::session_store::SessionStore;
         use crate::agents::template_store::TemplateStore;
+        use crate::providers::test_support::FakeHost;
         use crate::providers::{Provider, RepositoryRegistry};
 
         let sandbox = sandboxed.then(|| {
@@ -513,10 +513,13 @@ impl TestRuntime {
             repositories: vec![crate::agents::template::RepositoryRules {
                 name: Self::HOST.to_string(),
                 kind: crate::agents::template::RepositoryKind::Pragmatic,
-                models: Some(vec![crate::agents::template::RuleModel::of(
-                    Self::MODEL,
-                    &[Self::RUNTIME],
-                )]),
+                models: Some(
+                    vec![crate::agents::template::RuleModel::of(
+                        Self::MODEL,
+                        &[Self::RUNTIME],
+                    )]
+                    .into(),
+                ),
             }],
             writing_tools: registry
                 .specs()
@@ -547,7 +550,7 @@ impl TestRuntime {
     /// Marks the seeded template's model loaded on the host (firing its signal).
     pub(crate) fn load(&self) {
         let t = self.template();
-        self.host.set_state(crate::agents::host::HostState {
+        self.host.set_state(crate::providers::HostState {
             loaded: Some((t.runtime, t.model, Some(t.n_ctx))),
             loading: false,
         });

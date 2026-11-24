@@ -35,6 +35,8 @@ fi
 # Cargo.lock and the vendored crates are needed for the offline build. The hive clone sits at
 # origin/main, so ship only the vendor files that differ from it (changed/added + untracked).
 # Stale crate dirs left on the hive are harmless; --restore cleans what was shipped.
+# Refresh origin/main first so the diff matches the hive clone; offline, the local copy is used.
+git -C "$REPO_ROOT" fetch -q origin main 2>/dev/null || echo "note: origin/main not fetched; using the local copy" >&2
 (cd "$REPO_ROOT" && {
     git diff --name-only --diff-filter=d origin/main -- backend/vendor
     git ls-files -o --exclude-standard backend/vendor

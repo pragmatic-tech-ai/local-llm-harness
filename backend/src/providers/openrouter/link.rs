@@ -6,7 +6,6 @@
 //! (as the worker relays them), then `turn_done {content, tool_calls, usage}`; or
 //! `turn_rejected` when the prompt is too long, or `turn_error`.
 
-use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -14,10 +13,47 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-use crate::engine::tool_format::ParsedCall;
 use crate::engine::{ChatMessage, Role};
-use crate::providers::openrouter::api::{ApiError, OpenRouterApi, OpenRouterModel, SseStream};
+use crate::providers::openrouter::api::{OpenRouterApi, OpenRouterModel};
+use crate::providers::openrouter::turn::Turn;
 use crate::runtime::worker::{GenerateRequest, LinkError, Note, PromptSize, WorkerLink};
+
+/// The wire keys the chat body and the notes share: one home each.
+pub(super) struct Wire;
+
+impl Wire {
+    pub(super) const MODEL: &'static str = "model";
+    pub(super) const MESSAGES: &'static str = "messages";
+    pub(super) const TOOLS: &'static str = "tools";
+    pub(super) const STREAM: &'static str = "stream";
+    pub(super) const USAGE: &'static str = "usage";
+    pub(super) const INCLUDE: &'static str = "include";
+    pub(super) const TEMPERATURE: &'static str = "temperature";
+    pub(super) const TOP_P: &'static str = "top_p";
+    pub(super) const TOP_K: &'static str = "top_k";
+    pub(super) const REPETITION_PENALTY: &'static str = "repetition_penalty";
+    pub(super) const SEED: &'static str = "seed";
+    pub(super) const MAX_TOKENS: &'static str = "max_tokens";
+    pub(super) const REASONING: &'static str = "reasoning";
+    pub(super) const ENABLED: &'static str = "enabled";
+    pub(super) const ROLE: &'static str = "role";
+    pub(super) const CONTENT: &'static str = "content";
+    pub(super) const TOOL_CALLS: &'static str = "tool_calls";
+    pub(super) const TOOL_CALL_ID: &'static str = "tool_call_id";
+    pub(super) const ID: &'static str = "id";
+    pub(super) const TYPE: &'static str = "type";
+    pub(super) const FUNCTION: &'static str = "function";
+    pub(super) const NAME: &'static str = "name";
+    pub(super) const ARGUMENTS: &'static str = "arguments";
+    pub(super) const N_CTX: &'static str = "n_ctx";
+    pub(super) const MODEL_NAME: &'static str = "model_name";
+    pub(super) const SUPPORTS_TOOLS: &'static str = "supports_tools";
+    pub(super) const PROMPT_TOKENS: &'static str = "prompt_tokens";
+    pub(super) const COMPLETION_TOKENS: &'static str = "completion_tokens";
+    pub(super) const REASONING_TOKENS: &'static str = "reasoning_tokens";
+    pub(super) const COST: &'static str = "cost";
+    pub(super) const ESTIMATED: &'static str = "estimated";
+}
 
 /// A model's prompt-size calibration: how many real tokens one estimated token turned out to
 /// be. Shared by every link (and so every session) on one repository and model.
@@ -75,11 +111,6 @@ pub struct OpenRouterLink {
 
 impl OpenRouterLink {
     const NOT_SUPPORTED: &'static str = "not supported by this provider";
-    const F_MESSAGES: &'static str = "messages";
-    const F_TOOLS: &'static str = "tools";
-    const F_SEED: &'static str = "seed";
-    const F_MAX_TOKENS: &'static str = "max_tokens";
-    const F_REASONING: &'static str = "reasoning";
     const KIND_FUNCTION: &'static str = "function";
     /// The sampling value meaning "not set" for `seed` and `max_tokens`.
     const UNSET: i64 = -1;
@@ -102,31 +133,34 @@ impl OpenRouterLink {
     fn body(&self, req: &GenerateRequest) -> Value {
         let sampling = &req.sampling;
         let mut body = Map::new();
-        body.insert("model".into(), json!(self.model.id));
+        body.insert(Wire::MODEL.into(), json!(self.model.id));
         body.insert(
-            Self::F_MESSAGES.into(),
+            Wire::MESSAGES.into(),
             Value::Array(req.messages.iter().map(Self::wire_message).collect()),
         );
         if !req.tools.is_empty() {
-            body.insert(Self::F_TOOLS.into(), Value::Array(req.tools.clone()));
+            body.insert(Wire::TOOLS.into(), Value::Array(req.tools.clone()));
         }
-        body.insert("stream".into(), json!(true));
-        body.insert("usage".into(), json!({"include": true}));
-        body.insert("temperature".into(), Self::wire_f32(sampling.temperature));
-        body.insert("top_p".into(), Self::wire_f32(sampling.top_p));
-        body.insert("top_k".into(), json!(sampling.top_k));
+        body.insert(Wire::STREAM.into(), json!(true));
+        body.insert(Wire::USAGE.into(), json!({(Wire::INCLUDE): true}));
         body.insert(
-            "repetition_penalty".into(),
+            Wire::TEMPERATURE.into(),
+            Self::wire_f32(sampling.temperature),
+        );
+        body.insert(Wire::TOP_P.into(), Self::wire_f32(sampling.top_p));
+        body.insert(Wire::TOP_K.into(), json!(sampling.top_k));
+        body.insert(
+            Wire::REPETITION_PENALTY.into(),
             Self::wire_f32(sampling.repeat_penalty),
         );
         if sampling.seed != Self::UNSET {
-            body.insert(Self::F_SEED.into(), json!(sampling.seed));
+            body.insert(Wire::SEED.into(), json!(sampling.seed));
         }
         if i64::from(sampling.max_tokens) != Self::UNSET {
-            body.insert(Self::F_MAX_TOKENS.into(), json!(sampling.max_tokens));
+            body.insert(Wire::MAX_TOKENS.into(), json!(sampling.max_tokens));
         }
         if req.enable_thinking && self.model.reasoning {
-            body.insert(Self::F_REASONING.into(), json!({"enabled": true}));
+            body.insert(Wire::REASONING.into(), json!({(Wire::ENABLED): true}));
         }
         Value::Object(body)
     }
@@ -136,7 +170,7 @@ impl OpenRouterLink {
     fn wire_message(message: &ChatMessage) -> Value {
         match message.role {
             Role::System | Role::User => {
-                json!({"role": message.role, "content": message.content})
+                json!({(Wire::ROLE): message.role, (Wire::CONTENT): message.content})
             }
             Role::Assistant => {
                 let calls: Vec<Value> = message
@@ -145,24 +179,24 @@ impl OpenRouterLink {
                     .flatten()
                     .map(|call| {
                         json!({
-                            "id": call.id,
-                            "type": Self::KIND_FUNCTION,
-                            "function": {
-                                "name": call.function.name,
-                                "arguments": call.function.arguments.to_string(),
+                            (Wire::ID): call.id,
+                            (Wire::TYPE): Self::KIND_FUNCTION,
+                            (Wire::FUNCTION): {
+                                (Wire::NAME): call.function.name,
+                                (Wire::ARGUMENTS): call.function.arguments.to_string(),
                             }
                         })
                     })
                     .collect();
                 if calls.is_empty() {
-                    return json!({"role": message.role, "content": message.content});
+                    return json!({(Wire::ROLE): message.role, (Wire::CONTENT): message.content});
                 }
                 let content = if message.content.is_empty() {
                     Value::Null
                 } else {
                     json!(message.content)
                 };
-                json!({"role": message.role, "content": content, "tool_calls": calls})
+                json!({(Wire::ROLE): message.role, (Wire::CONTENT): content, (Wire::TOOL_CALLS): calls})
             }
             Role::Tool => {
                 let content = match &message.tool_result {
@@ -170,9 +204,9 @@ impl OpenRouterLink {
                     None => message.content.clone(),
                 };
                 json!({
-                    "role": message.role,
-                    "tool_call_id": message.tool_call_id.clone().unwrap_or_default(),
-                    "content": content,
+                    (Wire::ROLE): message.role,
+                    (Wire::TOOL_CALL_ID): message.tool_call_id.clone().unwrap_or_default(),
+                    (Wire::CONTENT): content,
                 })
             }
         }
@@ -189,7 +223,7 @@ impl OpenRouterLink {
 
     /// The characters of the serialized messages and tools: what the estimate counts.
     fn prompt_chars(body: &Value) -> usize {
-        [Self::F_MESSAGES, Self::F_TOOLS]
+        [Wire::MESSAGES, Wire::TOOLS]
             .iter()
             .filter_map(|field| body.get(*field))
             .map(|value| value.to_string().chars().count())
@@ -200,7 +234,11 @@ impl OpenRouterLink {
 #[async_trait]
 impl WorkerLink for OpenRouterLink {
     async fn model_props(&self) -> Result<Value, LinkError> {
-        Ok(json!({"n_ctx": self.n_ctx, "model_name": self.model.id, "supports_tools": true}))
+        Ok(json!({
+            (Wire::N_CTX): self.n_ctx,
+            (Wire::MODEL_NAME): self.model.id,
+            (Wire::SUPPORTS_TOOLS): true,
+        }))
     }
 
     async fn tokenize(&self, _text: &str) -> Result<Value, LinkError> {
@@ -237,296 +275,10 @@ impl WorkerLink for OpenRouterLink {
     }
 }
 
-/// Where a turn's HTTP call stands.
-enum Phase {
-    /// Not sent yet; holds the body.
-    Connect(Value),
-    Streaming(SseStream),
-    Finished,
-}
-
-/// One tool call being assembled from its deltas.
-#[derive(Default)]
-struct CallDraft {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
-impl CallDraft {
-    const F_ID: &'static str = "id";
-    const F_FUNCTION: &'static str = "function";
-    const F_NAME: &'static str = "name";
-    const F_ARGUMENTS: &'static str = "arguments";
-    const CALL_ID_PREFIX: &'static str = "call_";
-
-    /// Folds in one `tool_calls[]` delta: the id and name are taken when first sent, argument
-    /// fragments are appended.
-    fn absorb(&mut self, delta: &Value) {
-        if let Some(id) = delta.get(Self::F_ID).and_then(Value::as_str) {
-            if self.id.is_empty() {
-                self.id = id.to_string();
-            }
-        }
-        let Some(function) = delta.get(Self::F_FUNCTION) else {
-            return;
-        };
-        if let Some(name) = function.get(Self::F_NAME).and_then(Value::as_str) {
-            if self.name.is_empty() {
-                self.name = name.to_string();
-            }
-        }
-        if let Some(fragment) = function.get(Self::F_ARGUMENTS).and_then(Value::as_str) {
-            self.arguments.push_str(fragment);
-        }
-    }
-
-    /// The finished call at zero-based `index`, in the worker's parsed-call shape. Empty
-    /// arguments are `{}`; arguments that are not JSON keep their text as a string, with
-    /// `parse_error` set.
-    fn into_call(self, index: u64) -> ParsedCall {
-        let id = if self.id.is_empty() {
-            format!("{}{}", Self::CALL_ID_PREFIX, index + 1)
-        } else {
-            self.id
-        };
-        let (arguments, parse_error) = if self.arguments.trim().is_empty() {
-            (Value::Object(Map::new()), None)
-        } else {
-            match serde_json::from_str::<Value>(&self.arguments) {
-                Ok(value) => (value, None),
-                Err(e) => (Value::String(self.arguments.clone()), Some(e.to_string())),
-            }
-        };
-        ParsedCall {
-            id,
-            name: self.name,
-            arguments,
-            raw: self.arguments,
-            parse_error,
-        }
-    }
-}
-
-/// The state of one `generate` stream.
-struct Turn {
-    api: Arc<OpenRouterApi>,
-    phase: Phase,
-    pending: VecDeque<Note>,
-    content: String,
-    calls: BTreeMap<u64, CallDraft>,
-    usage: Option<Value>,
-    finish_seen: bool,
-    n_ctx: u32,
-    /// The uncalibrated estimate of this prompt, which the usage's real count calibrates.
-    base_estimate: u32,
-    calibration: Arc<Calibration>,
-}
-
-impl Turn {
-    const M_TURN_STARTED: &'static str = "turn_started";
-    const M_TURN_CHUNK: &'static str = "turn_chunk";
-    const M_TOOL_CALL: &'static str = "tool_call";
-    const M_TURN_DONE: &'static str = "turn_done";
-    const M_TURN_REJECTED: &'static str = "turn_rejected";
-    const M_TURN_ERROR: &'static str = "turn_error";
-    const F_ERROR: &'static str = "error";
-    const F_USAGE: &'static str = "usage";
-    const F_CHOICES: &'static str = "choices";
-    const F_DELTA: &'static str = "delta";
-    const F_CONTENT: &'static str = "content";
-    const F_REASONING: &'static str = "reasoning";
-    const F_TOOL_CALLS: &'static str = "tool_calls";
-    const F_INDEX: &'static str = "index";
-    const F_FINISH_REASON: &'static str = "finish_reason";
-    const F_PROMPT_TOKENS: &'static str = "prompt_tokens";
-    const F_COMPLETION_TOKENS: &'static str = "completion_tokens";
-    const F_COMPLETION_DETAILS: &'static str = "completion_tokens_details";
-    const F_REASONING_TOKENS: &'static str = "reasoning_tokens";
-    const F_COST: &'static str = "cost";
-    const STREAM_CUT: &'static str = "stream ended before the answer finished";
-
-    fn new(
-        api: Arc<OpenRouterApi>,
-        body: Value,
-        n_ctx: u32,
-        base_estimate: u32,
-        estimate: u32,
-        calibration: Arc<Calibration>,
-    ) -> Self {
-        let started = Self::note(
-            Self::M_TURN_STARTED,
-            json!({"prompt": null, "prompt_tokens": estimate, "n_ctx": n_ctx, "estimated": true}),
-        );
-        Turn {
-            api,
-            phase: Phase::Connect(body),
-            pending: VecDeque::from([started]),
-            content: String::new(),
-            calls: BTreeMap::new(),
-            usage: None,
-            finish_seen: false,
-            n_ctx,
-            base_estimate,
-            calibration,
-        }
-    }
-
-    fn note(method: &str, params: Value) -> Note {
-        Note {
-            method: method.to_string(),
-            params,
-        }
-    }
-
-    /// The next note, or `None` once the turn's last note was handed out.
-    async fn step(mut self) -> Option<(Result<Note, LinkError>, Self)> {
-        loop {
-            if let Some(note) = self.pending.pop_front() {
-                return Some((Ok(note), self));
-            }
-            match std::mem::replace(&mut self.phase, Phase::Finished) {
-                Phase::Finished => return None,
-                Phase::Connect(body) => match self.api.stream_chat(body).await {
-                    Ok(stream) => self.phase = Phase::Streaming(stream),
-                    Err(e) => self.fail(e),
-                },
-                Phase::Streaming(mut stream) => match stream.next_event().await {
-                    Some(Ok(event)) => {
-                        if self.absorb(&event) {
-                            self.phase = Phase::Streaming(stream);
-                        }
-                    }
-                    Some(Err(e)) => self.fail(e),
-                    None => self.finish(stream.saw_done()),
-                },
-            }
-        }
-    }
-
-    /// Folds in one stream event, queueing its notes. Returns false when the event ended the
-    /// turn (an error object).
-    fn absorb(&mut self, event: &Value) -> bool {
-        if let Some(error) = event.get(Self::F_ERROR) {
-            self.fail(ApiError::of_stream_object(error, self.api.key()));
-            return false;
-        }
-        if let Some(usage) = event.get(Self::F_USAGE).filter(|u| u.is_object()) {
-            self.take_usage(usage);
-        }
-        let Some(choice) = event
-            .get(Self::F_CHOICES)
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-        else {
-            return true;
-        };
-        if let Some(delta) = choice.get(Self::F_DELTA) {
-            if let Some(text) = Self::text(delta, Self::F_REASONING) {
-                self.pending.push_back(Self::chunk(text, true));
-            }
-            if let Some(text) = Self::text(delta, Self::F_CONTENT) {
-                self.content.push_str(text);
-                self.pending.push_back(Self::chunk(text, false));
-            }
-            if let Some(calls) = delta.get(Self::F_TOOL_CALLS).and_then(Value::as_array) {
-                for (position, call) in calls.iter().enumerate() {
-                    let index = call
-                        .get(Self::F_INDEX)
-                        .and_then(Value::as_u64)
-                        .unwrap_or(position as u64);
-                    self.calls.entry(index).or_default().absorb(call);
-                }
-            }
-        }
-        if choice
-            .get(Self::F_FINISH_REASON)
-            .is_some_and(|reason| !reason.is_null())
-        {
-            self.finish_seen = true;
-        }
-        true
-    }
-
-    /// A non-empty string field of a delta.
-    fn text<'a>(delta: &'a Value, field: &str) -> Option<&'a str> {
-        delta
-            .get(field)
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-    }
-
-    fn chunk(text: &str, reasoning: bool) -> Note {
-        let mut params = json!({"text": text, "tokens": [], "stop": false});
-        if reasoning {
-            params[Self::F_REASONING] = json!(true);
-        }
-        Self::note(Self::M_TURN_CHUNK, params)
-    }
-
-    /// Keeps the usage for `turn_done` and calibrates the model's estimate with it.
-    fn take_usage(&mut self, usage: &Value) {
-        let count = |value: Option<&Value>| value.and_then(Value::as_u64).unwrap_or(0);
-        let prompt = count(usage.get(Self::F_PROMPT_TOKENS));
-        let reasoning = count(
-            usage
-                .get(Self::F_COMPLETION_DETAILS)
-                .and_then(|d| d.get(Self::F_REASONING_TOKENS)),
-        );
-        self.usage = Some(json!({
-            "prompt_tokens": prompt,
-            "completion_tokens": count(usage.get(Self::F_COMPLETION_TOKENS)),
-            "reasoning_tokens": reasoning,
-            "cost": usage.get(Self::F_COST).cloned().unwrap_or(Value::Null),
-        }));
-        self.calibration.observe(
-            self.base_estimate,
-            u32::try_from(prompt).unwrap_or(u32::MAX),
-        );
-    }
-
-    /// Ends the turn with `error`: a context-length refusal is `turn_rejected` (so the turn
-    /// ends `window_full`), anything else `turn_error`.
-    fn fail(&mut self, error: ApiError) {
-        self.phase = Phase::Finished;
-        let note = if error.is_context_length() {
-            Self::note(
-                Self::M_TURN_REJECTED,
-                json!({"needed": 0, "total": self.n_ctx}),
-            )
-        } else {
-            Self::note(Self::M_TURN_ERROR, json!({"message": error.to_string()}))
-        };
-        self.pending.push_back(note);
-    }
-
-    /// The stream ended: the calls (in index order) and `turn_done`, or a `turn_error` when it
-    /// was cut before `[DONE]` or a finish reason.
-    fn finish(&mut self, saw_done: bool) {
-        if !saw_done && !self.finish_seen {
-            self.fail(ApiError::Transport(Self::STREAM_CUT.to_string()));
-            return;
-        }
-        let calls: Vec<ParsedCall> = std::mem::take(&mut self.calls)
-            .into_iter()
-            .map(|(index, draft)| draft.into_call(index))
-            .collect();
-        for call in &calls {
-            let params = serde_json::to_value(call).unwrap_or(Value::Null);
-            self.pending
-                .push_back(Self::note(Self::M_TOOL_CALL, params));
-        }
-        let mut done = json!({"content": self.content, "tool_calls": calls});
-        if let Some(usage) = self.usage.take() {
-            done[Self::F_USAGE] = usage;
-        }
-        self.pending.push_back(Self::note(Self::M_TURN_DONE, done));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::tool_format::ParsedCall;
     use crate::engine::types::{FunctionCall, ToolCall};
     use crate::engine::SamplingConfig;
     use crate::providers::openrouter::{Canned, Captured, FakeHttp};
@@ -767,6 +519,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn absent_usage_counts_are_null_and_do_not_calibrate() {
+        let parts = Fixtures::sse(&[
+            Fixtures::delta(json!({"content": "ok"})),
+            Fixtures::finish("stop"),
+            json!({"choices": [], "usage": {"cost": 0.002}}),
+        ]);
+        let calibration = Arc::new(Calibration::new());
+        let (link, _requests) = Fixtures::link_with(
+            vec![Fixtures::canned(200, parts)],
+            false,
+            Arc::clone(&calibration),
+        )
+        .await;
+        let notes = Fixtures::notes(&link, &Fixtures::request(false)).await;
+        assert_eq!(
+            notes.last().expect("done").params["usage"],
+            json!({"prompt_tokens": null, "completion_tokens": null, "reasoning_tokens": null, "cost": 0.002})
+        );
+        assert_eq!(calibration.estimate(400), 100);
+    }
+
+    #[tokio::test]
     async fn reasoning_deltas_are_flagged_chunks_not_content() {
         let parts = Fixtures::sse(&[
             Fixtures::delta(json!({"reasoning": "let me think"})),
@@ -868,6 +642,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].raw, "{\"path\": ");
+        assert_eq!(calls[0].arguments, Value::Null);
         assert!(calls[0].parse_error.is_some());
     }
 
@@ -928,12 +703,14 @@ mod tests {
         // A 401 whose message echoes the key back.
         let unauthorized = json!({"error": {"code": 401,
             "message": format!("Invalid credentials: Bearer {}", Fixtures::KEY)}});
-        // A stream that breaks with an error object mid-way.
+        // A stream that breaks with an error object mid-way, echoing the key in its code and
+        // its message.
         let mid_stream = vec![
             format!("data: {}\n\n", Fixtures::delta(json!({"content": "Hel"}))),
             format!(
                 "data: {}\n\n",
-                json!({"error": {"code": "server_error", "message": "upstream died"},
+                json!({"error": {"code": format!("bad_key_{}", Fixtures::KEY),
+                        "message": format!("upstream died for Bearer {}", Fixtures::KEY)},
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}]})
             ),
         ];
@@ -954,7 +731,10 @@ mod tests {
             "{}",
             messages[0]
         );
-        assert_eq!(messages[1], "openrouter: server_error upstream died");
+        assert_eq!(
+            messages[1],
+            "openrouter: bad_key_*** upstream died for Bearer ***"
+        );
 
         // A connect failure: nothing listens on the port.
         let port = {

@@ -853,8 +853,9 @@ impl<'a> Summarizer<'a> {
     /// brief worded it) is intended: it is the text the worker reports as final, and it is
     /// what `ToolLoop` reads too. Without tools the worker builds it from the same chunks.
     ///
-    /// A reply counts as cut off when its generated tokens (summed over `turn_chunk.tokens`)
-    /// reach `max_tokens`. The chunk `stop` flag is not used: the in-process engines send a
+    /// A reply counts as cut off when its generated tokens reach `max_tokens`: the usage's
+    /// `completion_tokens` when the provider reports it (OpenRouter chunks carry no tokens),
+    /// else the sum over `turn_chunk.tokens`. The chunk `stop` flag is not used: the in-process engines send a
     /// final `stop: true` chunk on the `max_tokens` cap as well as on end of sequence.
     async fn call(&mut self, content: String) -> Result<String, String> {
         let req = GenerateRequest {
@@ -900,10 +901,15 @@ impl<'a> Summarizer<'a> {
                     self.stats.out_tokens = self.stats.out_tokens.saturating_add(tokens);
                 }
                 ToolLoop::M_TURN_DONE => {
-                    if let Some(usage) = NoteUsage::of_done(params) {
+                    let usage = NoteUsage::of_done(params);
+                    let generated = usage
+                        .as_ref()
+                        .and_then(|u| u.completion_tokens)
+                        .map_or(out_tokens, |n| usize::try_from(n).unwrap_or(usize::MAX));
+                    if let Some(usage) = usage {
                         self.stats.apply_usage(usage, call_prompt, call_out);
                     }
-                    if out_tokens >= self.max_tokens {
+                    if generated >= self.max_tokens {
                         return Err(format!("{}{}", Self::ERR_MAX_TOKENS, self.max_tokens));
                     }
                     let content = params
@@ -2133,6 +2139,20 @@ mod tests {
             ),
             ("empty reply", Sx::reply("  \n ", 2), "empty"),
             ("max_tokens hit", Sx::reply("cut off", max), "max_tokens"),
+            (
+                "max_tokens hit by the usage count",
+                Notes::script(vec![
+                    Notes::started_fill("p", 10, N_CTX as u32),
+                    Notes::chunk_of("cut off", 0),
+                    Notes::note(
+                        "turn_done",
+                        json!({"content": "cut off", "tool_calls": [], "usage": {
+                            "prompt_tokens": 10, "completion_tokens": max
+                        }}),
+                    ),
+                ]),
+                "max_tokens",
+            ),
             (
                 "stream ends without turn_done",
                 Notes::script(vec![

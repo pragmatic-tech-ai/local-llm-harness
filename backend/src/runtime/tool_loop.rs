@@ -317,10 +317,12 @@ impl StepMeter {
         }
     }
 
-    /// The provider's counts replace the measured ones, and its cost is kept.
+    /// The provider's counts replace the measured ones, and its cost is kept. The prompt size
+    /// stops being an estimate only when the usage reports a prompt count.
     fn apply_usage(&mut self, usage: NoteUsage) {
         if usage.prompt_tokens.is_some() {
             self.prompt_tokens = usage.prompt_tokens;
+            self.estimated = false;
         }
         if let Some(out) = usage.completion_tokens {
             self.out_tokens = out;
@@ -329,7 +331,6 @@ impl StepMeter {
             self.reported_think = usage.reasoning_tokens;
         }
         self.cost = usage.cost;
-        self.estimated = false;
     }
 
     /// Stops the generation clock (once).
@@ -2146,6 +2147,26 @@ You are terse.<|tool>declaration:echo{";
         assert!(r.estimated);
         assert_eq!(r.prompt_tokens, Some(50));
         assert_eq!(r.cost, None);
+    }
+
+    #[tokio::test]
+    async fn usage_without_prompt_count_keeps_the_estimate() {
+        let mut f = Fixture::new();
+        let script = Notes::script(vec![
+            UsageNotes::estimated_started(),
+            Notes::chunk_of("a", 0),
+            UsageNotes::done(json!({
+                "prompt_tokens": null, "completion_tokens": 9, "reasoning_tokens": null, "cost": 0.001
+            })),
+        ]);
+        f.run(Some(FakeLink::new(true, vec![script])))
+            .await
+            .unwrap();
+        let r = &f.trace.records[0];
+        assert!(r.estimated);
+        assert_eq!(r.prompt_tokens, Some(50));
+        assert_eq!(r.out_tokens, 9);
+        assert_eq!(r.cost, Some(0.001));
     }
 
     #[tokio::test]

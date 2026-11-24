@@ -74,10 +74,15 @@
 //! list could not be fetched; the save stands) and `delete_repository {name}` deletes one. A
 //! rename or delete is refused while a template uses the repository (`repository is used by
 //! templates: {names}`, the names from the template store). Each broadcasts
-//! `repositories_changed` (a listing only when it fetched: a refresh, or the first listing of
-//! a list never fetched) and signals the dispatcher, so
+//! `repositories_changed` then `templates_changed` (a listing only when it fetched: a refresh,
+//! or the first listing of a list never fetched), so a shown template tree re-reads which
+//! templates name a model their repository no longer lists, and signals the dispatcher, so
 //! sessions whose placement changed with it (a deleted repository reads `repository not found:
-//! {name}`) get `placement_changed`. `list_catalog` adds `repositories` (each with its kind,
+//! {name}`) get `placement_changed`. The used-by check and the delete are not atomic with
+//! `save_template`: a template saved naming a repository while that repository is being deleted
+//! may land after the check, and then names a deleted repository. This race is benign: the
+//! template still loads, and the tree marks it `unknown repository: {name}` until it is edited
+//! or the repository is re-created. `list_catalog` adds `repositories` (each with its kind,
 //! capabilities and models). Session rows (`list_sessions`, `attach_session`) carry the
 //! provider's `capabilities`, `null` when the session's repository is gone. A template whose
 //! model has left its repository's list still loads; the tree marks it with the validation
@@ -110,13 +115,13 @@ use super::trace::{NoTrace, SessionTrace, TraceLog, TraceStore, TurnTrace};
 use super::worker::WorkerLink;
 use super::workspace::Workspace;
 use crate::agents::dispatcher::{Dispatcher, Placement};
-use crate::agents::host::{HarnessIdentity, ModelRequirement};
+use crate::agents::host::ModelRequirement;
 use crate::agents::session::{SessionRecord, SessionSummary};
 use crate::agents::session_store::{SessionError, SessionStore};
 use crate::agents::template::{AgentTemplate, CompactionState, WorkspaceMode};
 use crate::agents::template_store::{TemplateError, TemplateStore};
 use crate::engine::SamplingConfig;
-use crate::providers::{ProviderCapabilities, RepositoryRegistry};
+use crate::providers::{HarnessIdentity, ProviderCapabilities, RepositoryRegistry};
 use crate::rpc::{
     BoxError, Frames, RpcError, SetSamplingParams, TokenizeParams, Ws, ERR_METHOD_NOT_FOUND,
 };
@@ -1234,12 +1239,17 @@ impl SharedRequests {
         Self::to_value(saved)
     }
 
-    /// Broadcasts `repositories_changed`, and signals the dispatcher so the placements that
-    /// changed with the repositories are announced.
+    /// Broadcasts `repositories_changed` and then `templates_changed` (a template's validity
+    /// depends on its repository's model list, so a shown tree re-reads its marks), and
+    /// signals the dispatcher so the placements that changed with the repositories are
+    /// announced.
     fn repositories_changed(&self) {
         self.deps
             .hub
             .broadcast(RuntimeServer::REPOSITORIES_CHANGED, json!({}));
+        self.deps
+            .hub
+            .broadcast(RuntimeServer::TEMPLATES_CHANGED, json!({}));
         self.deps.dispatcher.refresh();
     }
 
@@ -1311,10 +1321,10 @@ impl SharedRequests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::host::HostState;
     use crate::agents::template::{ContextStrategy, WorkspaceConfig};
     use crate::engine::{ChatMessage, Role};
     use crate::providers::openrouter::{Canned, FakeHttp, OpenRouterProvider};
+    use crate::providers::HostState;
     use crate::rpc::test_support::TestClient;
     use crate::rpc::{ERR_INVALID_PARAMS, ERR_PARSE};
     use crate::runtime::compaction::{Summarize, SummaryNote, Trim};
@@ -3623,6 +3633,22 @@ mod tests {
         .unwrap();
         assert_eq!(changed(&mut b), 1);
         assert!(!format!("{:?}", a.drain()).contains(Repositories::KEY));
+    }
+
+    #[tokio::test]
+    async fn repository_changes_also_announce_templates_changed() {
+        let (base, _requests) =
+            FakeHttp::serve(vec![Repositories::models(&[Repositories::MODEL])]).await;
+        let rt = TestRuntime::openrouter("repotpl", Client::idle(), &base);
+        let mut a = Client::new(&rt);
+        let mut b = Client::new(&rt);
+        Repositories::save(&mut a, Repositories::REPO, None)
+            .await
+            .unwrap();
+        let methods = Client::methods(&b.drain());
+        let repositories = Client::position(&methods, RuntimeServer::REPOSITORIES_CHANGED);
+        let templates = Client::position(&methods, RuntimeServer::TEMPLATES_CHANGED);
+        assert!(repositories < templates, "{methods:?}");
     }
 
     #[tokio::test]

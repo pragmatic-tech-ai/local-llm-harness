@@ -1,6 +1,7 @@
 //! The agent template: the declarative, file-backed definition of an agent.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,8 @@ const DEFAULT_STEP_BUDGET: usize = 8;
 const ERR_UNKNOWN_TOOL: &str = "unknown tool: ";
 const ERR_UNKNOWN_RUNTIME: &str = "unknown runtime: ";
 const ERR_UNKNOWN_MODEL: &str = "unknown model: ";
+const ERR_RUNTIME_PREFIX: &str = "runtime ";
+const ERR_CANNOT_LOAD_MODEL: &str = " cannot load model ";
 const ERR_STEP_BUDGET: &str = "step_budget must be at least 1";
 const ERR_UNKNOWN_REPOSITORY: &str = "unknown repository: ";
 const ERR_LIST_UNAVAILABLE_PREFIX: &str = "model list unavailable for repository ";
@@ -244,10 +247,9 @@ impl AgentTemplate {
 
 /// How a repository serves its models, which decides how a template naming it is validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RepositoryKind {
-    #[serde(rename = "pragmatic")]
     Pragmatic,
-    #[serde(rename = "openrouter")]
     OpenRouter,
 }
 
@@ -260,12 +262,13 @@ pub struct RuleModel {
     pub context_length: Option<u32>,
 }
 
-/// A repository a template may name, with its models. `None` means the list is unknown.
+/// A repository a template may name, with its models. `None` means the list is unknown. The
+/// list is shared, so repositories offering the same models hold one copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryRules {
     pub name: String,
     pub kind: RepositoryKind,
-    pub models: Option<Vec<RuleModel>>,
+    pub models: Option<Arc<[RuleModel]>>,
 }
 
 /// What a template may reference: the known runtimes, tools and repositories (each with the
@@ -341,13 +344,14 @@ impl TemplateRules {
                 }
                 let found = repo
                     .models
+                    .as_deref()
+                    .unwrap_or_default()
                     .iter()
-                    .flatten()
                     .find(|m| m.id == t.model)
                     .ok_or_else(|| format!("{ERR_UNKNOWN_MODEL}{}", t.model))?;
                 if !found.runtimes.contains(&t.runtime) {
                     return Err(format!(
-                        "runtime {} cannot load model {}",
+                        "{ERR_RUNTIME_PREFIX}{}{ERR_CANNOT_LOAD_MODEL}{}",
                         t.runtime, t.model
                     ));
                 }
@@ -357,7 +361,7 @@ impl TemplateRules {
                 if t.runtime != OPENROUTER_RUNTIME {
                     return Err(format!("{ERR_UNKNOWN_RUNTIME}{}", t.runtime));
                 }
-                let Some(models) = repo.models.as_ref() else {
+                let Some(models) = repo.models.as_deref() else {
                     return Err(format!("{ERR_LIST_UNAVAILABLE_PREFIX}{name}"));
                 };
                 let found = models
@@ -372,13 +376,17 @@ impl TemplateRules {
         }
     }
 
-    /// The models of the first Pragmatic repository, preferring `hive`: what a seed template
-    /// picks from.
-    pub fn pragmatic_models(&self) -> &[RuleModel] {
+    /// The first Pragmatic repository, preferring `hive`: the one a seed template names.
+    pub fn seed_repository(&self) -> Option<&RepositoryRules> {
         self.repositories
             .iter()
             .filter(|r| r.kind == RepositoryKind::Pragmatic)
             .min_by_key(|r| r.name != ModelRequirement::DEFAULT_REPOSITORY)
+    }
+
+    /// The models of [`Self::seed_repository`]: what a seed template picks from.
+    pub fn pragmatic_models(&self) -> &[RuleModel] {
+        self.seed_repository()
             .and_then(|r| r.models.as_deref())
             .unwrap_or_default()
     }
@@ -393,10 +401,13 @@ impl TemplateRules {
             repositories: vec![RepositoryRules {
                 name: "hive".into(),
                 kind: RepositoryKind::Pragmatic,
-                models: Some(vec![
-                    RuleModel::of("gemma-4-e4b", &["llamacpp"]),
-                    RuleModel::of("tiny", &["candle", "llamacpp"]),
-                ]),
+                models: Some(
+                    vec![
+                        RuleModel::of("gemma-4-e4b", &["llamacpp"]),
+                        RuleModel::of("tiny", &["candle", "llamacpp"]),
+                    ]
+                    .into(),
+                ),
             }],
             writing_tools: vec![],
         }
@@ -598,7 +609,7 @@ mod tests {
             rules.repositories.push(RepositoryRules {
                 name: "or".into(),
                 kind: RepositoryKind::OpenRouter,
-                models,
+                models: models.map(Into::into),
             });
             rules
         }

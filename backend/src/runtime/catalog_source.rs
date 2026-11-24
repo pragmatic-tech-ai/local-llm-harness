@@ -81,7 +81,8 @@ impl CatalogSource for DiscoveredCatalog {
 
 impl RulesSource for DiscoveredCatalog {
     fn rules(&self) -> TemplateRules {
-        let models: Vec<RuleModel> = discover(&self.catalog)
+        // Built once and shared by every host's rules.
+        let models: Arc<[RuleModel]> = discover(&self.catalog)
             .into_iter()
             .map(|m| RuleModel {
                 id: m.display_name,
@@ -104,7 +105,7 @@ impl RulesSource for DiscoveredCatalog {
                 .map(|name| RepositoryRules {
                     name: name.clone(),
                     kind: RepositoryKind::Pragmatic,
-                    models: Some(models.clone()),
+                    models: Some(Arc::clone(&models)),
                 })
                 .collect(),
         }

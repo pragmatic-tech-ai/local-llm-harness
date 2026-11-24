@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use tokio::sync::{broadcast, Mutex};
 
-use crate::agents::host::{HarnessIdentity, HostError, HostState, ModelRequirement};
-use crate::providers::{Provider, ProviderCapabilities};
+use crate::agents::host::ModelRequirement;
+use crate::providers::{HarnessIdentity, HostError, HostState, Provider, ProviderCapabilities};
 use crate::runtime::worker::{WorkerLink, WsWorkerLink};
 use crate::supervisor::catalog::Catalog;
 use crate::supervisor::discovery::{discover, DiscoveredModel};

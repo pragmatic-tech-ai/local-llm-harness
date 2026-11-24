@@ -550,6 +550,32 @@ mod tests {
     }
 
     #[test]
+    fn old_snapshot_with_host_routes_to_that_repository() {
+        let d = TempDir::new("legacyhost");
+        let s = d.store();
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        drop(s);
+        let path = d.0.join("sessions").join(format!("{}.json", rec.id));
+        for host in ["hive", "lab"] {
+            let text = fs::read_to_string(&path).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let snapshot = v["snapshot"].as_object_mut().unwrap();
+            snapshot.remove("repository");
+            snapshot.insert("host".into(), serde_json::json!(host));
+            fs::write(&path, v.to_string()).unwrap();
+            let store = d.store();
+            let got = store.get(&rec.id).unwrap();
+            assert_eq!(got.snapshot.repository.as_deref(), Some(host));
+            let (_, req) = store
+                .list_with_requirements()
+                .into_iter()
+                .find(|(summary, _)| summary.id == rec.id)
+                .unwrap();
+            assert_eq!(req.repository, host);
+        }
+    }
+
+    #[test]
     fn overrides_round_trip() {
         let d = TempDir::new("over");
         let s = d.store();
