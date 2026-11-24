@@ -273,7 +273,13 @@ describe('RepositoryEditorViewModel', () =>
         {
             rig.editor.PropertyChanged(name).subscribe(() => order.push(name + '=' + String((rig.editor as unknown as Record<string, unknown>)[name])))
         }
-        const at = (entry: string) => order.indexOf(entry)
+        // Each entry must have been raised, or the ordering checks below would pass vacuously on -1.
+        const at = (entry: string) =>
+        {
+            const index = order.indexOf(entry)
+            expect(index, entry).toBeGreaterThanOrEqual(0)
+            return index
+        }
         await rig.OpenRouter()
         // Shown from empty: the form appears before its texts are written.
         expect(at('HasRepository=true')).toBeLessThan(at('HeaderText=openrouter  OpenRouter'))
@@ -283,7 +289,6 @@ describe('RepositoryEditorViewModel', () =>
         order.length = 0
         rig.editor.Open(EditorRig.Hive)
         // Hidden for a Pragmatic repository: the texts are cleared while the form is still shown.
-        expect(at('FilterText=')).toBeGreaterThanOrEqual(0)
         expect(at('FilterText=')).toBeLessThan(at('IsOpenRouter=false'))
         expect(at('KeyHint=')).toBeLessThan(at('IsOpenRouter=false'))
         expect(at('Name=hive')).toBeLessThan(at('IsOpenRouter=false'))

@@ -1,7 +1,7 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import type { IDisposable } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
-import type { CompactionRecord, StepEnd, StepRecord, TracePage, TraceTurn, TurnRecord } from './agents'
+import type { CompactionRecord, ProviderCapabilities, StepEnd, StepRecord, TracePage, TraceTurn, TurnRecord } from './agents'
 import { TextFormat } from './TextFormat'
 
 /** Number formatting shared by the trace rows: thin-space thousands, one-decimal seconds, integer percentages. */
@@ -102,16 +102,19 @@ export class TraceStepViewModel extends Observable
     private static readonly EndRejected: StepEnd = 'rejected'
     private static readonly EndError: StepEnd = 'error'
     private static readonly EndAborted: StepEnd = 'aborted'
-    /** Pixel width of a step's fill track (the panel's context bar is wider; these sit beside the fill text). */
+    /** Pixel width of a step's fill track (the panel's context bar is wider; this one sits on its own row under the fill text). */
     private static readonly BarPixels = 80
 
     private readonly record: StepRecord
     private readonly tools: TraceToolViewModel[]
+    /** The session's provider measures prompts by estimate, so compaction's before/after counts are estimates. */
+    private readonly estimatedMeasure: boolean
 
-    constructor(record: StepRecord)
+    constructor(record: StepRecord, estimatedMeasure = false)
     {
         super()
         this.record = record
+        this.estimatedMeasure = estimatedMeasure
         this.tools = record.tools.map(t => new TraceToolViewModel(TextFormat.Format(TraceStepViewModel.ToolFormat, t.name,
             t.ok ? TraceStepViewModel.ToolOk : TraceStepViewModel.ToolFailed, TraceNumbers.Thousands(t.ms), TraceNumbers.Thousands(t.bytes)), t.repeat_failure === true))
     }
@@ -185,8 +188,9 @@ export class TraceStepViewModel extends Observable
     }
 
     /**
-     * The step's compaction line (`⟲ ...`), or '' when compaction did not run. An estimated step's token counts are
-     * marked `≈`; a reported summary cost is appended as ` · ${cost}`.
+     * The step's compaction line (`⟲ ...`), or '' when compaction did not run. Its token counts are marked `≈` when the
+     * session's provider measures prompts by estimate (whatever the step's usage later reported) or the step itself is
+     * an estimate; a reported summary cost is appended as ` · ${cost}`.
      */
     public get CompactionText(): string
     {
@@ -200,7 +204,7 @@ export class TraceStepViewModel extends Observable
 
     private CompactionLine(c: CompactionRecord): string
     {
-        const mark = this.record.estimated === true ? TraceStepViewModel.ApproxMark : ''
+        const mark = this.estimatedMeasure || this.record.estimated === true ? TraceStepViewModel.ApproxMark : ''
         const before = mark + TraceNumbers.Thousands(c.before_tokens)
         const after = mark + TraceNumbers.Thousands(c.after_tokens)
         if (c.strategy === TraceStepViewModel.StrategySummarize && c.fallback)
@@ -287,17 +291,20 @@ export class TraceTurnViewModel extends Observable
     public readonly Steps = new ObservableCollection<TraceStepViewModel>()
 
     private readonly turn: number
+    /** Passed to each step: the session's provider measures prompts by estimate. */
+    private readonly estimatedMeasure: boolean
     private summary: TurnRecord | null = null
     private live = false
     private expanded: boolean
     private userToggled = false
     private resetBefore = false
 
-    constructor(turn: number, expanded: boolean)
+    constructor(turn: number, expanded: boolean, estimatedMeasure = false)
     {
         super()
         this.turn = turn
         this.expanded = expanded
+        this.estimatedMeasure = estimatedMeasure
     }
 
     public get Turn(): number
@@ -415,7 +422,7 @@ export class TraceTurnViewModel extends Observable
             {
                 if (replace)
                 {
-                    this.Steps.SetAt(index, new TraceStepViewModel(record))
+                    this.Steps.SetAt(index, new TraceStepViewModel(record, this.estimatedMeasure))
                 }
                 return
             }
@@ -425,7 +432,7 @@ export class TraceTurnViewModel extends Observable
             }
             index++
         }
-        this.Steps.Insert(index, new TraceStepViewModel(record))
+        this.Steps.Insert(index, new TraceStepViewModel(record, this.estimatedMeasure))
     }
 
     private SetExpanded(value: boolean): void
@@ -459,6 +466,7 @@ export class TraceViewModel extends Observable
     private static readonly PropHasWarning = 'HasWarning'
     private static readonly PropHasMore = 'HasMore'
     private static readonly PropResetPending = 'ResetPending'
+    private static readonly MeasureEstimated: ProviderCapabilities['measure_prompt'] = 'estimated'
 
     public readonly Turns = new ObservableCollection<TraceTurnViewModel>()
 
@@ -479,6 +487,8 @@ export class TraceViewModel extends Observable
     private pageError = ''
     /** The shown session is running a turn (from the attach reply, then `session_busy`). */
     private busy = false
+    /** The shown session's provider measures prompts by estimate (its capabilities' `measure_prompt`). */
+    private estimatedMeasure = false
 
     constructor()
     {
@@ -522,9 +532,11 @@ export class TraceViewModel extends Observable
      * first page. Called on attach, on switch and after reconnect. A `trace_warning` is kept across a same-session
      * reload until its page loads; a page failure is always dropped (the reload retries it). A successful page clears
      * both. When the session is `busy` (and still is once the page loads), its newest summary-less turn is the one
-     * running; when busy ends without that turn's summary, the turn is incomplete.
+     * running; when busy ends without that turn's summary, the turn is incomplete. The session's provider
+     * `capabilities` (null when unknown) decide whether its compaction counts are marked as estimates.
      */
-    public async ShowSession(client: RuntimeClient | null, id: string | null, busy = false): Promise<void>
+    public async ShowSession(client: RuntimeClient | null, id: string | null, busy = false,
+        capabilities: ProviderCapabilities | null = null): Promise<void>
     {
         const token = ++this.token
         this.UpdateWarning(() =>
@@ -539,6 +551,7 @@ export class TraceViewModel extends Observable
         this.client = client
         this.id = id
         this.busy = busy
+        this.estimatedMeasure = capabilities?.measure_prompt === TraceViewModel.MeasureEstimated
         this.Turns.Clear()
         this.oldestPaged = null
         this.loadingOlder = false
@@ -749,7 +762,7 @@ export class TraceViewModel extends Observable
         {
             index++
         }
-        const row = new TraceTurnViewModel(turn, index === 0)
+        const row = new TraceTurnViewModel(turn, index === 0, this.estimatedMeasure)
         if (index === 0 && this.Turns.Count > 0)
         {
             this.Turns.Get(0)!.CollapseByDefault()

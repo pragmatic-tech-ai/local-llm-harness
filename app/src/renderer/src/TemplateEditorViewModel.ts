@@ -1,5 +1,5 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
-import { TypedSignal } from './JsonRpcConnection'
+import { TypedSignal, type IDisposable } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
 import { RepositoryKind, TemplateRepository, type AgentTemplate, type CatalogInfo, type CatalogModel, type CatalogRepository, type ContextStrategy,
     type OpenRouterModelInfo, type SamplingConfig, type TemplateLeafNode, type ToolSpec, type WorkspaceMode } from './agents'
@@ -20,7 +20,9 @@ import { TextFormat } from './TextFormat'
  * ErrorText; only a file that does not load at all (it does not parse, or its id is a duplicate) opens with the
  * fields seeded from the defaults plus what the tree node carries. Either way Save repairs it. Validation errors from
  * `save_template` show in ErrorText; a catalog failure shows in CatalogError until a retry (EnsureCatalog, on the
- * next open or refresh) succeeds.
+ * next open or refresh) succeeds. A `repositories_changed` re-reads the catalog (unsaved edits stay), so the repository
+ * and model choices follow the Models rail. Switching from an OpenRouter repository back to a Pragmatic one restores the
+ * runtime and context size last used on a Pragmatic one (else the loaded template's, when it was not OpenRouter).
  *
  * HiddenTextRule (see RepositoryEditorViewModel): a bound text changed while its part is collapsed keeps its old
  * render, so Changed raises the visibility props that are now true first and those now false last.
@@ -115,6 +117,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     public readonly OnSaved = new TypedSignal<string>()
 
     private readonly client: RuntimeClient
+    private readonly repositoriesChanged: IDisposable
     private readonly saveCommand: RelayCommand
     private readonly revertCommand: RelayCommand
     private catalog: CatalogInfo | null = null
@@ -155,11 +158,14 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private workspaceName = ''
     private sampling: Partial<SamplingConfig> | undefined = undefined
     private enabled = new Set<string>()
+    /** The runtime and context size last set while a Pragmatic repository was chosen (restored when one is again). */
+    private lastPragmatic: { runtime: string, contextSizeText: string } | null = null
 
     constructor(client: RuntimeClient)
     {
         super()
         this.client = client
+        this.repositoriesChanged = client.OnRepositoriesChanged.Subscribe(() => void this.LoadCatalog())
         for (const choice of TemplateEditorViewModel.StrategyChoices)
         {
             this.ContextChoices.Add(new ChoiceItem(choice[0], choice[1]))
@@ -176,6 +182,12 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     public get SaveCommand(): ICommand
     {
         return this.saveCommand
+    }
+
+    /** Stops following `repositories_changed`. */
+    public dispose(): void
+    {
+        this.repositoriesChanged.Dispose()
     }
 
     public get RevertCommand(): ICommand
@@ -576,15 +588,21 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
 
     /**
      * Changing the repository re-lists the models. An OpenRouter one sets the runtime to `openrouter`; a Pragmatic one
-     * takes the catalog's first runtime when the current one is not a catalog runtime. A model the repository lacks is
-     * replaced by its first (an OpenRouter pick then sets the context size).
+     * takes the catalog's first runtime when the current one is not a catalog runtime; coming back from an OpenRouter
+     * one it restores the last Pragmatic runtime and context size. A model the repository lacks is replaced by its first
+     * (an OpenRouter pick then sets the context size).
      */
     public set Repository(value: string)
     {
         this.SetField(TemplateEditorViewModel.PropRepository, this.repository, value, () =>
         {
+            const fromOpenRouter = this.IsOpenRouter
+            if (!fromOpenRouter)
+            {
+                this.lastPragmatic = { runtime: this.runtime, contextSizeText: this.contextSizeText }
+            }
             this.repository = value
-            this.FitToRepository()
+            this.FitToRepository(fromOpenRouter)
             this.RebuildChoices()
         }, true)
     }
@@ -917,6 +935,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private Fill(template: AgentTemplate): void
     {
         this.loaded = template
+        this.lastPragmatic = null
         this.name = template.name
         this.systemPrompt = template.system_prompt
         this.stepBudgetText = String(template.step_budget)
@@ -1057,7 +1076,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     }
 
     /** After a repository change: the runtime and model it can run (see the Repository setter). */
-    private FitToRepository(): void
+    private FitToRepository(fromOpenRouter: boolean): void
     {
         const repository = this.CurrentRepository()
         if (repository === null)
@@ -1068,9 +1087,16 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         {
             this.runtime = TemplateEditorViewModel.OpenRouterRuntime
         }
-        else if (!(this.catalog?.runtimes ?? []).some(r => r.name === this.runtime))
+        else
         {
-            this.runtime = this.catalog?.runtimes[0]?.name ?? ''
+            if (fromOpenRouter)
+            {
+                this.RestorePragmatic()
+            }
+            if (!(this.catalog?.runtimes ?? []).some(r => r.name === this.runtime))
+            {
+                this.runtime = this.catalog?.runtimes[0]?.name ?? ''
+            }
         }
         const models = this.ModelsOf(repository)
         if (!models.includes(this.model) && models.length > 0)
@@ -1078,6 +1104,22 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
             this.model = models[0]
         }
         this.ApplyOpenRouterModel()
+    }
+
+    /**
+     * Back on a Pragmatic repository from an OpenRouter one: the runtime and context size last used on a Pragmatic one,
+     * else the loaded template's when it was not an OpenRouter one, else the default context size (the runtime then
+     * falls to the catalog's first).
+     */
+    private RestorePragmatic(): void
+    {
+        const loaded = this.loaded
+        const fallback = loaded !== null && loaded.runtime !== TemplateEditorViewModel.OpenRouterRuntime
+            ? { runtime: loaded.runtime, contextSizeText: String(loaded.n_ctx) }
+            : { runtime: '', contextSizeText: String(TemplateEditorViewModel.DefaultContextSize) }
+        const restored = this.lastPragmatic ?? fallback
+        this.runtime = restored.runtime
+        this.contextSizeText = restored.contextSizeText
     }
 
     /** An OpenRouter model was picked: the runtime is `openrouter` and the context size min(context_length, 32768). */

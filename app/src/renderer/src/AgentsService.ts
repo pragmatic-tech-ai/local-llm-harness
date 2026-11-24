@@ -399,6 +399,7 @@ export class AgentsService extends ServiceBase implements IActivatable
             subscription.Dispose()
         }
         this.Panel.Bind(null)
+        this.Editor.dispose()
         super.dispose()
     }
 }

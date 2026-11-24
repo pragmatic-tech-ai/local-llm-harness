@@ -58,15 +58,14 @@ resources TracePanelResources {
         }
     }
 
-    // A step: fill text + bar (the context-bar style, smaller), then out/think/load/ttft/gen/rate, the compaction line, tool rows, error.
+    // A step: the fill text (with any cost), the fill bar (the context-bar style, smaller) on its own row so neither
+    // squeezes the other in a narrow panel, then out/think/load/ttft/gen/rate, the compaction line, tool rows, error.
     DataTemplate [ DataType = TraceStepViewModel ] {
         StackPanel [ Orientation = Vertical, Margin = (0,2,0,2) ] {
-            StackPanel [ Orientation = Horizontal ] {
-                TextBlock [ Text = $Text, FontFamily = "Consolas", Margin = (0,0,8,0), VerticalAlignment = Center ]
-                Border [ Fill = @Bg2, Stroke = Pen [ Brush = @Border ], CornerRadius = 3, Height = 6,
-                         HorizontalAlignment = Left, VerticalAlignment = Center, Width = $BarTrackWidth, ClipToBounds = true ] {
-                    Border [ Fill = @Fg2, CornerRadius = 3, HorizontalAlignment = Left, Width = $BarWidth ]
-                }
+            TextBlock [ Text = $Text, FontFamily = "Consolas" ]
+            Border [ Fill = @Bg2, Stroke = Pen [ Brush = @Border ], CornerRadius = 3, Height = 6, Margin = (0,2,0,2),
+                     HorizontalAlignment = Left, Width = $BarTrackWidth, ClipToBounds = true ] {
+                Border [ Fill = @Fg2, CornerRadius = 3, HorizontalAlignment = Left, Width = $BarWidth ]
             }
             // No wrapping: the Wrap path re-joins words with single spaces, losing the double-space separators.
             TextBlock [ Text = $StatsText, Style = @BodySm, Foreground = @Fg2, FontFamily = "Consolas" ]

@@ -383,4 +383,18 @@ describe('SessionViewModel', () =>
         expect(gone.view.IsLoadable).toBe(true)
         expect(gone.view.Panel.IsTokenizeAvailable).toBe(true)
     })
+
+    it('clear_resets_the_panel_capabilities', async () =>
+    {
+        const remote: ProviderCapabilities = { measure_prompt: 'estimated', tokenize: false, raw_prompt: false, logprobs: false, load_unload: false }
+        const rig = new Rig()
+        const done = rig.view.Attach('s1')
+        await rig.Respond('attach_session', { ...Rig.Attached({ state: PlacementState.Ready, host: 'or' }), capabilities: remote })
+        await done
+        expect(rig.view.Panel.IsTokenizeAvailable).toBe(false)
+        rig.view.Clear()
+        expect(rig.view.Capabilities).toBe(null)
+        expect(rig.view.Panel.IsTokenizeAvailable).toBe(true)
+        expect(rig.view.Panel.IsRawPromptAvailable).toBe(true)
+    })
 })

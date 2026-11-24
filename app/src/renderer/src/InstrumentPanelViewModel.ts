@@ -181,10 +181,14 @@ export class InstrumentPanelViewModel extends Observable
         return !this.IsLogprobsAvailable
     }
 
-    /** The context fill is an estimate: the last turn said so, or the provider only estimates. */
+    /**
+     * The context fill is an estimate: the last turn said so, or the provider only estimates. Nothing is marked while
+     * nothing is used yet (before the first turn the count is a plain 0, not an estimate).
+     */
     public get IsContextEstimated(): boolean
     {
-        return this.turnEstimated || this.capabilities?.measure_prompt === InstrumentPanelViewModel.MeasureEstimated
+        return this._contextUsed > 0
+            && (this.turnEstimated || this.capabilities?.measure_prompt === InstrumentPanelViewModel.MeasureEstimated)
     }
 
     /** Raises the feature visibility props whose value is `shown` (HiddenTextRule). */

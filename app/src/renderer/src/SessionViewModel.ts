@@ -306,7 +306,7 @@ export class SessionViewModel extends Observable
         this.Panel.ApplySession(attached.sampling, attached.enable_thinking)
         // Attach, switch and re-attach after a reconnect all reload the trace's first page; a busy session's newest
         // unfinished turn shows as running.
-        void this.Trace.ShowSession(this.client, id, attached.summary.busy)
+        void this.Trace.ShowSession(this.client, id, attached.summary.busy, this.capabilities)
         void this.LoadNotes(id, token)
     }
 
@@ -394,6 +394,7 @@ export class SessionViewModel extends Observable
             this.loading = false
             this.turnLoading = false
         })
+        this.Panel.ApplyCapabilities(null)
     }
 
     private async Load(): Promise<void>

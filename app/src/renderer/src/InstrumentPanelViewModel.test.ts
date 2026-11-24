@@ -243,9 +243,22 @@ describe('InstrumentPanelViewModel', () =>
         expect(rig.vm.Panel.Prompt).toBe('')
         rig.Notify('turn_started', { prompt: 'RAW', prompt_tokens: 1024, n_ctx: 4096 })
         expect(rig.vm.Panel.ContextLabel).toBe('1024 / 4096 (25%)')
-        // An estimating provider marks the fill before its first turn too.
+        // An estimating provider marks a fill it reported without the flag too.
         rig.vm.Panel.ApplyCapabilities({ measure_prompt: 'estimated', tokenize: false, raw_prompt: false, logprobs: false, load_unload: false })
         expect(rig.vm.Panel.ContextLabel).toBe('≈1024 / 4096 (25%)')
+    })
+
+    it('estimating_provider_marks_nothing_before_the_first_turn', () =>
+    {
+        const rig = new Rig()
+        const panel = rig.vm.Panel
+        panel.ApplyCapabilities({ measure_prompt: 'estimated', tokenize: false, raw_prompt: false, logprobs: false, load_unload: false })
+        expect(panel.IsContextEstimated).toBe(false)
+        expect(panel.ContextLabel.startsWith('≈')).toBe(false)
+        rig.Send('one')
+        rig.Notify('turn_started', { prompt: null, prompt_tokens: 1024, n_ctx: 4096, estimated: true })
+        expect(panel.IsContextEstimated).toBe(true)
+        expect(panel.ContextLabel).toBe('≈1024 / 4096 (25%)')
     })
 })
 

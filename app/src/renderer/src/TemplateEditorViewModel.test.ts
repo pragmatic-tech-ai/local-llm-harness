@@ -614,6 +614,7 @@ describe('TemplateEditorViewModel', () =>
         expect(e.Model).toBe('anthropic/claude-x')
         expect(e.ContextSizeText).toBe('32768')
         // A row being hidden disappears after its texts changed (HiddenTextRule).
+        expect(raised.lastIndexOf('RuntimeChoice')).toBeGreaterThanOrEqual(0)
         expect(raised.lastIndexOf('IsRuntimeVisible')).toBeGreaterThan(raised.lastIndexOf('RuntimeChoice'))
         e.ModelChoice = e.ModelChoices.Get(1)!
         expect(e.Model).toBe('google/gemma-small')
@@ -623,6 +624,8 @@ describe('TemplateEditorViewModel', () =>
         e.Repository = 'hive'
         expect(e.IsRuntimeVisible).toBe(true)
         // A row being shown appears before its texts change.
+        expect(raised.indexOf('IsRuntimeVisible')).toBeGreaterThanOrEqual(0)
+        expect(raised.indexOf('RuntimeChoice')).toBeGreaterThanOrEqual(0)
         expect(raised.indexOf('IsRuntimeVisible')).toBeLessThan(raised.indexOf('RuntimeChoice'))
     })
 
@@ -663,5 +666,79 @@ describe('TemplateEditorViewModel', () =>
         const remote = rig.Frames().pop()!.params.template as AgentTemplate
         expect(remote).toMatchObject({ repository: 'or', runtime: 'openrouter', model: 'anthropic/claude-x', n_ctx: 32768 })
         expect('host' in remote).toBe(false)
+    })
+
+    it('repositories_changed_reloads_the_catalog_and_keeps_edits', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open({ ...Rig.Researcher, runtime: 'openrouter', model: 'google/gemma-small', n_ctx: 8192, repository: 'or' })
+        const e = rig.editor
+        e.Name = 'Edited'
+        const before = rig.Frames().filter(f => f.method === 'list_catalog').length
+        rig.client.HandleFrame(JSON.stringify({ method: 'repositories_changed', params: {} }))
+        expect(rig.Frames().filter(f => f.method === 'list_catalog').length).toBe(before + 1)
+        const or = Rig.Catalog.repositories!.find(r => r.name === 'or')!
+        const shrunk: CatalogInfo = {
+            ...Rig.Catalog,
+            repositories: [Rig.Catalog.repositories![0], { ...or, models: or.models.slice(0, 1) }],
+        }
+        await rig.Respond('list_catalog', shrunk)
+        await rig.Respond('list_all_tools', Rig.Tools)
+        // The model left the list: it stays as a marked choice, and the edit survives.
+        expect(e.ModelChoices.ToArray().map(c => c.Value)).toEqual(['anthropic/claude-x', 'google/gemma-small'])
+        expect(e.Model).toBe('google/gemma-small')
+        expect(e.Name).toBe('Edited')
+        expect(e.IsDirty).toBe(true)
+        // Disposed: no more reloads.
+        e.dispose()
+        rig.client.HandleFrame(JSON.stringify({ method: 'repositories_changed', params: {} }))
+        expect(rig.Frames().filter(f => f.method === 'list_catalog').length).toBe(before + 1)
+    })
+
+    it('late_catalog_hides_runtime_for_openrouter_template', async () =>
+    {
+        const rig = new Rig()
+        const e = rig.editor
+        const leaf: TemplateLeafNode = { ...Rig.Leaf, runtime: 'openrouter', model: 'google/gemma-small' }
+        void e.Open(new TemplateTreeNodeViewModel(leaf))
+        await rig.Respond('get_template', { id: leaf.id, path: leaf.path,
+            template: { ...Rig.Researcher, runtime: 'openrouter', model: 'google/gemma-small', n_ctx: 8192, repository: 'or' } })
+        // The repository is not known yet: it counts as Pragmatic, so the Runtime row shows.
+        expect(e.IsRuntimeVisible).toBe(true)
+        const raised: string[] = []
+        for (const name of ['IsRuntimeVisible', 'RuntimeChoice'])
+        {
+            e.PropertyChanged(name).subscribe(() => raised.push(name))
+        }
+        await rig.Respond('list_catalog', Rig.Catalog)
+        await rig.Respond('list_all_tools', Rig.Tools)
+        expect(e.IsRuntimeVisible).toBe(false)
+        // A row being hidden disappears after its texts changed (HiddenTextRule).
+        expect(raised.lastIndexOf('RuntimeChoice')).toBeGreaterThanOrEqual(0)
+        expect(raised.lastIndexOf('IsRuntimeVisible')).toBeGreaterThan(raised.lastIndexOf('RuntimeChoice'))
+        expect(e.ContextSizeText).toBe('8192')
+        expect(e.IsDirty).toBe(false)
+    })
+
+    it('back_to_pragmatic_restores_its_runtime_and_ctx', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open({ ...Rig.Researcher, runtime: 'candle', model: 'tiny', n_ctx: 4096 })
+        const e = rig.editor
+        e.ContextSizeText = '6000'
+        e.Repository = 'or'
+        expect(e.Runtime).toBe('openrouter')
+        expect(e.ContextSizeText).toBe('32768')
+        e.Repository = 'hive'
+        expect(e.Runtime).toBe('candle')
+        expect(e.ContextSizeText).toBe('6000')
+        expect(e.Model).toBe('tiny')
+        // Opened on OpenRouter: back on a Pragmatic one the catalog's first runtime and the default context size.
+        const remote = new Rig()
+        await remote.Open({ ...Rig.Researcher, runtime: 'openrouter', model: 'google/gemma-small', n_ctx: 8000, repository: 'or' })
+        remote.editor.Repository = 'hive'
+        expect(remote.editor.Runtime).toBe('llamacpp')
+        expect(remote.editor.ContextSizeText).toBe('8192')
+        expect(remote.editor.Model).toBe('gemma-4')
     })
 })
