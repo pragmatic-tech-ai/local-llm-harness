@@ -121,8 +121,8 @@ The owner's framing:
   - `repository not found: {name}` when the repository is missing;
   - `repository {name} has no API key` when an OpenRouter repository has no key;
   - `model not in repository {name}: {model}` when the model is not served.
-- **Identity.** A provider's `identity()` is per repository and model. Two OpenRouter
-  repositories listing the same model id are two identities.
+- **Identity.** A provider's `identity()` is per repository; within one requirement it is
+  stable. Two OpenRouter repositories listing the same model id are two identities.
 - **Names on the wire.** The words *repository* and *provider* are the ones used in the app and
   on the wire.
 
@@ -233,7 +233,7 @@ An **always-ready provider** behaves like this:
 - `serves` is true for any model in its repository's list.
 - `current_link` and `ensure_ready` always return a link.
 - `state().loaded` reports the requirement.
-- `identity()` is stable per repository and model.
+- `identity()` is per repository; within one requirement it is stable.
 - `unload_if` returns `Ok(false)`.
 - Placement therefore always reads `ready`. `evicts` is never set, and the app hides Load and
   Unload when `load_unload` is false.
