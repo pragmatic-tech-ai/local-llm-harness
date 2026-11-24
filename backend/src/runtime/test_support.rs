@@ -385,7 +385,9 @@ impl Drop for TempDir {
 /// `FakeHost` and a registry holding the test `echo` tool. The template store seeds its `Default`
 /// template (id [`Self::TEMPLATE_ID`]) and its `Worker` template (id [`Self::WORKER_ID`]) for
 /// runtime [`Self::RUNTIME`] and model [`Self::MODEL`], which the host serves with `link`.
-/// [`Self::sandboxed`] adds a sandbox and the builtin file and note tools.
+/// [`Self::sandboxed`] adds a sandbox and the builtin file and note tools. Repositories are a
+/// registry over the temp dir with `hive` as its Pragmatic repository; its OpenRouter
+/// repositories reach [`Self::OFFLINE`] unless [`Self::openrouter`] gives a base url.
 pub(crate) struct TestRuntime {
     pub(crate) deps: super::server::RuntimeDeps,
     pub(crate) host: Arc<crate::agents::host::FakeHost>,
@@ -402,20 +404,27 @@ impl TestRuntime {
     const SESSIONS_DIR: &'static str = "sessions";
     const SANDBOX_DIR: &'static str = "sandbox";
     const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// The OpenRouter base url of a runtime that never reaches OpenRouter.
+    pub(crate) const OFFLINE: &'static str = "http://127.0.0.1:1";
 
     pub(crate) fn new(tag: &str, link: Arc<FakeLink>) -> Self {
-        Self::over(TempDir::new(tag), link, false)
+        Self::over(TempDir::new(tag), link, false, Self::OFFLINE)
     }
 
     /// Like [`Self::new`], with a sandbox (`sandbox` in the temp dir) and the builtin tools.
     pub(crate) fn sandboxed(tag: &str, link: Arc<FakeLink>) -> Self {
-        Self::over(TempDir::new(tag), link, true)
+        Self::over(TempDir::new(tag), link, true, Self::OFFLINE)
+    }
+
+    /// Like [`Self::sandboxed`], with OpenRouter repositories reaching `base_url`.
+    pub(crate) fn openrouter(tag: &str, link: Arc<FakeLink>, base_url: &str) -> Self {
+        Self::over(TempDir::new(tag), link, true, base_url)
     }
 
     /// A fresh runtime over this one's data directory, as after a supervisor restart.
     pub(crate) fn reopen(self, link: Arc<FakeLink>) -> Self {
         let sandboxed = self.deps.sandbox.is_some();
-        Self::over(self.dir, link, sandboxed)
+        Self::over(self.dir, link, sandboxed, Self::OFFLINE)
     }
 
     /// The sandbox root of a [`Self::sandboxed`] runtime.
@@ -433,8 +442,9 @@ impl TestRuntime {
         self.dir.0.join(Self::SESSIONS_DIR)
     }
 
-    fn over(dir: TempDir, link: Arc<FakeLink>, sandboxed: bool) -> Self {
+    fn over(dir: TempDir, link: Arc<FakeLink>, sandboxed: bool, base_url: &str) -> Self {
         use super::builtin::{BuiltinSource, Sandbox};
+        use super::catalog_source::RulesWithRepositories;
         use super::executor::ToolExecutor;
         use super::policy::EnabledPolicy;
         use super::registry::ToolRegistry;
@@ -443,7 +453,7 @@ impl TestRuntime {
         use crate::agents::host::FakeHost;
         use crate::agents::session_store::SessionStore;
         use crate::agents::template_store::TemplateStore;
-        use crate::providers::{Provider, StaticProviders};
+        use crate::providers::{Provider, RepositoryRegistry};
 
         let sandbox = sandboxed.then(|| {
             let root = dir.0.join(Self::SANDBOX_DIR);
@@ -462,14 +472,24 @@ impl TestRuntime {
         ));
         let host = FakeHost::serving_with_link(Self::HOST, &[(Self::RUNTIME, Self::MODEL)], link);
         let providers = vec![(Self::HOST.to_string(), host.clone() as Arc<dyn Provider>)];
+        let repositories = Arc::new(
+            RepositoryRegistry::open(
+                &dir.0,
+                providers,
+                Arc::new(Self::catalog()),
+                base_url.to_string(),
+            )
+            .expect("repository registry"),
+        );
+        let rules = Arc::new(RulesWithRepositories::new(Self::rules(&registry)));
+        rules.attach(Arc::clone(&repositories));
         let templates =
-            TemplateStore::open(&dir.0.join(Self::TEMPLATES_DIR), Self::rules(&registry))
-                .expect("template store");
+            TemplateStore::open(&dir.0.join(Self::TEMPLATES_DIR), rules).expect("template store");
         let sessions = SessionStore::open(&dir.0.join(Self::SESSIONS_DIR)).expect("session store");
         let deps = super::server::RuntimeDeps {
             templates: Arc::new(templates),
             sessions: Arc::new(sessions),
-            dispatcher: Arc::new(Dispatcher::new(Arc::new(StaticProviders(providers)))),
+            dispatcher: Arc::new(Dispatcher::new(repositories.clone())),
             registry: registry.clone(),
             tool_loop: Arc::new(super::tool_loop::ToolLoop::new(executor, registry)),
             catalog: Arc::new(Self::catalog()),
@@ -478,6 +498,7 @@ impl TestRuntime {
                 dir.0.join(Self::SESSIONS_DIR),
             )),
             sandbox,
+            repositories,
         };
         Self { deps, host, dir }
     }

@@ -9,9 +9,10 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use super::atomic_file::AtomicFile;
+use super::host::ModelRequirement;
 use super::template::{
-    AgentTemplate, ContextStrategy, RepositoryKind, RepositoryRules, RuleModel, RulesSource,
-    TemplateRules, WorkspaceConfig, DEFAULT_COMPACT_AT_PCT,
+    AgentTemplate, ContextStrategy, RuleModel, RulesSource, TemplateRules, WorkspaceConfig,
+    DEFAULT_COMPACT_AT_PCT,
 };
 
 const EXT: &str = "toml";
@@ -264,6 +265,43 @@ impl TemplateStore {
         }
         nodes.sort_by_key(TemplateNode::sort_key);
         nodes
+    }
+
+    /// The names of the templates whose repository is `repository` (a template naming none
+    /// uses `hive`), sorted. Files that do not parse use nothing.
+    pub fn templates_using(&self, repository: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        Self::collect_users(&self.root, repository, &mut names);
+        names.sort();
+        names
+    }
+
+    fn collect_users(dir: &Path, repository: &str, names: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                Self::collect_users(&p, repository, names);
+                continue;
+            }
+            if p.extension().and_then(|e| e.to_str()) != Some(EXT) {
+                continue;
+            }
+            let parsed = fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| toml::from_str::<AgentTemplate>(&s).ok());
+            if let Some(t) = parsed {
+                let uses = t
+                    .repository
+                    .as_deref()
+                    .unwrap_or(ModelRequirement::DEFAULT_REPOSITORY);
+                if uses == repository {
+                    names.push(t.name);
+                }
+            }
+        }
     }
 
     pub fn get(&self, id: &str) -> Result<(AgentTemplate, String), TemplateError> {
@@ -566,6 +604,7 @@ impl TemplateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::template::{RepositoryKind, RepositoryRules};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// A unique temp directory removed on drop.
@@ -627,6 +666,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn templates_using_names_the_repository_users() {
+        let d = TempDir::new("users");
+        let s = d.store();
+        d.hand_file("grp", "Alpha");
+        let mut other = TempDir::sample("Beta");
+        other.repository = Some("or1".into());
+        let dir = d.0.join("templates").join("grp");
+        fs::write(
+            dir.join("beta.toml"),
+            toml::to_string_pretty(&other).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.join("broken.toml"), "not toml [").unwrap();
+        assert_eq!(s.templates_using("or1"), ["Beta"]);
+        // The seeds name no repository, so they use `hive`.
+        assert_eq!(s.templates_using("hive"), ["Alpha", "Default", "Worker"]);
+        assert!(s.templates_using("none").is_empty());
     }
 
     #[test]

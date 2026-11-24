@@ -228,7 +228,7 @@ mod tests {
     use crate::agents::template::{
         AgentTemplate, ContextStrategy, WorkspaceConfig, DEFAULT_COMPACT_AT_PCT,
     };
-    use crate::providers::{Measure, Provider, ProviderCapabilities, StaticProviders};
+    use crate::providers::{FixedProviders, Measure, Provider, ProviderCapabilities};
     use crate::runtime::test_support::FakeLink;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -256,8 +256,8 @@ mod tests {
             Dispatcher::new(Self::source(hosts))
         }
 
-        fn source(hosts: &[&Arc<FakeHost>]) -> Arc<StaticProviders> {
-            Arc::new(StaticProviders(
+        fn source(hosts: &[&Arc<FakeHost>]) -> Arc<FixedProviders> {
+            Arc::new(FixedProviders(
                 hosts
                     .iter()
                     .map(|h| (h.name().to_string(), Arc::clone(h) as Arc<dyn Provider>))
@@ -562,7 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_with_no_hosts_returns_a_receiver() {
-        let d = Dispatcher::new(Arc::new(StaticProviders(Vec::new())));
+        let d = Dispatcher::new(Arc::new(FixedProviders(Vec::new())));
         let mut rx = d.subscribe();
         assert!(rx.try_recv().is_err());
     }

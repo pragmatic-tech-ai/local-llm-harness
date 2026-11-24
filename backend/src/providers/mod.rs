@@ -12,10 +12,14 @@
 //! [`Provider::identity`] names the exact harness a link reaches, so a turn can tell a reload of
 //! its model (a new instance) from the harness it started on.
 //!
-//! [`PragmaticProvider`] is the first provider: the in-process harness manager.
+//! [`PragmaticProvider`] is the in-process harness manager behind each Pragmatic repository, and
+//! [`OpenRouterProvider`](openrouter::OpenRouterProvider) the always-ready provider behind each
+//! OpenRouter repository. The [`RepositoryRegistry`] holds them all and is the dispatcher's
+//! [`ProviderSource`].
 
 pub mod openrouter;
 pub mod pragmatic;
+pub mod registry;
 
 use std::sync::Arc;
 
@@ -27,6 +31,7 @@ use crate::agents::host::{HarnessIdentity, HostError, HostState, ModelRequiremen
 use crate::runtime::worker::WorkerLink;
 
 pub use pragmatic::{LocalHarness, PragmaticProvider};
+pub use registry::RepositoryRegistry;
 
 /// How exactly a provider can measure a prompt's size in tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,11 +102,12 @@ pub trait ProviderSource: Send + Sync {
     fn providers(&self) -> Vec<Arc<dyn Provider>>;
 }
 
-/// A fixed list of `(repository name, provider)` pairs. Temporary: a registry-backed source
-/// replaces it for `main.rs` once repositories are configurable.
-pub struct StaticProviders(pub Vec<(String, Arc<dyn Provider>)>);
+/// A fixed list of `(repository name, provider)` pairs, for tests that need no registry.
+#[cfg(test)]
+pub(crate) struct FixedProviders(pub Vec<(String, Arc<dyn Provider>)>);
 
-impl ProviderSource for StaticProviders {
+#[cfg(test)]
+impl ProviderSource for FixedProviders {
     fn provider(&self, repository: &str) -> Option<Arc<dyn Provider>> {
         self.0
             .iter()

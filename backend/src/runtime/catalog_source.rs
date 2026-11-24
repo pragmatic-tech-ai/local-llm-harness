@@ -4,8 +4,13 @@
 //! Runtimes, tools and hosts are fixed at startup. Models are re-discovered on every read, so a
 //! model file dropped into a model directory shows up in `list_catalog`, passes `save_template`
 //! validation and can start a session without a supervisor restart.
+//!
+//! [`RulesWithRepositories`] adds the OpenRouter repositories of a [`RepositoryRegistry`] to a
+//! rules source, so a template naming one validates against its current model list. The
+//! registry is attached after the template store opens (it needs the providers, which come
+//! later); until then only the base rules apply.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -13,6 +18,7 @@ use serde_json::Value;
 use crate::agents::template::{
     RepositoryKind, RepositoryRules, RuleModel, RulesSource, TemplateRules,
 };
+use crate::providers::RepositoryRegistry;
 use crate::supervisor::catalog::Catalog;
 use crate::supervisor::control::CatalogListing;
 use crate::supervisor::discovery::discover;
@@ -102,6 +108,36 @@ impl RulesSource for DiscoveredCatalog {
                 })
                 .collect(),
         }
+    }
+}
+
+/// A rules source plus the OpenRouter repositories of the attached registry.
+pub struct RulesWithRepositories<R> {
+    base: R,
+    registry: OnceLock<Arc<RepositoryRegistry>>,
+}
+
+impl<R: RulesSource> RulesWithRepositories<R> {
+    pub fn new(base: R) -> Self {
+        Self {
+            base,
+            registry: OnceLock::new(),
+        }
+    }
+
+    /// Adds `registry`'s repositories from now on. Only the first registry attached counts.
+    pub fn attach(&self, registry: Arc<RepositoryRegistry>) {
+        let _ = self.registry.set(registry);
+    }
+}
+
+impl<R: RulesSource> RulesSource for RulesWithRepositories<R> {
+    fn rules(&self) -> TemplateRules {
+        let mut rules = self.base.rules();
+        if let Some(registry) = self.registry.get() {
+            rules.repositories.extend(registry.rules());
+        }
+        rules
     }
 }
 

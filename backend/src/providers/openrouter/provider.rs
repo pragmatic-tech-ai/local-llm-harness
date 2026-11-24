@@ -183,7 +183,7 @@ impl Provider for OpenRouterProvider {
 mod tests {
     use super::*;
     use crate::agents::dispatcher::{Dispatcher, Placement};
-    use crate::providers::StaticProviders;
+    use crate::providers::FixedProviders;
 
     struct Fixtures;
 
@@ -231,7 +231,7 @@ mod tests {
 
         fn dispatcher(provider: Arc<OpenRouterProvider>) -> Dispatcher {
             let provider: Arc<dyn Provider> = provider;
-            Dispatcher::new(Arc::new(StaticProviders(vec![(
+            Dispatcher::new(Arc::new(FixedProviders(vec![(
                 Self::REPOSITORY.to_string(),
                 provider,
             )])))

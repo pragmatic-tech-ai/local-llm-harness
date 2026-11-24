@@ -2,10 +2,11 @@ use backend::agents::dispatcher::Dispatcher;
 use backend::agents::session_store::SessionStore;
 use backend::agents::template_store::{TemplateNode, TemplateStore};
 use backend::engine::{build_engine, EngineConfig, EngineKind};
-use backend::providers::{LocalHarness, PragmaticProvider, Provider, StaticProviders};
+use backend::providers::openrouter::OpenRouterApi;
+use backend::providers::{LocalHarness, PragmaticProvider, Provider, RepositoryRegistry};
 use backend::rpc;
 use backend::runtime::builtin::{BuiltinSource, Sandbox};
-use backend::runtime::catalog_source::DiscoveredCatalog;
+use backend::runtime::catalog_source::{DiscoveredCatalog, RulesWithRepositories};
 use backend::runtime::executor::ToolExecutor;
 use backend::runtime::hub::Hub;
 use backend::runtime::policy::EnabledPolicy;
@@ -121,12 +122,17 @@ struct AgentsStack {
     sessions: SessionStore,
     /// The sessions' trace logs, in the sessions directory.
     traces: TraceStore,
-    /// The editor's catalog and the template rules: models re-discovered on every read.
+    /// The editor's catalog and the Pragmatic template rules: models re-discovered on every
+    /// read.
     source: Arc<DiscoveredCatalog>,
+    /// The template store's rules: the catalog's, plus the OpenRouter repositories once the
+    /// registry is attached.
+    rules: Arc<RulesWithRepositories<Arc<DiscoveredCatalog>>>,
 }
 
 impl AgentsStack {
     const ERR_UNAVAILABLE: &'static str = "agents data unavailable:";
+    const ERR_REPOSITORIES: &'static str = "repositories unavailable:";
     const TEMPLATES_DIR: &'static str = "templates";
     const SESSIONS_DIR: &'static str = "sessions";
 
@@ -169,8 +175,9 @@ impl AgentsStack {
             host_names.clone(),
         ));
         let data_dir = catalog.agents.data_dir();
+        let rules = Arc::new(RulesWithRepositories::new(Arc::clone(&source)));
         let templates =
-            TemplateStore::open(&data_dir.join(Self::TEMPLATES_DIR), Arc::clone(&source))
+            TemplateStore::open(&data_dir.join(Self::TEMPLATES_DIR), Arc::clone(&rules))
                 .map_err(|e| e.to_string())?;
         let sessions_dir = data_dir.join(Self::SESSIONS_DIR);
         let sessions = SessionStore::open(&sessions_dir).map_err(|e| e.to_string())?;
@@ -181,18 +188,21 @@ impl AgentsStack {
             sessions,
             traces: TraceStore::new(sessions_dir),
             source,
+            rules,
         })
     }
 
-    /// The runtime's shared state: one local host per configured name over `manager`, and the
-    /// same sandbox the registry's file tools use.
+    /// The runtime's shared state: the repository registry (one Pragmatic repository per
+    /// configured host name over `manager`, and the OpenRouter ones from the agents data dir) as
+    /// the dispatcher's provider source and the template rules' repositories, and the same
+    /// sandbox the registry's file tools use. An unreadable repositories file is an error.
     fn into_deps<H: LocalHarness + 'static>(
         self,
         manager: Arc<H>,
         registry: Arc<ToolRegistry>,
         tool_loop: Arc<ToolLoop>,
         sandbox: Option<Sandbox>,
-    ) -> RuntimeDeps {
+    ) -> Result<RuntimeDeps, String> {
         let providers: Vec<(String, Arc<dyn Provider>)> = self
             .host_names
             .into_iter()
@@ -205,17 +215,28 @@ impl AgentsStack {
                 (name, provider)
             })
             .collect();
-        RuntimeDeps {
+        let repositories = Arc::new(
+            RepositoryRegistry::open(
+                &self.catalog.agents.data_dir(),
+                providers,
+                Arc::clone(&self.source) as _,
+                OpenRouterApi::DEFAULT_BASE_URL.to_string(),
+            )
+            .map_err(|e| format!("{} {e}", Self::ERR_REPOSITORIES))?,
+        );
+        self.rules.attach(Arc::clone(&repositories));
+        Ok(RuntimeDeps {
             templates: Arc::new(self.templates),
             sessions: Arc::new(self.sessions),
-            dispatcher: Arc::new(Dispatcher::new(Arc::new(StaticProviders(providers)))),
+            dispatcher: Arc::new(Dispatcher::new(repositories.clone())),
             registry,
             tool_loop,
             catalog: self.source,
             hub: Arc::new(Hub::new()),
             traces: Arc::new(self.traces),
             sandbox,
-        }
+            repositories,
+        })
     }
 
     /// How many template leaves the tree holds.
@@ -284,7 +305,7 @@ async fn run_supervisor(config: &Config) -> Result<(), Box<dyn std::error::Error
         },
     ));
     if let (Ok((stack, listener)), Some(addr)) = (runtime, runtime_addr) {
-        let deps = stack.into_deps(manager.clone(), registry, tool_loop, sandbox);
+        let deps = stack.into_deps(manager.clone(), registry, tool_loop, sandbox)?;
         println!(
             "runtime listening on ws://{} ({} tools, {} templates, {} sessions)",
             addr,
@@ -444,7 +465,7 @@ exe = \"x\"
         let tool_loop = Arc::new(ToolLoop::new(executor, registry.clone()));
         let names = AgentsStack::host_names(&catalog).unwrap();
         let stack = AgentsStack::open(&catalog, names, &registry).unwrap();
-        let deps = stack.into_deps(manager, registry, tool_loop, None);
+        let deps = stack.into_deps(manager, registry, tool_loop, None).unwrap();
         let tree = deps.templates.tree();
         assert_eq!(AgentsStack::template_count(&tree), 2);
         match &tree[..] {
@@ -462,6 +483,40 @@ exe = \"x\"
         let view = deps.catalog.view();
         assert_eq!(view.hosts, ["hive"]);
         assert_eq!(view.runtimes.len(), 1);
+        let repositories = deps.repositories.list();
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].name, "hive");
+    }
+
+    #[test]
+    fn malformed_repositories_file_is_an_error() {
+        let dir = DataDir::new("repos");
+        let catalog = DataDir::catalog(&dir.0, "");
+        let manager = Arc::new(HarnessManager::new(
+            (*catalog).clone(),
+            ProcessLauncher::new(),
+            WsProbe,
+            ManagerConfig::default(),
+        ));
+        let registry = DataDir::registry();
+        let executor = Arc::new(ToolExecutor::new(
+            registry.clone(),
+            Box::new(EnabledPolicy),
+            Config::TOOL_TIMEOUT,
+        ));
+        let tool_loop = Arc::new(ToolLoop::new(executor, registry.clone()));
+        let names = AgentsStack::host_names(&catalog).unwrap();
+        let stack = AgentsStack::open(&catalog, names, &registry).unwrap();
+        std::fs::write(
+            dir.0.join(RepositoryRegistry::FILE_NAME),
+            "[[openrouter]]\nname = \"hive\"\n",
+        )
+        .unwrap();
+        let err = stack
+            .into_deps(manager, registry, tool_loop, None)
+            .err()
+            .expect("a repository named like a host is refused");
+        assert!(err.starts_with(AgentsStack::ERR_REPOSITORIES), "{err}");
     }
 
     #[test]

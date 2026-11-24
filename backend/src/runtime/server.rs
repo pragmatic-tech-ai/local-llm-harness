@@ -65,6 +65,22 @@
 //! The catalog is read through [`CatalogSource`] and the template rules through the template
 //! store's source, so `list_catalog`, `save_template` and `create_session` see models dropped
 //! on disk; the last two (and `list_catalog`) also refresh the hosts' model lists.
+//!
+//! Repositories are the [`RepositoryRegistry`]'s, which is also the dispatcher's provider
+//! source. `list_repositories` lists them (`key_hint` only, never a key),
+//! `list_repository_models {name, refresh?}` lists one's models (an OpenRouter list refetched
+//! when `refresh` asks), `save_repository {name, previous_name?, id_prefixes, api_key?}` creates,
+//! updates or renames an OpenRouter repository (the result carries `fetch_error` when its model
+//! list could not be fetched; the save stands) and `delete_repository {name}` deletes one. A
+//! rename or delete is refused while a template uses the repository (`repository is used by
+//! templates: {names}`, the names from the template store). Each broadcasts
+//! `repositories_changed` (a listing only when it refreshed) and signals the dispatcher, so
+//! sessions whose placement changed with it (a deleted repository reads `repository not found:
+//! {name}`) get `placement_changed`. `list_catalog` adds `repositories` (each with its kind,
+//! capabilities and models). Session rows (`list_sessions`, `attach_session`) carry the
+//! provider's `capabilities`, `null` when the session's repository is gone. A template whose
+//! model has left its repository's list still loads; the tree marks it with the validation
+//! error.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -99,6 +115,7 @@ use crate::agents::session_store::{SessionError, SessionStore};
 use crate::agents::template::{AgentTemplate, CompactionState, WorkspaceMode};
 use crate::agents::template_store::{TemplateError, TemplateStore};
 use crate::engine::SamplingConfig;
+use crate::providers::{ProviderCapabilities, RepositoryRegistry};
 use crate::rpc::{
     BoxError, Frames, RpcError, SetSamplingParams, TokenizeParams, Ws, ERR_METHOD_NOT_FOUND,
 };
@@ -120,6 +137,8 @@ pub struct RuntimeDeps {
     pub traces: Arc<TraceStore>,
     /// The tools' sandbox, where the sessions' workspace folders live; None without one.
     pub sandbox: Option<Sandbox>,
+    /// Every repository; the same registry is the dispatcher's provider source.
+    pub repositories: Arc<RepositoryRegistry>,
 }
 
 /// Accepts websocket connections forever.
@@ -137,6 +156,8 @@ impl RuntimeServer {
     pub const SESSION_LOADING: &'static str = "session_loading";
     /// Sent `{id, notes}` to a session's connections when its notes change.
     pub const NOTES_CHANGED: &'static str = "notes_changed";
+    /// Broadcast after a repository is saved or deleted, or its model list refreshed.
+    pub const REPOSITORIES_CHANGED: &'static str = "repositories_changed";
 
     pub async fn serve(listener: TcpListener, deps: RuntimeDeps) {
         loop {
@@ -327,13 +348,15 @@ impl SessionHandle for SessionNotes {
     }
 }
 
-/// A `list_sessions` row: the summary's fields plus the live placement and busy flag.
+/// A `list_sessions` row: the summary's fields plus the live placement, busy flag and the
+/// provider's capabilities (`null` when the repository is gone).
 #[derive(Debug, Serialize)]
 struct SessionRow {
     #[serde(flatten)]
     summary: SessionSummary,
     placement: Placement,
     busy: bool,
+    capabilities: Option<ProviderCapabilities>,
 }
 
 /// Session-derived values the server computes.
@@ -396,6 +419,7 @@ impl SessionView {
         SessionRow {
             placement: deps.dispatcher.status(req),
             busy: deps.hub.is_busy(&summary.id),
+            capabilities: deps.dispatcher.capabilities(req),
             summary,
         }
     }
@@ -535,6 +559,29 @@ struct SetThinkingParams {
     enable: bool,
 }
 
+#[derive(Deserialize)]
+struct NameParams {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RepositoryModelsParams {
+    name: String,
+    #[serde(default)]
+    refresh: bool,
+}
+
+#[derive(Deserialize)]
+struct SaveRepositoryParams {
+    name: String,
+    #[serde(default)]
+    previous_name: Option<String>,
+    #[serde(default)]
+    id_prefixes: Vec<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
 /// One client connection. Each request is started as it arrives (see the module docs) and
 /// finished in its own task; dropping the connection unregisters it from the hub.
 pub struct RuntimeConnection {
@@ -569,6 +616,11 @@ impl RuntimeConnection {
     const M_RESET: &'static str = "reset";
     const M_GET_TRACE: &'static str = "get_trace";
     const M_GET_NOTES: &'static str = "get_notes";
+    const M_LIST_REPOSITORIES: &'static str = "list_repositories";
+    const M_LIST_REPOSITORY_MODELS: &'static str = "list_repository_models";
+    const M_SAVE_REPOSITORY: &'static str = "save_repository";
+    const M_DELETE_REPOSITORY: &'static str = "delete_repository";
+    const F_REPOSITORIES: &'static str = "repositories";
     const ERR_NO_SESSION: &'static str = "no session attached";
     const ERR_BUSY: &'static str = "session is busy";
     const ERR_UNKNOWN_METHOD: &'static str = "unknown method: ";
@@ -718,6 +770,7 @@ impl RuntimeConnection {
         let row = SessionView::row_of(&self.deps, &rec);
         Ok(json!({
             "placement": row.placement.clone(),
+            "capabilities": row.capabilities,
             "summary": row,
             "snapshot": rec.snapshot,
             "transcript": rec.transcript,
@@ -988,7 +1041,33 @@ impl SharedRequests {
             RuntimeConnection::M_LIST_CATALOG => {
                 // Models dropped on disk become servable too, not only listed.
                 deps.dispatcher.refresh();
-                Self::to_value(deps.catalog.view())
+                let mut view = Self::to_value(deps.catalog.view())?;
+                view[RuntimeConnection::F_REPOSITORIES] =
+                    Self::to_value(deps.repositories.catalog())?;
+                Ok(view)
+            }
+            RuntimeConnection::M_LIST_REPOSITORIES => Self::to_value(deps.repositories.list()),
+            RuntimeConnection::M_LIST_REPOSITORY_MODELS => {
+                let p: RepositoryModelsParams = Frames::params(params)?;
+                let models = deps
+                    .repositories
+                    .models(&p.name, p.refresh)
+                    .await
+                    .map_err(RpcError::internal)?;
+                if p.refresh {
+                    self.repositories_changed();
+                }
+                Self::to_value(models)
+            }
+            RuntimeConnection::M_SAVE_REPOSITORY => self.save_repository(params).await,
+            RuntimeConnection::M_DELETE_REPOSITORY => {
+                let p: NameParams = Frames::params(params)?;
+                let templates = Arc::clone(&deps.templates);
+                deps.repositories
+                    .delete(&p.name, &|name| templates.templates_using(name))
+                    .map_err(RpcError::internal)?;
+                self.repositories_changed();
+                Ok(json!({}))
             }
             RuntimeConnection::M_LIST_ALL_TOOLS => Self::to_value(deps.registry.specs()),
             RuntimeConnection::M_LIST_SESSIONS => self.list_sessions(),
@@ -1130,6 +1209,37 @@ impl SharedRequests {
         Ok(Value::Null)
     }
 
+    /// Creates, updates or renames an OpenRouter repository; a rename is refused while
+    /// templates use the old name.
+    async fn save_repository(&self, params: Value) -> Result<Value, RpcError> {
+        let p: SaveRepositoryParams = Frames::params(params)?;
+        let templates = Arc::clone(&self.deps.templates);
+        let used_by = move |name: &str| templates.templates_using(name);
+        let saved = self
+            .deps
+            .repositories
+            .save(
+                &p.name,
+                p.previous_name.as_deref(),
+                p.id_prefixes,
+                p.api_key,
+                &used_by,
+            )
+            .await
+            .map_err(RpcError::internal)?;
+        self.repositories_changed();
+        Self::to_value(saved)
+    }
+
+    /// Broadcasts `repositories_changed`, and signals the dispatcher so the placements that
+    /// changed with the repositories are announced.
+    fn repositories_changed(&self) {
+        self.deps
+            .hub
+            .broadcast(RuntimeServer::REPOSITORIES_CHANGED, json!({}));
+        self.deps.dispatcher.refresh();
+    }
+
     fn sessions_changed(deps: &RuntimeDeps) -> Result<Value, RpcError> {
         deps.hub
             .broadcast(RuntimeServer::SESSIONS_CHANGED, json!({}));
@@ -1201,6 +1311,7 @@ mod tests {
     use crate::agents::host::HostState;
     use crate::agents::template::{ContextStrategy, WorkspaceConfig};
     use crate::engine::{ChatMessage, Role};
+    use crate::providers::openrouter::{Canned, FakeHttp, OpenRouterProvider};
     use crate::rpc::test_support::TestClient;
     use crate::rpc::{ERR_INVALID_PARAMS, ERR_PARSE};
     use crate::runtime::compaction::{Summarize, SummaryNote, Trim};
@@ -2071,10 +2182,14 @@ mod tests {
         assert_eq!(tools.as_array().unwrap().len(), 1);
         assert_eq!(tools[0]["name"], "echo");
         let catalog = a.call(C::M_LIST_CATALOG, Value::Null).await.unwrap();
-        assert_eq!(
-            catalog,
-            serde_json::to_value(TestRuntime::catalog()).unwrap()
-        );
+        let mut want = serde_json::to_value(TestRuntime::catalog()).unwrap();
+        want["repositories"] = json!([{
+            "name": TestRuntime::HOST,
+            "kind": "pragmatic",
+            "capabilities": ProviderCapabilities::FULL,
+            "models": want["models"],
+        }]);
+        assert_eq!(catalog, want);
         a.open_session().await;
         let session_tools = a.call(C::M_LIST_TOOLS, Value::Null).await.unwrap();
         assert_eq!(session_tools, tools);
@@ -3110,5 +3225,457 @@ mod tests {
         let handle = config.scope.session.expect("session handle");
         assert!(handle.exists());
         assert_eq!(handle.notes(), Some(vec![]));
+    }
+
+    /// OpenRouter repositories over a fake OpenRouter.
+    struct Repositories;
+
+    impl Repositories {
+        const REPO: &'static str = "or1";
+        const RENAMED: &'static str = "or2";
+        const KEY: &'static str = "sk-or-server-secret-9c1d";
+        const HINT: &'static str = "9c1d";
+        const MODEL: &'static str = "vendor/m";
+        const OTHER_MODEL: &'static str = "vendor/n";
+        const AGENT: &'static str = "Router";
+        const NOTES_FILE: &'static str = "notes.txt";
+        const NOTES_BODY: &'static str = "first line of the notes";
+        const ANSWER: &'static str = "noted";
+        const USED: &'static str = "repository is used by templates: Router";
+
+        /// A `/models` body listing `ids`, all tools-capable.
+        fn models(ids: &[&str]) -> Canned {
+            let data: Vec<Value> = ids
+                .iter()
+                .map(|id| {
+                    json!({"id": id, "name": id, "context_length": 65536,
+                        "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                        "supported_parameters": ["tools"]})
+                })
+                .collect();
+            Canned::new(200, &[&json!({ "data": data }).to_string()])
+        }
+
+        /// A streamed chat answer: `delta`, then `finish`, usage and `[DONE]`.
+        fn chat(delta: Value, finish: &str) -> Canned {
+            let events = [
+                json!({"choices": [{"index": 0, "delta": delta, "finish_reason": null}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 40, "completion_tokens": 5,
+                    "total_tokens": 45, "cost": 0.0001}}),
+            ];
+            let mut parts: Vec<String> = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+            parts.push("data: [DONE]\n\n".into());
+            Canned { status: 200, parts }
+        }
+
+        async fn save(
+            c: &mut Client,
+            name: &str,
+            previous: Option<&str>,
+        ) -> Result<Value, RpcError> {
+            c.call(
+                C::M_SAVE_REPOSITORY,
+                json!({ "name": name, "previous_name": previous, "id_prefixes": [],
+                    "api_key": Self::KEY }),
+            )
+            .await
+        }
+
+        /// The seed template moved onto the OpenRouter model.
+        fn template(rt: &TestRuntime) -> AgentTemplate {
+            AgentTemplate {
+                name: Self::AGENT.into(),
+                runtime: OpenRouterProvider::RUNTIME.into(),
+                model: Self::MODEL.into(),
+                repository: Some(Self::REPO.into()),
+                n_ctx: 8192,
+                ..rt.template()
+            }
+        }
+
+        async fn save_template(c: &mut Client, rt: &TestRuntime) -> Value {
+            c.call(
+                C::M_SAVE_TEMPLATE,
+                json!({ "path": GROUP, "template": Self::template(rt) }),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Waits for a `method` frame on `c`, returning its params.
+        async fn next_note(c: &mut Client, method: &str) -> Value {
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    let frame = c.rx.recv().await.expect("frames");
+                    if frame[METHOD] == method {
+                        return frame[PARAMS].clone();
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no {method}"))
+        }
+
+        fn find<'a>(rows: &'a Value, name: &str) -> &'a Value {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from {rows}"))
+        }
+
+        fn router_node(tree: &Value) -> Value {
+            tree[0]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["name"] == Self::AGENT)
+                .expect("listed")
+                .clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn list_repositories_has_hive_and_openrouter() {
+        let (base, _requests) =
+            FakeHttp::serve(vec![Repositories::models(&[Repositories::MODEL])]).await;
+        let rt = TestRuntime::openrouter("repolist", Client::idle(), &base);
+        let mut a = Client::new(&rt);
+        let saved = Repositories::save(&mut a, Repositories::REPO, None)
+            .await
+            .unwrap();
+        assert_eq!(saved, json!({ "name": Repositories::REPO }));
+        let rows = a.call(C::M_LIST_REPOSITORIES, Value::Null).await.unwrap();
+        let hive = Repositories::find(&rows, TestRuntime::HOST);
+        assert_eq!(hive["kind"], "pragmatic");
+        assert_eq!(hive["editable"], false);
+        assert_eq!(hive["model_count"], 1);
+        assert_eq!(
+            hive["capabilities"],
+            serde_json::to_value(ProviderCapabilities::FULL).unwrap()
+        );
+        assert!(hive.get("key_hint").is_none());
+        let or = Repositories::find(&rows, Repositories::REPO);
+        assert_eq!(or["kind"], "openrouter");
+        assert_eq!(or["editable"], true);
+        assert_eq!(or["has_key"], true);
+        assert_eq!(or["key_hint"], Repositories::HINT);
+        assert_eq!(or["model_count"], 1);
+        assert_eq!(or["id_prefixes"], json!([]));
+        assert!(or["fetched_at"].is_u64());
+        assert_eq!(or["capabilities"]["measure_prompt"], "estimated");
+        assert_eq!(or["capabilities"]["load_unload"], false);
+        let models = a
+            .call(
+                C::M_LIST_REPOSITORY_MODELS,
+                json!({ "name": Repositories::REPO }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models["models"][0]["id"], Repositories::MODEL);
+        assert!(models["fetched_at"].is_u64());
+        let hive_models = a
+            .call(
+                C::M_LIST_REPOSITORY_MODELS,
+                json!({ "name": TestRuntime::HOST }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hive_models["models"][0]["name"], TestRuntime::MODEL);
+        let catalog = a.call(C::M_LIST_CATALOG, Value::Null).await.unwrap();
+        assert_eq!(catalog["hosts"], json!([TestRuntime::HOST]));
+        let listed = Repositories::find(&catalog["repositories"], Repositories::REPO);
+        assert_eq!(listed["kind"], "openrouter");
+        assert_eq!(listed["models"][0]["id"], Repositories::MODEL);
+        let missing = a
+            .call(C::M_LIST_REPOSITORY_MODELS, json!({ "name": "nope" }))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.message, "repository not found: nope");
+        // The key is in no result and no notification.
+        let wire = format!("{rows}{catalog}{models}{:?}", a.drain());
+        assert!(!wire.contains(Repositories::KEY));
+    }
+
+    #[tokio::test]
+    async fn rename_and_delete_refused_while_used() {
+        let (base, _requests) = FakeHttp::serve(vec![
+            Repositories::models(&[Repositories::MODEL]),
+            Repositories::models(&[Repositories::MODEL]),
+        ])
+        .await;
+        let rt = TestRuntime::openrouter("repoused", Client::idle(), &base);
+        let mut a = Client::new(&rt);
+        Repositories::save(&mut a, Repositories::REPO, None)
+            .await
+            .unwrap();
+        let saved = Repositories::save_template(&mut a, &rt).await;
+        let rename = Repositories::save(&mut a, Repositories::RENAMED, Some(Repositories::REPO))
+            .await
+            .unwrap_err();
+        assert_eq!(rename.message, Repositories::USED);
+        let delete = a
+            .call(
+                C::M_DELETE_REPOSITORY,
+                json!({ "name": Repositories::REPO }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(delete.message, Repositories::USED);
+        let hive = a
+            .call(C::M_DELETE_REPOSITORY, json!({ "name": TestRuntime::HOST }))
+            .await
+            .unwrap_err();
+        assert_eq!(hive.message, "repository is not editable: hive");
+        assert_eq!(rt.deps.repositories.list().len(), 2);
+
+        // Once no template uses it, both go through.
+        a.call(C::M_DELETE_TEMPLATE, json!({ "id": saved["id"] }))
+            .await
+            .unwrap();
+        let renamed = Repositories::save(&mut a, Repositories::RENAMED, Some(Repositories::REPO))
+            .await
+            .unwrap();
+        assert_eq!(renamed, json!({ "name": Repositories::RENAMED }));
+        let deleted = a
+            .call(
+                C::M_DELETE_REPOSITORY,
+                json!({ "name": Repositories::RENAMED }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, json!({}));
+        assert_eq!(rt.deps.repositories.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleted_repository_session_unavailable() {
+        let (base, _requests) =
+            FakeHttp::serve(vec![Repositories::models(&[Repositories::MODEL])]).await;
+        let rt = TestRuntime::openrouter("repogone", Client::idle(), &base);
+        let _watcher = PlacementWatcher::spawn(&rt.deps);
+        let mut a = Client::new(&rt);
+        Repositories::save(&mut a, Repositories::REPO, None)
+            .await
+            .unwrap();
+        let saved = Repositories::save_template(&mut a, &rt).await;
+        let row = a
+            .call(C::M_CREATE_SESSION, json!({ "template_id": saved["id"] }))
+            .await
+            .unwrap();
+        let id = row["id"].clone();
+        assert_eq!(
+            row["placement"],
+            json!({ "state": "ready", "host": Repositories::REPO })
+        );
+        assert_eq!(row["capabilities"]["measure_prompt"], "estimated");
+        // The session outlives its template; then the repository can go.
+        a.call(C::M_DELETE_TEMPLATE, json!({ "id": saved["id"] }))
+            .await
+            .unwrap();
+        a.drain();
+        a.call(
+            C::M_DELETE_REPOSITORY,
+            json!({ "name": Repositories::REPO }),
+        )
+        .await
+        .unwrap();
+        let gone = json!({ "state": "unavailable", "reason": "repository not found: or1" });
+        let changed = Repositories::next_note(&mut a, RuntimeServer::PLACEMENT_CHANGED).await;
+        assert_eq!(changed, json!({ "id": id, "placement": gone }));
+        let rows = a.call(C::M_LIST_SESSIONS, Value::Null).await.unwrap();
+        assert_eq!(rows[0]["placement"], gone);
+        assert_eq!(rows[0]["capabilities"], Value::Null);
+        let attached = a.attach(id.as_str().unwrap()).await;
+        assert_eq!(attached["placement"], gone);
+        assert_eq!(attached["capabilities"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn template_with_vanished_model_still_loads() {
+        let (base, _requests) = FakeHttp::serve(vec![
+            Repositories::models(&[Repositories::MODEL, Repositories::OTHER_MODEL]),
+            Repositories::models(&[Repositories::OTHER_MODEL]),
+        ])
+        .await;
+        let rt = TestRuntime::openrouter("repovanish", Client::idle(), &base);
+        let mut a = Client::new(&rt);
+        Repositories::save(&mut a, Repositories::REPO, None)
+            .await
+            .unwrap();
+        let saved = Repositories::save_template(&mut a, &rt).await;
+        let tree = a.call(C::M_LIST_TEMPLATES, Value::Null).await.unwrap();
+        assert_eq!(Repositories::router_node(&tree)["error"], Value::Null);
+
+        let refreshed = a
+            .call(
+                C::M_LIST_REPOSITORY_MODELS,
+                json!({ "name": Repositories::REPO, "refresh": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed["models"].as_array().unwrap().len(), 1);
+        let vanished = "unknown model: vendor/m";
+        let tree = a.call(C::M_LIST_TEMPLATES, Value::Null).await.unwrap();
+        let node = Repositories::router_node(&tree);
+        assert_eq!(node["error"], vanished);
+        assert_eq!(node["model"], Repositories::MODEL);
+        let got = a
+            .call(C::M_GET_TEMPLATE, json!({ "id": saved["id"] }))
+            .await
+            .unwrap();
+        assert_eq!(got["template"]["model"], Repositories::MODEL);
+        assert_eq!(got["error"], vanished);
+
+        // After a restart without network the cached list still marks it, and it still loads.
+        let rt = rt.reopen(Client::idle());
+        let mut b = Client::new(&rt);
+        let tree = b.call(C::M_LIST_TEMPLATES, Value::Null).await.unwrap();
+        assert_eq!(Repositories::router_node(&tree)["error"], vanished);
+        assert_eq!(
+            rt.deps.templates.templates_using(Repositories::REPO),
+            [Repositories::AGENT]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rows_carry_capabilities() {
+        let rt = TestRuntime::new("sesscaps", Client::idle());
+        let caps = ProviderCapabilities {
+            logprobs: false,
+            ..ProviderCapabilities::FULL
+        };
+        rt.host.set_capabilities(caps);
+        let mut a = Client::new(&rt);
+        let id = a.create().await;
+        let want = serde_json::to_value(caps).unwrap();
+        let rows = a.call(C::M_LIST_SESSIONS, Value::Null).await.unwrap();
+        assert_eq!(rows[0]["capabilities"], want);
+        let attached = a.attach(&id).await;
+        assert_eq!(attached["capabilities"], want);
+        assert_eq!(attached["summary"]["capabilities"], want);
+    }
+
+    #[tokio::test]
+    async fn repositories_changed_broadcast_on_save() {
+        // The failed fetch on save leaves the list unknown, so the plain listing fetches too.
+        let (base, _requests) = FakeHttp::serve(vec![
+            Canned::new(500, &["{\"error\":{\"message\":\"down\"}}"]),
+            Repositories::models(&[Repositories::MODEL]),
+            Repositories::models(&[Repositories::MODEL]),
+        ])
+        .await;
+        let rt = TestRuntime::openrouter("repobcast", Client::idle(), &base);
+        let mut a = Client::new(&rt);
+        let mut b = Client::new(&rt);
+        let saved = Repositories::save(&mut a, Repositories::REPO, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            saved,
+            json!({ "name": Repositories::REPO, "fetch_error": "openrouter: 500 down" })
+        );
+        let changed = |c: &mut Client| {
+            Client::methods(&c.drain())
+                .iter()
+                .filter(|m| *m == RuntimeServer::REPOSITORIES_CHANGED)
+                .count()
+        };
+        assert_eq!(changed(&mut b), 1);
+        // A plain listing announces nothing; a refresh does.
+        a.call(
+            C::M_LIST_REPOSITORY_MODELS,
+            json!({ "name": Repositories::REPO }),
+        )
+        .await
+        .unwrap();
+        let refreshed = a
+            .call(
+                C::M_LIST_REPOSITORY_MODELS,
+                json!({ "name": Repositories::REPO, "refresh": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed["models"][0]["id"], Repositories::MODEL);
+        assert!(refreshed.get("error").is_none());
+        assert_eq!(changed(&mut b), 1);
+        a.call(
+            C::M_DELETE_REPOSITORY,
+            json!({ "name": Repositories::REPO }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed(&mut b), 1);
+        assert!(!format!("{:?}", a.drain()).contains(Repositories::KEY));
+    }
+
+    #[tokio::test]
+    async fn openrouter_session_turn_runs_against_fake_server() {
+        let call = json!({"tool_calls": [{"index": 0, "id": "t0", "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"/sandbox/notes.txt\"}"}}]});
+        let (base, mut requests) = FakeHttp::serve(vec![
+            Repositories::models(&[Repositories::MODEL]),
+            Repositories::chat(call, "tool_calls"),
+            Repositories::chat(json!({"content": Repositories::ANSWER}), "stop"),
+        ])
+        .await;
+        let rt = TestRuntime::openrouter("repoturn", Client::idle(), &base);
+        std::fs::write(
+            rt.sandbox_root().join(Repositories::NOTES_FILE),
+            Repositories::NOTES_BODY,
+        )
+        .unwrap();
+        let mut a = Client::new(&rt);
+        Repositories::save(&mut a, Repositories::REPO, None)
+            .await
+            .unwrap();
+        let saved = Repositories::save_template(&mut a, &rt).await;
+        let row = a
+            .call(C::M_CREATE_SESSION, json!({ "template_id": saved["id"] }))
+            .await
+            .unwrap();
+        let id = row["id"].as_str().unwrap().to_string();
+        a.attach(&id).await;
+        a.drain();
+        assert_eq!(a.send().await.unwrap(), Value::Null);
+
+        let frames = a.drain();
+        let steps = TestClient::params_of(&frames, SessionTrace::M_TRACE_STEP);
+        assert_eq!(steps.len(), 2);
+        let turn = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0];
+        assert_eq!(turn[RECORD][REASON], "answered");
+        assert_eq!(turn[RECORD][COMMITTED], true);
+        let rec = rt.deps.sessions.get(&id).unwrap();
+        let tool = rec
+            .transcript
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool result in the transcript");
+        assert!(
+            serde_json::to_string(&tool.tool_result)
+                .unwrap()
+                .contains(Repositories::NOTES_BODY),
+            "{tool:?}"
+        );
+        assert_eq!(rec.transcript.last().unwrap().content, Repositories::ANSWER);
+
+        // The model list, then one chat call per step; the second carries the tool result.
+        let listing = requests.recv().await.unwrap();
+        assert!(listing.head.starts_with("GET /models "), "{}", listing.head);
+        let first = requests.recv().await.unwrap();
+        assert_eq!(
+            first.header("authorization"),
+            Some(format!("Bearer {}", Repositories::KEY))
+        );
+        assert_eq!(first.json()["model"], Repositories::MODEL);
+        let second = requests.recv().await.unwrap();
+        assert!(second.body.contains(Repositories::NOTES_BODY));
+        // The key is nowhere in the session file, the trace log or the notifications.
+        for file in std::fs::read_dir(rt.sessions_dir()).unwrap() {
+            let text = std::fs::read_to_string(file.unwrap().path()).unwrap_or_default();
+            assert!(!text.contains(Repositories::KEY));
+        }
+        assert!(!format!("{frames:?}").contains(Repositories::KEY));
     }
 }
