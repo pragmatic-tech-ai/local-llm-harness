@@ -855,8 +855,9 @@ impl<'a> Summarizer<'a> {
     ///
     /// A reply counts as cut off when its generated tokens reach `max_tokens`: the usage's
     /// `completion_tokens` when the provider reports it (OpenRouter chunks carry no tokens),
-    /// else the sum over `turn_chunk.tokens`. The chunk `stop` flag is not used: the in-process engines send a
-    /// final `stop: true` chunk on the `max_tokens` cap as well as on end of sequence.
+    /// else the sum over `turn_chunk.tokens`. The chunk `stop` flag is not used: the in-process
+    /// engines send a final `stop: true` chunk on the `max_tokens` cap as well as on end of
+    /// sequence.
     async fn call(&mut self, content: String) -> Result<String, String> {
         let req = GenerateRequest {
             messages: Self::messages(&content),
