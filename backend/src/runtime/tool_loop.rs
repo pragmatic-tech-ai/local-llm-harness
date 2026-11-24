@@ -138,10 +138,8 @@ struct StepMeter {
 
 impl StepMeter {
     const FIELD_PROMPT: &'static str = "prompt";
-    const FIELD_PROMPT_TOKENS: &'static str = "prompt_tokens";
     const FIELD_N_CTX: &'static str = "n_ctx";
     const FIELD_TEXT: &'static str = "text";
-    const FIELD_TOKENS: &'static str = "tokens";
 
     /// The meter of the step at zero-based index `index`.
     fn new(index: usize) -> Self {
@@ -168,7 +166,7 @@ impl StepMeter {
     fn observe(&mut self, note: &Note) {
         match note.method.as_str() {
             ToolLoop::M_TURN_STARTED => {
-                self.prompt_tokens = Self::count(&note.params, Self::FIELD_PROMPT_TOKENS);
+                self.prompt_tokens = Self::count(&note.params, ToolLoop::FIELD_PROMPT_TOKENS);
                 self.n_ctx = Self::count(&note.params, Self::FIELD_N_CTX);
                 let prompt = note
                     .params
@@ -181,7 +179,7 @@ impl StepMeter {
                 self.first_chunk.get_or_insert_with(Instant::now);
                 let tokens = note
                     .params
-                    .get(Self::FIELD_TOKENS)
+                    .get(ToolLoop::FIELD_TOKENS)
                     .and_then(Value::as_array)
                     .map_or(0, Vec::len);
                 let text = note
@@ -257,6 +255,8 @@ pub struct ToolLoop {
 
 impl ToolLoop {
     const M_TOOL_CALL: &'static str = "tool_call";
+    pub(crate) const FIELD_PROMPT_TOKENS: &'static str = "prompt_tokens";
+    pub(crate) const FIELD_TOKENS: &'static str = "tokens";
     pub(crate) const M_TURN_STARTED: &'static str = "turn_started";
     pub(crate) const M_TURN_CHUNK: &'static str = "turn_chunk";
     pub(crate) const M_TURN_DONE: &'static str = "turn_done";
@@ -266,15 +266,15 @@ impl ToolLoop {
     const M_LOOP_DONE: &'static str = "loop_done";
     const STREAM_ENDED: &'static str = "worker stream ended unexpectedly";
     const BAD_TURN_DONE: &'static str = "worker sent a malformed turn_done";
-    const FIELD_MESSAGE: &'static str = "message";
-    const FIELD_NEEDED: &'static str = "needed";
-    const FIELD_TOTAL: &'static str = "total";
+    pub(crate) const FIELD_MESSAGE: &'static str = "message";
+    pub(crate) const FIELD_NEEDED: &'static str = "needed";
+    pub(crate) const FIELD_TOTAL: &'static str = "total";
     const KIND_FUNCTION: &'static str = "function";
     const SUPPORTS_TOOLS: &'static str = "supports_tools";
     const FIELD_ID: &'static str = "id";
     const CALL_ID_PREFIX: &'static str = "call_";
     const FIELD_TOOL_CALLS: &'static str = "tool_calls";
-    const FIELD_CONTENT: &'static str = "content";
+    pub(crate) const FIELD_CONTENT: &'static str = "content";
     /// Reported when no harness is Ready (shared with the runtime server).
     pub(crate) const NO_MODEL: &'static str = "no model running";
 
