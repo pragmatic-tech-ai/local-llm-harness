@@ -77,9 +77,13 @@ impl Dispatcher {
         })
     }
 
-    /// The provider that serves `req`: exactly the one its repository names.
+    /// The provider that serves `req`: exactly the one its repository names, unless that
+    /// provider is unavailable or does not serve the model.
     fn provider_for(&self, req: &ModelRequirement) -> Result<Arc<dyn Provider>, DispatchError> {
         let provider = self.named_provider(req)?;
+        if let Some(reason) = provider.unavailable() {
+            return Err(DispatchError(reason));
+        }
         if provider.serves(req) {
             Ok(provider)
         } else {

@@ -14,6 +14,7 @@
 //!
 //! [`PragmaticProvider`] is the first provider: the in-process harness manager.
 
+pub mod openrouter;
 pub mod pragmatic;
 
 use std::sync::Arc;
@@ -62,6 +63,11 @@ pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     /// What this provider supports beyond running a chat.
     fn capabilities(&self) -> ProviderCapabilities;
+    /// Why this provider can serve nothing right now (an OpenRouter repository without a key),
+    /// or `None` when it can. The dispatcher reports the reason as the placement.
+    fn unavailable(&self) -> Option<String> {
+        None
+    }
     /// Whether this provider can ever serve `req`'s runtime and model (cheap; no loading). The
     /// repository is not checked: routing by repository is the dispatcher's job.
     fn serves(&self, req: &ModelRequirement) -> bool;
