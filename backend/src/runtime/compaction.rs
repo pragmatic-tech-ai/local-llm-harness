@@ -856,10 +856,16 @@ pub struct Compactor {
     /// The session's sampling; a summary call copies it, overriding a few fields.
     sampling: SamplingConfig,
     sink: Arc<dyn SummarySink>,
+    /// The session named in the measure-failure log line (empty when unknown).
+    session: String,
+    /// How many measure failures were logged this turn: at most one.
+    logged_failures: usize,
 }
 
 impl Compactor {
     const PERCENT: usize = 100;
+    /// The start of the once-per-turn log line for a failed `measure_prompt`.
+    const MEASURE_FAILED: &'static str = "measure_prompt failed, compaction skipped for session";
 
     pub fn new(
         strategy: ContextStrategy,
@@ -876,7 +882,21 @@ impl Compactor {
             committed_len,
             sampling,
             sink,
+            session: String::new(),
+            logged_failures: 0,
         }
+    }
+
+    /// Names `session` in the measure-failure log line.
+    pub fn for_session(mut self, session: &str) -> Self {
+        self.session = session.to_string();
+        self
+    }
+
+    /// How many measure failures this compactor has logged: 0, or 1 once any measure of the
+    /// turn failed (later failures are not logged again).
+    pub fn logged_failures(&self) -> usize {
+        self.logged_failures
     }
 
     /// A compactor that never compacts (and never measures).
@@ -904,7 +924,8 @@ impl Compactor {
     /// `max(max_tokens, 0)`. The messages come back unchanged, with no record, when the
     /// strategy is off, when the prompt plus the reservation fits the budget, or when a
     /// measure fails (an old worker without `measure_prompt`, or a link error): the step then
-    /// goes out uncompacted and the turn continues. Otherwise the strategy's result is
+    /// goes out uncompacted and the turn continues (the turn's first failure is logged to
+    /// stderr once, see [`Self::logged_failures`]). Otherwise the strategy's result is
     /// returned, with its record. A summary saved through the sink is also kept here, even
     /// when a later measure of the same step fails.
     pub async fn prepare(
@@ -925,8 +946,12 @@ impl Compactor {
             enable_thinking,
             sampling: &self.sampling,
         };
-        let Ok(size) = measure.measure(messages).await else {
-            return Self::unchanged(messages);
+        let size = match measure.measure(messages).await {
+            Ok(size) => size,
+            Err(error) => {
+                self.measure_failed(&error);
+                return Self::unchanged(messages);
+            }
         };
         let budget = size.n_ctx.saturating_mul(usize::from(self.compact_at_pct)) / Self::PERCENT;
         let reservation = usize::try_from(max_tokens.max(0)).unwrap_or(usize::MAX);
@@ -973,7 +998,22 @@ impl Compactor {
                 outcome
             }
         };
-        outcome.unwrap_or_else(|_| Self::unchanged(messages))
+        match outcome {
+            Ok(compacted) => compacted,
+            Err(error) => {
+                self.measure_failed(&error);
+                Self::unchanged(messages)
+            }
+        }
+    }
+
+    /// Logs the turn's first measure failure to stderr; the step still goes out uncompacted
+    /// and its trace record carries no compaction.
+    fn measure_failed(&mut self, error: &str) {
+        if self.logged_failures == 0 {
+            eprintln!("{} {}: {error}", Self::MEASURE_FAILED, self.session);
+            self.logged_failures += 1;
+        }
     }
 
     /// `messages` as they are, with no record.

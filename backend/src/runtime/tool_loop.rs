@@ -86,9 +86,12 @@ pub struct TurnConfig {
     pub tools: Vec<String>,
     pub enable_thinking: bool,
     pub sampling: SamplingConfig,
-    /// How the prompt is kept inside the window (the session's snapshot).
+    /// How the prompt is kept inside the window (the session's snapshot). The loop does not
+    /// read it: it configures the [`Compactor`] the caller builds and passes to
+    /// [`ToolLoop::run`] (the server's `SessionView::compactor`).
     pub context_strategy: ContextStrategy,
-    /// The budget, as a percentage of the window, past which the prompt is compacted.
+    /// The budget, as a percentage of the window, past which the prompt is compacted. Like
+    /// `context_strategy`, it configures the caller's [`Compactor`]; the loop does not read it.
     pub compact_at_pct: u8,
 }
 
@@ -2180,7 +2183,7 @@ You are terse.<|tool>declaration:echo{";
         let link = FakeLink::new(
             true,
             vec![
-                Fixture::step("", vec![Fixture::echo_call("call_1")]),
+                Fixture::step("", vec![Fixture::echo_call(Compaction::CALL_ID)]),
                 Fixture::step("done", vec![]),
             ],
         );
@@ -2191,6 +2194,29 @@ You are terse.<|tool>declaration:echo{";
         assert_eq!(requests[1].messages.len(), 7);
         assert_eq!(link.measured().len(), 2);
         assert!(f.trace.records.iter().all(|r| r.compaction.is_none()));
+        // Both steps failed to measure; the failure was logged once for the turn.
+        assert_eq!(f.compactor.logged_failures(), 1);
+    }
+
+    #[tokio::test]
+    async fn max_tokens_reservation_pushes_a_fitting_prompt_over_budget() {
+        // 1400 fits the 1500 budget alone, but not with 500 reserved for the reply.
+        let prompt = Compaction::budget() - 100;
+        for (max_tokens, compacted) in [(500, true), (-1, false)] {
+            let mut f = Fixture::new();
+            f.config.sampling.max_tokens = max_tokens;
+            f.compactor = Compaction::compactor(ContextStrategy::Trim);
+            let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+            link.set_measure(Compaction::size(prompt));
+            f.run(Some(link.clone())).await.unwrap();
+            let record = f.trace.records[0].compaction.clone();
+            assert_eq!(record.is_some(), compacted, "max_tokens {max_tokens}");
+            if let Some(record) = record {
+                assert_eq!(record.strategy, Trim::STRATEGY);
+                assert_eq!(record.before_tokens as usize, prompt);
+            }
+            assert_eq!(f.compactor.logged_failures(), 0);
+        }
     }
 
     #[tokio::test]
@@ -2230,7 +2256,7 @@ You are terse.<|tool>declaration:echo{";
             true,
             vec![
                 Compaction::summary_reply(Compaction::SUMMARY),
-                Fixture::step("", vec![Fixture::echo_call("call_1")]),
+                Fixture::step("", vec![Fixture::echo_call(Compaction::CALL_ID)]),
                 Fixture::step("done", vec![]),
             ],
         );

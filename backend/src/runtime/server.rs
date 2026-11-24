@@ -318,6 +318,7 @@ impl SessionView {
             config.sampling.clone(),
             Arc::new(sink),
         )
+        .for_session(&rec.id)
     }
 
     fn row(deps: &RuntimeDeps, summary: SessionSummary, req: &ModelRequirement) -> SessionRow {
@@ -2566,6 +2567,12 @@ mod tests {
         /// The length of each long question in [`Self::long_turns`].
         const LONG: usize = 1200;
         const SUMMARY: &'static str = "S";
+        /// A summary saved before a reset.
+        const OLD: &'static str = "OLD";
+        /// A summary saved on a live session.
+        const KEPT: &'static str = "kept";
+        /// A summary saved after the session was deleted.
+        const LATE: &'static str = "late";
         const COMPACTION: &'static str = "compaction";
         const STRATEGY: &'static str = "strategy";
         const REUSED: &'static str = "reused_summary";
@@ -2694,7 +2701,7 @@ mod tests {
         let id = a.open_session().await;
         rt.deps
             .sessions
-            .set_compaction(&id, Some(Compacting::state("OLD", 2)))
+            .set_compaction(&id, Some(Compacting::state(Compacting::OLD, 2)))
             .unwrap();
         a.call(C::M_RESET, Value::Null).await.unwrap();
         assert_eq!(rt.deps.sessions.get(&id).unwrap().compaction, None);
@@ -2710,7 +2717,7 @@ mod tests {
         let summary_call = &rt.host.link().requests()[0];
         let span = &summary_call.messages[1].content;
         assert!(span.starts_with("user: aaa"), "{span}");
-        assert!(!span.contains("OLD"));
+        assert!(!span.contains(Compacting::OLD));
         let saved = rt.deps.sessions.get(&id).unwrap().compaction.unwrap();
         assert_eq!(
             (saved.summary.as_str(), saved.covers),
@@ -2752,11 +2759,16 @@ mod tests {
             sessions: Arc::clone(&rt.deps.sessions),
             session: rec.id.clone(),
         };
-        sink.save(Compacting::state("kept", 1)).await.unwrap();
+        sink.save(Compacting::state(Compacting::KEPT, 1))
+            .await
+            .unwrap();
         let kept = rt.deps.sessions.get(&rec.id).unwrap().compaction;
-        assert_eq!(kept, Some(Compacting::state("kept", 1)));
+        assert_eq!(kept, Some(Compacting::state(Compacting::KEPT, 1)));
         rt.deps.sessions.delete(&rec.id).unwrap();
-        assert_eq!(sink.save(Compacting::state("late", 1)).await, Ok(()));
+        assert_eq!(
+            sink.save(Compacting::state(Compacting::LATE, 1)).await,
+            Ok(())
+        );
         assert!(!rt.deps.sessions.contains(&rec.id));
     }
 }
