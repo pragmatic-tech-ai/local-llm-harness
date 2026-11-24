@@ -74,6 +74,7 @@ export class TraceStepViewModel extends Observable
     private static readonly ReusedFormat = '⟲ summarize (reused): {0} → {1} tokens · covers {2} messages'
     private static readonly FallbackFormat = '⟲ summarize failed → trim: {0} → {1} tokens · {2} results elided · {3} turns dropped'
     private static readonly FallbackErrorFormat = '  ({0})'
+    private static readonly TrimOnTopFormat = ' · {0} results elided · {1} turns dropped'
     private static readonly StrategySummarize: CompactionRecord['strategy'] = 'summarize'
     private static readonly ToolOk = 'ok'
     private static readonly ToolFailed = 'failed'
@@ -173,14 +174,21 @@ export class TraceStepViewModel extends Observable
         }
         if (c.strategy === TraceStepViewModel.StrategySummarize)
         {
-            if (c.reused_summary)
-            {
-                return TextFormat.Format(TraceStepViewModel.ReusedFormat, before, after, c.summarized_messages)
-            }
-            return TextFormat.Format(TraceStepViewModel.SummarizeFormat, before, after, c.summarized_messages,
-                TraceNumbers.Seconds(c.summary_ms ?? 0))
+            const line = c.reused_summary
+                ? TextFormat.Format(TraceStepViewModel.ReusedFormat, before, after, c.summarized_messages)
+                : TextFormat.Format(TraceStepViewModel.SummarizeFormat, before, after, c.summarized_messages,
+                    TraceNumbers.Seconds(c.summary_ms ?? 0))
+            return line + TraceStepViewModel.TrimOnTopText(c)
         }
         return TextFormat.Format(TraceStepViewModel.TrimFormat, before, after, c.elided_results, c.dropped_turns)
+    }
+
+    /** The trim counts of a summary that trim ran on top of, or '' when it removed nothing. */
+    private static TrimOnTopText(c: CompactionRecord): string
+    {
+        return c.elided_results > 0 || c.dropped_turns > 0
+            ? TextFormat.Format(TraceStepViewModel.TrimOnTopFormat, c.elided_results, c.dropped_turns)
+            : ''
     }
 
     public get HasCompaction(): boolean

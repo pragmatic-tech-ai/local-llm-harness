@@ -177,6 +177,7 @@ describe('TemplateEditorViewModel', () =>
         {
             e.CompactAtText = bad
             expect(e.HasCompactAtError).toBe(true)
+            expect(e.CompactAtError).toBe('Compact at must be a whole percentage from 10 to 95.')
             expect(e.CanSave).toBe(false)
         }
         for (const good of ['10', '95'])

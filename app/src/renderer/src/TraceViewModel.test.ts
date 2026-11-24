@@ -386,9 +386,10 @@ describe('TraceViewModel', () =>
         }
         const text = (over: Partial<CompactionRecord>): string => new TraceStepViewModel(Rig.Step(1, 1, { compaction: { ...base, ...over } })).CompactionText
         expect(text({})).toBe('⟲ trim: 7 420 → 5 980 tokens · 3 results elided · 0 turns dropped')
-        expect(text({ strategy: 'summarize', after_tokens: 3100, summarized_messages: 14, summary_ms: 18200 }))
+        const summarized: Partial<CompactionRecord> = { strategy: 'summarize', elided_results: 0, summarized_messages: 14 }
+        expect(text({ ...summarized, after_tokens: 3100, summary_ms: 18200 }))
             .toBe('⟲ summarize: 7 420 → 3 100 tokens · covers 14 messages · 18.2 s')
-        expect(text({ strategy: 'summarize', before_tokens: 6900, after_tokens: 3300, summarized_messages: 14, reused_summary: true }))
+        expect(text({ ...summarized, before_tokens: 6900, after_tokens: 3300, reused_summary: true }))
             .toBe('⟲ summarize (reused): 6 900 → 3 300 tokens · covers 14 messages')
         expect(text({ strategy: 'summarize', fallback: true }))
             .toBe('⟲ summarize failed → trim: 7 420 → 5 980 tokens · 3 results elided · 0 turns dropped')
@@ -397,8 +398,26 @@ describe('TraceViewModel', () =>
         expect(new TraceStepViewModel(Rig.Step(1, 1, { compaction: { ...base } })).HasCompaction).toBe(true)
         // A trim record ignores `fallback` (only a summarize record falls back), and a reused summary has no time to show.
         expect(text({ fallback: true, summary_error: 'ignored' })).toBe(text({}))
-        expect(text({ strategy: 'summarize', reused_summary: true, summary_ms: null, summarized_messages: 14 }))
+        expect(text({ ...summarized, reused_summary: true, summary_ms: null }))
             .toBe('⟲ summarize (reused): 7 420 → 5 980 tokens · covers 14 messages')
+    })
+
+    it('compaction_text_shows_trim_on_top_of_a_summary', () =>
+    {
+        const base: CompactionRecord = {
+            strategy: 'summarize', before_tokens: 7420, after_tokens: 3100, elided_results: 0, dropped_turns: 0, summarized_messages: 14,
+            summary_ms: 18200, reused_summary: false, fallback: false, summary_prompt_tokens: null, summary_out_tokens: null, summary_error: null,
+        }
+        const text = (over: Partial<CompactionRecord>): string => new TraceStepViewModel(Rig.Step(1, 1, { compaction: { ...base, ...over } })).CompactionText
+        expect(text({ elided_results: 2 }))
+            .toBe('⟲ summarize: 7 420 → 3 100 tokens · covers 14 messages · 18.2 s · 2 results elided · 0 turns dropped')
+        expect(text({ dropped_turns: 1 }))
+            .toBe('⟲ summarize: 7 420 → 3 100 tokens · covers 14 messages · 18.2 s · 0 results elided · 1 turns dropped')
+        expect(text({ reused_summary: true, summary_ms: null, elided_results: 1, dropped_turns: 2 }))
+            .toBe('⟲ summarize (reused): 7 420 → 3 100 tokens · covers 14 messages · 1 results elided · 2 turns dropped')
+        // Nothing trimmed on top: no counts.
+        expect(text({})).toBe('⟲ summarize: 7 420 → 3 100 tokens · covers 14 messages · 18.2 s')
+        expect(text({ reused_summary: true, summary_ms: null })).toBe('⟲ summarize (reused): 7 420 → 3 100 tokens · covers 14 messages')
     })
 
     it('step_without_compaction_has_no_line', () =>

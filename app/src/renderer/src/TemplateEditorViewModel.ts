@@ -36,7 +36,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly NameRequired = 'Name is required.'
     private static readonly StepBudgetInvalid = 'Step budget must be a whole number of at least 1.'
     private static readonly ContextSizeInvalid = 'Context size must be a whole number of tokens.'
-    private static readonly CompactAtInvalid = 'Compact at must be a whole percentage from 10 to 95.'
+    private static readonly CompactAtInvalidFormat = 'Compact at must be a whole percentage from {0} to {1}.'
     private static readonly TemperatureInvalid = 'Temperature must be a number of 0 or more, or blank.'
     private static readonly TopPInvalid = 'Top P must be a number from 0 to 1, or blank.'
     private static readonly CatalogFailedFormat = 'catalog unavailable: {0}'
@@ -401,7 +401,9 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
 
     public get CompactAtError(): string
     {
-        return this.open && TemplateEditorViewModel.ParsePercent(this.compactAtText) === null ? TemplateEditorViewModel.CompactAtInvalid : ''
+        return this.open && TemplateEditorViewModel.ParsePercent(this.compactAtText) === null
+            ? TextFormat.Format(TemplateEditorViewModel.CompactAtInvalidFormat, TemplateEditorViewModel.MinCompactAtPct, TemplateEditorViewModel.MaxCompactAtPct)
+            : ''
     }
 
     public get HasCompactAtError(): boolean
