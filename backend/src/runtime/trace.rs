@@ -841,6 +841,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&a, &b));
         assert_eq!(b.next_turn().unwrap(), 1);
     }
+
     #[tokio::test]
     async fn session_trace_appends_then_notifies_and_finishes() {
         let d = TempDir::new("strace");
@@ -903,6 +904,40 @@ mod tests {
         assert_eq!(turns[0].user.chars().count(), 200);
         assert_eq!((turns[1].steps, turns[1].peak_fill), (0, 0.0));
         assert_eq!(turns[1].reason, "aborted");
+    }
+
+    #[tokio::test]
+    async fn session_trace_totals_add_up_over_steps() {
+        let d = TempDir::new("stotals");
+        let mut trace = d.session_trace();
+        let mut sink = RecordingSink::new();
+        let fills = [
+            (Some(100), Some(1000), 5, 1),
+            (Some(400), Some(1000), 7, 2),
+            (Some(900), None, 11, 3),
+            (Some(900), Some(0), 13, 4),
+            (None, Some(1000), 17, 5),
+            (Some(200), Some(1000), 19, 6),
+        ];
+        for (step, (prompt_tokens, n_ctx, out_tokens, think_tokens)) in
+            fills.into_iter().enumerate()
+        {
+            let mut record = TempDir::step_record(0, step as u32 + 1);
+            record.prompt_tokens = prompt_tokens;
+            record.n_ctx = n_ctx;
+            record.out_tokens = out_tokens;
+            record.think_tokens = think_tokens;
+            trace.step(record, &mut sink).await.unwrap();
+        }
+        trace.finish("answered", true, &mut sink).await.unwrap();
+        let records = TraceLog::read_records(&d.0.join(FILE)).unwrap();
+        let TraceRecord::Turn(turn) = records.last().unwrap() else {
+            panic!("not a turn record: {:?}", records.last());
+        };
+        assert_eq!(turn.steps, 6);
+        assert_eq!(turn.peak_fill, 400.0 / 1000.0);
+        assert_eq!(turn.out_tokens, 5 + 7 + 11 + 13 + 17 + 19);
+        assert_eq!(turn.think_tokens, 1 + 2 + 3 + 4 + 5 + 6);
     }
 
     #[tokio::test]

@@ -698,10 +698,12 @@ mod tests {
         }
     }
 
-    /// A `TurnTrace` that collects every step record.
+    /// A `TurnTrace` that collects every step record; with `close` set, each report then fails
+    /// as if the trace's own notify found the sink closed.
     #[derive(Default)]
     struct RecordingTrace {
         records: Vec<StepRecord>,
+        close: bool,
     }
 
     #[async_trait]
@@ -712,6 +714,9 @@ mod tests {
             _sink: &mut dyn LoopSink,
         ) -> Result<(), SinkClosed> {
             self.records.push(record);
+            if self.close {
+                return Err(SinkClosed);
+            }
             Ok(())
         }
     }
@@ -1605,6 +1610,7 @@ You are terse.<|tool>declaration:echo{";
         assert_eq!(end.steps, 3);
         assert_eq!(*links.steps.lock().unwrap(), [0, 1, 2]);
     }
+
     #[tokio::test]
     async fn each_step_is_traced_with_fill_tokens_and_end() {
         let mut f = Fixture::new();
@@ -1790,6 +1796,46 @@ You are terse.<|tool>declaration:echo{";
         assert_eq!(r[0].end, StepOutcome::Aborted);
         assert_eq!(r[0].tools.len(), 1);
         assert_eq!(r[0].out_tokens, TRACED_OUT_TOKENS);
+    }
+
+    #[tokio::test]
+    async fn sink_closed_in_the_trace_notify_keeps_the_real_end_once() {
+        let mut f = Fixture::new();
+        f.trace.close = true;
+        let link = FakeLink::new(true, vec![Fixture::traced_step("hi", vec![])]);
+        assert_eq!(f.run(Some(link)).await, Err(SinkClosed));
+        let r = &f.trace.records;
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].end, StepOutcome::Answered);
+        assert!(!f.sink.methods().contains(&"loop_done"));
+        assert!(f.transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sink_closed_at_loop_done_keeps_the_real_end_once() {
+        let mut f = Fixture::new();
+        // started, two chunks and done are accepted; loop_done is refused.
+        f.sink = RecordingSink::closing_after(4);
+        let link = FakeLink::new(true, vec![Fixture::traced_step("hi", vec![])]);
+        assert_eq!(f.run(Some(link)).await, Err(SinkClosed));
+        let r = &f.trace.records;
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].end, StepOutcome::Answered);
+        assert!(f.transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sink_closed_at_closing_turn_error_keeps_the_real_end_once() {
+        let mut f = Fixture::new();
+        // The synthesized turn_error is the first note, and it is refused.
+        f.sink = RecordingSink::closing_after(0);
+        let links = StepLinks::new(vec![Err("boom".into())]);
+        assert_eq!(f.run_with(&links).await, Err(SinkClosed));
+        let r = &f.trace.records;
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].end, StepOutcome::Error);
+        assert_eq!(r[0].error.as_deref(), Some("boom"));
+        assert!(f.sink.notes.is_empty());
     }
 
     #[tokio::test]
