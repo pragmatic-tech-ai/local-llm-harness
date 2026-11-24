@@ -1,6 +1,6 @@
 # Agent trace in the instrument panel
 
-**Status:** approved 2026-11-24 (owner "go"); implemented on feat/agent-trace
+**Status:** approved 2026-11-24; shipped and live-proven on the hive 2026-11-24 (main @748acc3e). Protocol proof: candle and llamacpp turns counted tokens, load_ms appeared only on the loading step (8.1 s, 10.0 s), a thinking turn recorded 176 of 193 tokens as thinking, a forced read_file step recorded ok 8 ms 88 B, and get_trace paged the turns back. The owner confirmed the Trace panel.
 **Roadmap:** step 2 (`docs/roadmap.md`)
 **Builds on:** `docs/specs/2026-11-23-agent-templates-sessions-design.md` (sessions, the
 runtime on :8779, the dispatcher)

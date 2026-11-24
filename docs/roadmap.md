@@ -21,7 +21,7 @@ policy seam stays, unused.
    its transcript; the **Sessions** capability lists and opens sessions. The dispatcher
    loads a session's model on an explicit Load or on its first message, through the
    supervisor. Everything below hangs off this.
-2. **Agent trace in the instrument panel.** Per step: context fill, tokens, tool latency,
+2. **Agent trace in the instrument panel.** *Shipped 2026-11-24* (`docs/specs/2026-11-24-agent-trace-design.md`). Per step: context fill, tokens, tool latency,
    and why the loop stopped. This makes every later capability measurable on the small
    model.
 3. **Memory and context.** Conversations survive reconnects, supervisor restarts and model
