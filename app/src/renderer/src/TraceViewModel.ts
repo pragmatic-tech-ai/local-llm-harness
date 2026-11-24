@@ -185,7 +185,7 @@ export class TraceStepViewModel extends Observable
 
     public get HasCompaction(): boolean
     {
-        return this.CompactionText.length > 0
+        return this.record.compaction !== undefined && this.record.compaction !== null
     }
 
     /** One row per tool the step ran, in run order. */

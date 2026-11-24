@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { RuntimeClient } from './RuntimeClient'
 import { FakeSocket } from './FakeSocket'
-import { TraceViewModel, type TraceTurnViewModel } from './TraceViewModel'
-import { TraceStepViewModel } from './TraceViewModel'
+import { TraceStepViewModel, TraceViewModel, type TraceTurnViewModel } from './TraceViewModel'
 import type { CompactionRecord, StepRecord, TracePage, TraceTurn, TurnRecord } from './agents'
 
 class Rig
@@ -396,6 +395,10 @@ describe('TraceViewModel', () =>
         expect(text({ strategy: 'summarize', fallback: true, summary_error: 'worker busy' }))
             .toBe('⟲ summarize failed → trim: 7 420 → 5 980 tokens · 3 results elided · 0 turns dropped  (worker busy)')
         expect(new TraceStepViewModel(Rig.Step(1, 1, { compaction: { ...base } })).HasCompaction).toBe(true)
+        // A trim record ignores `fallback` (only a summarize record falls back), and a reused summary has no time to show.
+        expect(text({ fallback: true, summary_error: 'ignored' })).toBe(text({}))
+        expect(text({ strategy: 'summarize', reused_summary: true, summary_ms: null, summarized_messages: 14 }))
+            .toBe('⟲ summarize (reused): 7 420 → 5 980 tokens · covers 14 messages')
     })
 
     it('step_without_compaction_has_no_line', () =>

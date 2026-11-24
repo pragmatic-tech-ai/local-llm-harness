@@ -1,6 +1,6 @@
 // Template editor (host area): Save / Revert over the template's fields: name, system prompt, step budget, runtime
-// and model (from the catalog, models filtered by the runtime), context size, context strategy and compact-at percent, thinking, sampling defaults (blank =
-// none), preferred host and the tool checkboxes. A field that does not parse shows its error under it and disables
+// and model (from the catalog, models filtered by the runtime), context size, context strategy and compact-at
+// percent, thinking, sampling defaults (blank = none), preferred host and the tool checkboxes. A field that does not parse shows its error under it and disables
 // Save; load and save errors show above the form, and a catalog failure in a banner that stays until a retry works.
 // The form is read-only while the template loads. Merged app-global by app.mu.
 import TemplateEditorViewModel from "../TemplateEditorViewModel.js"
