@@ -63,6 +63,53 @@ pub struct StepRecord {
     pub end: StepOutcome,
     pub tools: Vec<ToolTiming>,
     pub error: Option<String>,
+    /// Present only on steps where compaction ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionRecord>,
+}
+
+/// What compaction did to one step's prompt. Token fields are measured prompt sizes; the
+/// other `u32` fields are counts. All saturate at `u32::MAX`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CompactionRecord {
+    pub strategy: String,
+    pub before_tokens: u32,
+    pub after_tokens: u32,
+    pub elided_results: u32,
+    pub dropped_turns: u32,
+    pub summarized_messages: u32,
+    pub summary_ms: Option<u64>,
+    pub reused_summary: bool,
+    pub fallback: bool,
+    pub summary_prompt_tokens: Option<u32>,
+    pub summary_out_tokens: Option<u32>,
+    pub summary_error: Option<String>,
+}
+
+impl CompactionRecord {
+    /// A record for `strategy` that measured `before` tokens and sent `after`, with every
+    /// count zero and every summary field empty.
+    pub fn new(strategy: &str, before: usize, after: usize) -> Self {
+        Self {
+            strategy: strategy.to_string(),
+            before_tokens: Self::count(before),
+            after_tokens: Self::count(after),
+            elided_results: 0,
+            dropped_turns: 0,
+            summarized_messages: 0,
+            summary_ms: None,
+            reused_summary: false,
+            fallback: false,
+            summary_prompt_tokens: None,
+            summary_out_tokens: None,
+            summary_error: None,
+        }
+    }
+
+    /// `n` as a record count, saturating at `u32::MAX`.
+    pub fn count(n: usize) -> u32 {
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
 }
 
 /// One per turn, written after the loop is done.
@@ -658,6 +705,7 @@ mod tests {
                     bytes: 26,
                 }],
                 error: None,
+                compaction: None,
             }
         }
 
@@ -724,6 +772,40 @@ mod tests {
         assert_eq!(page.turns[0].steps, vec![TempDir::step_record(1, 1)]);
         assert_eq!(page.turns[0].summary, Some(TempDir::turn_record(1)));
         assert!(page.reset_pending);
+    }
+
+    #[test]
+    fn step_record_without_compaction_has_no_field_and_old_lines_parse() {
+        let plain = TempDir::step(1, 1);
+        let line = plain.line_value();
+        assert!(line.get("compaction").is_none(), "{line}");
+        // A line written before the field existed parses with `compaction: None`.
+        let old = serde_json::to_string(&line).unwrap();
+        assert!(!old.contains("compaction"), "{old}");
+        assert_eq!(serde_json::from_str::<TraceRecord>(&old).unwrap(), plain);
+
+        let mut record = TempDir::step_record(1, 2);
+        let mut compaction = CompactionRecord::new("trim", 7420, 5980);
+        compaction.elided_results = 3;
+        record.compaction = Some(compaction);
+        let with = TraceRecord::Step(record);
+        let value = with.line_value();
+        assert_eq!(value["compaction"]["strategy"], "trim");
+        assert_eq!(value["compaction"]["before_tokens"], 7420);
+        assert_eq!(value["compaction"]["after_tokens"], 5980);
+        assert_eq!(value["compaction"]["elided_results"], 3);
+        assert_eq!(value["compaction"]["summary_ms"], Value::Null);
+        assert_eq!(value["compaction"]["summary_error"], Value::Null);
+        let text = serde_json::to_string(&value).unwrap();
+        assert_eq!(serde_json::from_str::<TraceRecord>(&text).unwrap(), with);
+    }
+
+    #[test]
+    fn compaction_record_counts_saturate() {
+        let record = CompactionRecord::new("trim", usize::MAX, 5);
+        assert_eq!(record.before_tokens, u32::MAX);
+        assert_eq!(record.after_tokens, 5);
+        assert_eq!(CompactionRecord::count(usize::MAX), u32::MAX);
     }
 
     #[test]

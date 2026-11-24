@@ -234,6 +234,7 @@ impl StepMeter {
             end,
             tools: self.tools,
             error,
+            compaction: None,
         }
     }
 
