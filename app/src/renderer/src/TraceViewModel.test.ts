@@ -54,9 +54,9 @@ class Rig
         this.client.HandleFrame(JSON.stringify({ method, params }))
     }
 
-    public async Show(id: string, page: TracePage): Promise<void>
+    public async Show(id: string, page: TracePage, busy = false): Promise<void>
     {
-        const done = this.trace.ShowSession(this.client, id)
+        const done = this.trace.ShowSession(this.client, id, busy)
         await this.Respond('get_trace', page)
         await done
     }
@@ -208,6 +208,57 @@ describe('TraceViewModel', () =>
         expect(rig.Turn(0).HeaderText).toBe('Turn 5 · running…')
         // Re-shown (reconnect): the same turn, from the page only, is incomplete again.
         await rig.Show('s1', { turns: [Rig.Turn(5, { summary: null })], more: false, reset_pending: false })
+        expect(rig.Headers()).toEqual(['Turn 5 · incomplete'])
+    })
+
+    it('busy_session_shows_its_newest_unfinished_turn_as_running', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show('s1', { turns: [Rig.Turn(5, { summary: null }), Rig.Turn(4)], more: false, reset_pending: false }, true)
+        expect(rig.Turn(0).HeaderText).toBe('Turn 5 · running…')
+        expect(rig.Turn(1).HeaderText).toBe('Turn 4 · answered · 1 steps · 21.4 s · peak 41%')
+        // Busy ends without a trace_turn: the turn never finished.
+        rig.Notify('session_busy', { id: 's1', busy: false })
+        expect(rig.Headers()[0]).toBe('Turn 5 · incomplete')
+    })
+
+    it('busy_ending_after_the_summary_keeps_the_summary', async () =>
+    {
+        const rig = new Rig()
+        await rig.Show('s1', { turns: [Rig.Turn(5, { summary: null })], more: false, reset_pending: false }, true)
+        rig.Notify('trace_turn', { id: 's1', record: Rig.Summary(5) })
+        rig.Notify('session_busy', { id: 's1', busy: false })
+        expect(rig.Headers()).toEqual(['Turn 5 · answered · 2 steps · 21.4 s · peak 41%'])
+    })
+
+    it('busy_session_with_a_finished_newest_turn_marks_nothing_running', async () =>
+    {
+        const rig = new Rig()
+        // The running turn has no record yet; an older crash-cut turn stays incomplete.
+        await rig.Show('s1', { turns: [Rig.Turn(6), Rig.Turn(5, { summary: null })], more: false, reset_pending: false }, true)
+        expect(rig.Turn(1).HeaderText).toBe('Turn 5 · incomplete')
+    })
+
+    it('session_busy_notes_set_and_clear_the_running_turn', async () =>
+    {
+        const rig = new Rig()
+        const page: TracePage = { turns: [Rig.Turn(5, { summary: null })], more: false, reset_pending: false }
+        // Busy arrives while the page is in flight; another session's note changes nothing.
+        const done = rig.trace.ShowSession(rig.client, 's1')
+        rig.Notify('session_busy', { id: 's1', busy: true })
+        rig.Notify('session_busy', { id: 's2', busy: false })
+        await rig.Respond('get_trace', page)
+        await done
+        expect(rig.Headers()).toEqual(['Turn 5 · running…'])
+        rig.Notify('session_busy', { id: 's2', busy: false })
+        expect(rig.Headers()).toEqual(['Turn 5 · running…'])
+        // Busy already over when the page lands: nothing is running.
+        await rig.Show('s1', page, true)
+        rig.Notify('session_busy', { id: 's1', busy: false })
+        const late = rig.trace.ShowSession(rig.client, 's1', true)
+        rig.Notify('session_busy', { id: 's1', busy: false })
+        await rig.Respond('get_trace', page)
+        await late
         expect(rig.Headers()).toEqual(['Turn 5 · incomplete'])
     })
 

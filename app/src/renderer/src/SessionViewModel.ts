@@ -232,8 +232,9 @@ export class SessionViewModel extends Observable
         this.Chat.Bind(this.client)
         this.Chat.LoadHistory(attached.transcript)
         this.Panel.ApplySession(attached.sampling, attached.enable_thinking)
-        // Attach, switch and re-attach after a reconnect all reload the trace's first page.
-        void this.Trace.ShowSession(this.client, id)
+        // Attach, switch and re-attach after a reconnect all reload the trace's first page; a busy session's newest
+        // unfinished turn shows as running.
+        void this.Trace.ShowSession(this.client, id, attached.summary.busy)
     }
 
     /**

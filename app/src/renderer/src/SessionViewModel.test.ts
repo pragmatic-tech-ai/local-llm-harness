@@ -240,4 +240,17 @@ describe('SessionViewModel', () =>
         rig.view.Clear()
         expect(rig.view.Trace.Turns.Count).toBe(0)
     })
+
+    it('attach_to_a_busy_session_shows_its_unfinished_turn_running', async () =>
+    {
+        const rig = new Rig()
+        const attached = Rig.Attached({ state: PlacementState.Ready, host: 'local' })
+        const done = rig.view.Attach('s1')
+        await rig.Respond('attach_session', { ...attached, summary: { ...attached.summary, busy: true } })
+        await done
+        await rig.Respond('get_trace', { turns: [{ turn: 3, steps: [], summary: null, reset_before: false }], more: false, reset_pending: false })
+        expect(rig.view.Trace.Turns.Get(0)!.HeaderText).toBe('Turn 3 · running…')
+        rig.Notify('session_busy', { id: 's1', busy: false })
+        expect(rig.view.Trace.Turns.Get(0)!.HeaderText).toBe('Turn 3 · incomplete')
+    })
 })

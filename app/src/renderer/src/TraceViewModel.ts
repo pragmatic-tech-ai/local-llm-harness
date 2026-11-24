@@ -282,12 +282,27 @@ export class TraceTurnViewModel extends Observable
         }
     }
 
-    /** A live step arrived for this turn: it runs until its summary arrives. */
+    /** The turn's summary is known (paged or live). */
+    public get HasSummary(): boolean
+    {
+        return this.summary !== null
+    }
+
+    /** A live step arrived for this turn, or its session is busy with it: it runs until its summary arrives. */
     public MarkLive(): void
     {
         if (!this.live)
         {
             this.UpdateHeader(() => { this.live = true })
+        }
+    }
+
+    /** The session stopped being busy: a live turn whose summary never came is incomplete. */
+    public EndLive(): void
+    {
+        if (this.live && this.summary === null)
+        {
+            this.UpdateHeader(() => { this.live = false })
         }
     }
 
@@ -376,6 +391,8 @@ export class TraceViewModel extends Observable
     private noteWarning = ''
     /** The last failed page load: cleared by the next successful page and by every ShowSession. */
     private pageError = ''
+    /** The shown session is running a turn (from the attach reply, then `session_busy`). */
+    private busy = false
 
     constructor()
     {
@@ -418,9 +435,10 @@ export class TraceViewModel extends Observable
      * Shows a session's trace (null to show none): clears the list, follows that session's live records and loads the
      * first page. Called on attach, on switch and after reconnect. A `trace_warning` is kept across a same-session
      * reload until its page loads; a page failure is always dropped (the reload retries it). A successful page clears
-     * both.
+     * both. When the session is `busy` (and still is once the page loads), its newest summary-less turn is the one
+     * running; when busy ends without that turn's summary, the turn is incomplete.
      */
-    public async ShowSession(client: RuntimeClient | null, id: string | null): Promise<void>
+    public async ShowSession(client: RuntimeClient | null, id: string | null, busy = false): Promise<void>
     {
         const token = ++this.token
         this.UpdateWarning(() =>
@@ -434,6 +452,7 @@ export class TraceViewModel extends Observable
         this.Unsubscribe()
         this.client = client
         this.id = id
+        this.busy = busy
         this.Turns.Clear()
         this.oldestPaged = null
         this.loadingOlder = false
@@ -465,6 +484,13 @@ export class TraceViewModel extends Observable
                     this.UpdateWarning(() => { this.noteWarning = n.message })
                 }
             }),
+            client.OnSessionBusy.Subscribe(n =>
+            {
+                if (n.id === this.id)
+                {
+                    this.SetBusy(n.busy)
+                }
+            }),
         ]
         let page: TracePage
         try
@@ -484,6 +510,10 @@ export class TraceViewModel extends Observable
             return
         }
         this.ApplyPage(page)
+        if (this.busy)
+        {
+            this.MarkNewestRunning()
+        }
         // Only the first page reports a reset after the newest turn. A live turn shown already came after it.
         if (page.reset_pending)
         {
@@ -580,6 +610,29 @@ export class TraceViewModel extends Observable
         }
         row.MarkLive()
         row.ApplyStep(record, true)
+    }
+
+    /** The session is busy: its newest turn, when it has no summary yet, is the one running. */
+    private MarkNewestRunning(): void
+    {
+        const newest = this.Turns.Count > 0 ? this.Turns.Get(0)! : null
+        if (newest !== null && !newest.HasSummary)
+        {
+            newest.MarkLive()
+        }
+    }
+
+    /** Busy ended: every turn still running without a summary is incomplete. */
+    private SetBusy(busy: boolean): void
+    {
+        this.busy = busy
+        if (!busy)
+        {
+            for (const t of this.Turns)
+            {
+                t.EndLive()
+            }
+        }
     }
 
     /** The oldest shown turn newer than every paged turn (a live one, so it came after the page's pending reset). */
