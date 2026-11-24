@@ -51,10 +51,10 @@ resources TracePanelResources {
 
     // A tool sub-row of a step.
     DataTemplate [ DataType = TraceToolViewModel ] {
-        StackPanel [ Orientation = Horizontal ] {
+        StackPanel [ Orientation = Vertical ] {
             TextBlock [ Text = $Text, Style = @BodySm, FontFamily = "Consolas" ]
             TextBlock [ Text = $RepeatText, Style = @BodySm, Foreground = @StateDanger, FontFamily = "Consolas",
-                        Margin = (8,0,0,0), Visibility = $HasRepeat << ToVisibility ]
+                        Margin = (16,0,0,0), Visibility = $HasRepeat << ToVisibility ]
         }
     }
 

@@ -22,6 +22,8 @@ export class ChatViewModel extends Observable
     private static readonly SendFailedFormat = '\n[send failed: {0}]'
     private static readonly LoadingNote = '[loading model…]'
     private static readonly ErrorKey = 'error'
+    private static readonly HintKey = 'hint'
+    private static readonly ErrorResultKeys: readonly string[] = [ChatViewModel.ErrorKey, ChatViewModel.HintKey]
     private static readonly NotKeptFormat = '[not kept: {0}]'
     private static readonly ParseErrorFormat = '{0}  [parse error: {1}]'
     private static readonly AnsweredReason = 'answered'
@@ -347,7 +349,7 @@ export class ChatViewModel extends Observable
         return items
     }
 
-    /** A failed tool's committed result is the runtime's `{error: msg}` object. */
+    /** A failed tool's committed result is the runtime's `{error: msg}` object, plus `hint` on a repeated failure. */
     private static IsErrorResult(result: unknown): boolean
     {
         if (typeof result !== 'object' || result === null || Array.isArray(result))
@@ -355,7 +357,7 @@ export class ChatViewModel extends Observable
             return false
         }
         const keys = Object.keys(result)
-        return keys.length === 1 && keys[0] === ChatViewModel.ErrorKey
+        return keys.includes(ChatViewModel.ErrorKey) && keys.every(k => ChatViewModel.ErrorResultKeys.includes(k))
     }
 
     /** A call whose arguments did not parse shows the raw text plus the parse error. */

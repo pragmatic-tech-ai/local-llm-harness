@@ -409,6 +409,18 @@ describe('ChatViewModel', () =>
         expect((items[5] as AssistantMessage).Text).toBe('It says hi.')
     })
 
+    it('history_shows_a_hinted_repeat_failure_as_failed', () =>
+    {
+        const rig = new Rig(true)
+        rig.vm.LoadHistory([
+            { role: 'user', content: 'read it twice' },
+            { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: { path: 'm.txt' } } }] },
+            { role: 'tool', content: '', tool_call_id: 'c1', tool_result: { error: 'no such path: m.txt', hint: 'This call already failed twice; try something different.' } },
+        ])
+        const result = rig.vm.Transcript.ToArray()[2] as ToolResultMessage
+        expect([result.Name, result.Ok]).toEqual(['read_file', false])
+    })
+
     it('history_replaces_the_transcript', () =>
     {
         const rig = new Rig(true)
