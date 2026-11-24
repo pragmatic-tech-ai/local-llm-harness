@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use super::notes::{NoteAddTool, NoteClearTool, NoteListTool};
 use super::tool::{Tool, ToolContext, ToolOutcome, ToolSource, ToolSpec};
 use super::workspace::Workspace;
 
@@ -767,7 +768,7 @@ impl Tool for DeletePathTool {
     }
 }
 
-/// Built-in tools: `get_time` always; the file tools only with a sandbox.
+/// Built-in tools: `get_time` and the note tools always; the file tools only with a sandbox.
 pub struct BuiltinSource {
     sandbox: Option<Sandbox>,
 }
@@ -800,6 +801,9 @@ impl ToolSource for BuiltinSource {
             }));
             tools.push(Arc::new(DeletePathTool { sandbox }));
         }
+        tools.push(Arc::new(NoteAddTool));
+        tools.push(Arc::new(NoteListTool));
+        tools.push(Arc::new(NoteClearTool));
         tools
     }
 }
@@ -1274,13 +1278,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn source_without_sandbox_has_only_get_time() {
+    fn source_without_sandbox_has_time_and_notes() {
         let names: Vec<String> = BuiltinSource::new(None)
             .tools()
             .iter()
             .map(|t| t.spec().name)
             .collect();
-        assert_eq!(names, ["get_time"]);
+        assert_eq!(names, ["get_time", "note_add", "note_list", "note_clear"]);
         let dir = TestDir::new();
         let specs: Vec<ToolSpec> = BuiltinSource::new(Some(dir.sandbox()))
             .tools()
@@ -1297,7 +1301,10 @@ pub(crate) mod tests {
                 "write_file",
                 "append_file",
                 "make_dir",
-                "delete_path"
+                "delete_path",
+                "note_add",
+                "note_list",
+                "note_clear"
             ]
         );
         let writers: Vec<&str> = specs

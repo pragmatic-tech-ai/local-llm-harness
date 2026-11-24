@@ -3,6 +3,7 @@ pub mod catalog_source;
 pub mod compaction;
 pub mod executor;
 pub mod hub;
+pub mod notes;
 pub mod policy;
 pub mod registry;
 pub mod server;
