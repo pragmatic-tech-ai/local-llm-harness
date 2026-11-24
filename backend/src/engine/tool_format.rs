@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
+use std::borrow::Cow;
 
 use super::template::OpenChannel;
 
@@ -66,25 +67,27 @@ pub struct GemmaThinkCounter {
     inside: bool,
     think: usize,
     carry: String,
+    open_marker: String,
 }
 
 impl GemmaThinkCounter {
-    const THINK_OPEN: &'static str = "<|channel>thought";
+    const THOUGHT: &'static str = "thought";
     const CHANNEL_CLOSE: &'static str = "<channel|>";
+    /// Bytes of tail kept between chunks: one short of the longest marker.
+    const CARRY_LEN: usize = OpenChannel::OPEN.len() + Self::THOUGHT.len() - 1;
 
     /// Starts inside a thinking channel when `prompt` ends with the `thought` opener.
     pub fn new(prompt: &str) -> Self {
-        let inside = OpenChannel::at_tail(prompt)
-            .map_or(false, |opener| opener.trim_end() == Self::THINK_OPEN);
+        let open_marker = format!("{}{}", OpenChannel::OPEN, Self::THOUGHT);
+        let inside =
+            OpenChannel::at_tail(prompt).is_some_and(|opener| opener.trim_end() == open_marker);
         Self {
             inside,
             think: 0,
             carry: String::new(),
+            open_marker,
         }
     }
-
-    /// Bytes of tail kept between chunks: one short of the longest marker.
-    const CARRY_LEN: usize = Self::THINK_OPEN.len() - 1;
 }
 
 impl ThinkCounter for GemmaThinkCounter {
@@ -93,9 +96,16 @@ impl ThinkCounter for GemmaThinkCounter {
             self.think += tokens;
         }
         let carried = self.carry.len();
-        let window = format!("{}{}", self.carry, text);
+        let window: Cow<str> = if carried == 0 {
+            Cow::Borrowed(text)
+        } else {
+            Cow::Owned(format!("{}{}", self.carry, text))
+        };
         let mut markers: Vec<(usize, bool)> = Vec::new();
-        for (marker, opens) in [(Self::THINK_OPEN, true), (Self::CHANNEL_CLOSE, false)] {
+        for (marker, opens) in [
+            (self.open_marker.as_str(), true),
+            (Self::CHANNEL_CLOSE, false),
+        ] {
             for (at, _) in window.match_indices(marker) {
                 // Markers wholly inside the carry were already applied.
                 if at + marker.len() > carried {
@@ -111,7 +121,8 @@ impl ThinkCounter for GemmaThinkCounter {
         while !window.is_char_boundary(start) {
             start += 1;
         }
-        self.carry = window[start..].to_string();
+        self.carry.clear();
+        self.carry.push_str(&window[start..]);
     }
 
     fn think_tokens(&self) -> usize {
@@ -123,11 +134,11 @@ impl ThinkCounter for GemmaThinkCounter {
 pub struct ThinkCounters;
 
 impl ThinkCounters {
-    /// A Gemma counter when the prompt carries Gemma 4 turn/channel syntax, else a no-op one.
+    /// A Gemma counter when the prompt ends with the Gemma 4 generation prompt (the model
+    /// turn opener, optionally followed by a channel opener, or a bare open channel after a
+    /// tool response), else a no-op one. Turn markers elsewhere in the prompt are user text.
     pub fn for_prompt(prompt: &str) -> Box<dyn ThinkCounter> {
-        if prompt.contains(GemmaToolFormat::TURN_OPEN)
-            || prompt.contains(GemmaToolFormat::CHANNEL_OPEN)
-        {
+        if GemmaToolFormat::ends_with_generation_prompt(prompt) {
             GemmaToolFormat.think_counter(prompt)
         } else {
             Box::new(NoThinkCounter)
@@ -218,8 +229,18 @@ impl GemmaToolFormat {
     const CALL_OPEN: &'static str = "<|tool_call>";
     const CALL_CLOSE: &'static str = "<tool_call|>";
     const RESPONSE_OPEN: &'static str = "<|tool_response>";
-    const TURN_OPEN: &'static str = "<|turn>";
-    const CHANNEL_OPEN: &'static str = "<|channel>";
+    const MODEL_TURN: &'static str = "<|turn>model
+";
+    const EMPTY_THOUGHT_TAIL: &'static str = "<|channel>thought
+<channel|>";
+
+    /// True iff `prompt` ends with a Gemma 4 generation prompt.
+    fn ends_with_generation_prompt(prompt: &str) -> bool {
+        let head = prompt
+            .strip_suffix(Self::EMPTY_THOUGHT_TAIL)
+            .unwrap_or(prompt);
+        head.ends_with(Self::MODEL_TURN) || OpenChannel::at_tail(prompt).is_some()
+    }
     const QUOTE: &'static str = "<|\"|>";
     const CALL_PREFIX: &'static str = "call:";
     const MAX_DEPTH: usize = 64;
@@ -1140,6 +1161,71 @@ mod tests {
         counter.push("<|channel>thought\nhmm", 4);
         counter.push("more", 4);
         assert_eq!(counter.think_tokens(), 0);
+    }
+
+    #[test]
+    fn for_prompt_ignores_turn_marker_in_user_text() {
+        let mut counter =
+            ThinkCounters::for_prompt("<start>user\nwhat is <|turn> ?<end><start>assistant\n");
+        counter.push("<|channel>thought\nhmm<channel|>", 4);
+        counter.push("more", 4);
+        assert_eq!(counter.think_tokens(), 0);
+    }
+
+    #[test]
+    fn for_prompt_accepts_every_gemma_generation_tail() {
+        for prompt in [
+            "<|turn>model\n",
+            "<|turn>model\n<|channel>thought\n<channel|>",
+            "x<|tool_response>y<tool_response|><|channel>thought\n",
+        ] {
+            let mut counter = ThinkCounters::for_prompt(prompt);
+            counter.push("<|channel>thought\n", 1);
+            counter.push("a", 2);
+            assert!(counter.think_tokens() >= 2, "{prompt}");
+        }
+    }
+
+    #[test]
+    fn closer_wholly_inside_carry_is_not_applied_twice() {
+        // "<channel|>" ends the channel; the next chunk re-enters via an opener that is
+        // completed later. A closer left in the carry must not close it again.
+        let chunks = [
+            ("<|channel>thought\n", 1),
+            ("<channel|>", 1),
+            ("<|channel>thought", 1),
+            ("\nx", 3),
+            ("y", 5),
+        ];
+        assert_eq!(
+            CounterFeed::run(CounterFeed::MODEL_TURN, &chunks),
+            1 + 3 + 5
+        );
+    }
+
+    #[test]
+    fn multibyte_carry_is_trimmed_to_a_char_boundary() {
+        let chunks = [
+            ("<|channel>thought\n", 1),
+            ("ééééééééééééééé", 1),
+            ("<channel|>", 2),
+            ("z", 9),
+        ];
+        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 1 + 2);
+    }
+
+    #[test]
+    fn several_markers_in_one_chunk_apply_in_order() {
+        let open_close_open = "<|channel>thought\n<channel|><|channel>thought\n";
+        let chunks = [(open_close_open, 1), ("a", 4)];
+        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 4);
+        let open_close = "<|channel>thought
+<channel|>";
+        let chunks = [(open_close, 1), ("a", 4)];
+        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 0);
+        let close_open_close = "<channel|><|channel>thought\n<channel|>";
+        let chunks = [("<|channel>thought\n", 1), (close_open_close, 2), ("a", 4)];
+        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 2);
     }
 
     #[test]

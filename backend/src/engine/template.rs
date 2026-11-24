@@ -73,7 +73,7 @@ impl ChatTemplate {
 pub struct OpenChannel;
 
 impl OpenChannel {
-    const OPEN: &'static str = "<|channel>";
+    pub const OPEN: &'static str = "<|channel>";
     const NAME_END: char = '\n';
 
     /// The opener text when `prompt` ends with exactly `<|channel>` + a channel name
