@@ -74,6 +74,7 @@ pub use super::catalog_source::{CatalogSource, CatalogView};
 use super::compaction::{Compactor, SummarySink};
 use super::hub::{ConnId, Hub};
 use super::registry::ToolRegistry;
+use super::tool::ToolScope;
 use super::tool_loop::{
     LinkFailure, LoopSink, SinkClosed, StepLink, ToolLoop, TurnConfig, TurnLinks,
 };
@@ -298,6 +299,7 @@ impl SessionView {
             tools: rec.snapshot.tools.clone(),
             enable_thinking: Self::thinking(rec),
             sampling: Self::sampling(rec),
+            scope: ToolScope::default(),
         }
     }
 
@@ -1805,6 +1807,7 @@ mod tests {
             tools: rec.snapshot.tools.clone(),
             enable_thinking: false,
             sampling: SamplingConfig::default(),
+            scope: ToolScope::default(),
         };
         let mut sink = crate::runtime::test_support::RecordingSink::new();
         let (end, transcript) = rt

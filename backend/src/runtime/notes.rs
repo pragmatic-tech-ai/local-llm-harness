@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::tool::{SessionHandle, Tool, ToolContext, ToolOutcome, ToolSpec};
+use crate::engine::{ChatMessage, Role};
 
 /// Limits and messages shared by the note tools.
 struct NoteRules;
@@ -155,6 +156,8 @@ pub struct NotesBlock;
 
 impl NotesBlock {
     pub const HEADER: &'static str = "[Your notes]";
+    /// What separates the system content (and any summary note) from the block.
+    const SEPARATOR: &'static str = "\n\n";
 
     /// None when there are no notes.
     pub fn text(notes: &[String]) -> Option<String> {
@@ -166,6 +169,28 @@ impl NotesBlock {
             out.push_str(&format!("\n{}. {note}", i + 1));
         }
         Some(out)
+    }
+
+    /// `messages` as the model sees them with `block`: the block after the system message's
+    /// content and a blank line (the block alone when that content is empty), or a system
+    /// message holding just the block put first when there is none. With no block the
+    /// messages come back as they are. Only the model's copy changes, never a transcript.
+    pub fn attach(messages: &[ChatMessage], block: Option<&str>) -> Vec<ChatMessage> {
+        let mut out = messages.to_vec();
+        let Some(block) = block else {
+            return out;
+        };
+        match out.first_mut() {
+            Some(system) if system.role == Role::System => {
+                system.content = if system.content.is_empty() {
+                    block.to_string()
+                } else {
+                    format!("{}{}{block}", system.content, Self::SEPARATOR)
+                };
+            }
+            _ => out.insert(0, ChatMessage::new(Role::System, block)),
+        }
+        out
     }
 }
 
@@ -337,5 +362,33 @@ mod tests {
             Some("[Your notes]\n1. a\n2. b".into())
         );
         assert_eq!(NotesBlock::text(&[]), None);
+    }
+
+    #[test]
+    fn block_attaches_to_the_system_message_or_comes_first() {
+        let block = "[Your notes]\n1. a";
+        let user = ChatMessage::new(Role::User, "q");
+        let system = ChatMessage::new(Role::System, "sys");
+        let empty = ChatMessage::new(Role::System, "");
+        assert_eq!(
+            NotesBlock::attach(&[system.clone(), user.clone()], Some(block)),
+            vec![
+                ChatMessage::new(Role::System, "sys\n\n[Your notes]\n1. a"),
+                user.clone()
+            ]
+        );
+        assert_eq!(
+            NotesBlock::attach(&[empty, user.clone()], Some(block)),
+            vec![ChatMessage::new(Role::System, block), user.clone()]
+        );
+        assert_eq!(
+            NotesBlock::attach(std::slice::from_ref(&user), Some(block)),
+            vec![ChatMessage::new(Role::System, block), user.clone()]
+        );
+        assert_eq!(NotesBlock::attach(&[], Some(block)).len(), 1);
+        assert_eq!(
+            NotesBlock::attach(&[system.clone(), user.clone()], None),
+            vec![system, user]
+        );
     }
 }

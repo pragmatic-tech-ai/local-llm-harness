@@ -7,6 +7,11 @@
 //! measures the prompt through the step's worker link and runs the session's strategy only
 //! when the prompt is over budget. The loop sends what it returns and puts the record on the
 //! step's trace record; the transcript the loop commits is never compacted.
+//!
+//! The session's notes block rides on the system message of every prompt the `Compactor`
+//! returns, after any summary note, and is part of every step measure. It is applied as a
+//! last transform on the outgoing copy only: the strategies, their indexes and a saved
+//! summary's `covers` all work on the un-noted transcript.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +20,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
+use super::notes::NotesBlock;
 use super::tool_loop::ToolLoop;
 use super::trace::{CompactionRecord, ToolTiming};
 use super::worker::{GenerateRequest, LinkError, PromptSize, WorkerLink};
@@ -1012,6 +1018,13 @@ impl Compactor {
     /// record. A summary saved through the sink is also kept here, even when a later measure
     /// of the same step fails. Summary calls are measured on their own, with no tools and
     /// thinking off.
+    ///
+    /// `notes` is the session's notes block ([`NotesBlock::text`]). Every prompt returned, on
+    /// every path above, carries it on the system message (see [`NotesBlock::attach`]), and
+    /// every measure of a step prompt includes it; summary calls never see it. The strategies
+    /// still work on the un-noted `messages`, so a saved summary's `covers` keeps indexing
+    /// the stored transcript, and the transcript itself never holds the block.
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare(
         &mut self,
         messages: &[ChatMessage],
@@ -1019,16 +1032,49 @@ impl Compactor {
         tools: &[Value],
         enable_thinking: bool,
         max_tokens: i32,
+        notes: Option<&str>,
+        link: &dyn WorkerLink,
+    ) -> Compacted {
+        let mut out = self
+            .compact(
+                messages,
+                current_turn_start,
+                tools,
+                enable_thinking,
+                max_tokens,
+                notes,
+                link,
+            )
+            .await;
+        out.messages = NotesBlock::attach(&out.messages, notes);
+        out
+    }
+
+    /// [`Self::prepare`] before the notes block goes on the returned messages; its measures
+    /// already include the block.
+    #[allow(clippy::too_many_arguments)]
+    async fn compact(
+        &mut self,
+        messages: &[ChatMessage],
+        current_turn_start: usize,
+        tools: &[Value],
+        enable_thinking: bool,
+        max_tokens: i32,
+        notes: Option<&str>,
         link: &dyn WorkerLink,
     ) -> Compacted {
         if self.strategy == ContextStrategy::Off {
             return Self::unchanged(messages);
         }
-        let measure = LinkMeasure {
+        let link_measure = LinkMeasure {
             link,
             tools,
             enable_thinking,
             sampling: &self.sampling,
+        };
+        let measure = NotedMeasure {
+            inner: &link_measure,
+            notes,
         };
         let size = match measure.measure(messages).await {
             Ok(size) => size,
@@ -1150,6 +1196,20 @@ impl PromptMeasure for LinkMeasure<'_> {
             sampling: self.sampling.clone(),
         };
         self.link.measure_prompt(&req).await.map_err(|e| e.0)
+    }
+}
+
+/// Measures a step prompt as it will be sent: with the notes block on its system message.
+struct NotedMeasure<'a> {
+    inner: &'a dyn PromptMeasure,
+    notes: Option<&'a str>,
+}
+
+#[async_trait]
+impl PromptMeasure for NotedMeasure<'_> {
+    async fn measure(&self, messages: &[ChatMessage]) -> Result<PromptSize, String> {
+        let noted = NotesBlock::attach(messages, self.notes);
+        self.inner.measure(&noted).await
     }
 }
 
@@ -2408,5 +2468,250 @@ mod tests {
         assert_eq!(Compactor::target(8192, 75, 6500), Some(8192));
         assert_eq!(Compactor::target(8192, 75, 8192), None);
         assert_eq!(Compactor::target(8192, 75, 9000), None);
+    }
+
+    /// Notes-block fixtures over [`Compactor::prepare`].
+    struct Nx;
+
+    impl Nx {
+        /// The window [`Self::by_bytes`] reports; the default budget is 1500.
+        const N_CTX: usize = 2000;
+        /// The length of each long question in [`Self::long_turns`].
+        const LONG: usize = 600;
+        const NOTES: &'static str = "[Your notes]\n1. keep going";
+        const NO_LIMIT: i32 = -1;
+
+        /// One token per byte of the request's serialized messages.
+        fn by_bytes(req: &GenerateRequest) -> PromptSize {
+            PromptSize {
+                prompt_tokens: serde_json::to_string(&req.messages).unwrap().len(),
+                n_ctx: Self::N_CTX,
+            }
+        }
+
+        fn compactor(
+            strategy: ContextStrategy,
+            saved: Option<CompactionState>,
+            committed_len: usize,
+            sink: Arc<RecordingSink>,
+        ) -> Compactor {
+            Compactor::new(
+                strategy,
+                DEFAULT_COMPACT_AT_PCT,
+                saved,
+                committed_len,
+                SamplingConfig::default(),
+                sink,
+            )
+        }
+
+        /// `turns` plain turns with long questions.
+        fn long_turns(turns: usize) -> Vec<ChatMessage> {
+            (0..turns)
+                .flat_map(|n| {
+                    let q = char::from(b'a' + n as u8).to_string().repeat(Self::LONG);
+                    [Fx::user(&q), Fx::assistant("ok")]
+                })
+                .collect()
+        }
+
+        /// `content` with the notes block after it and a blank line.
+        fn noted(content: &str) -> String {
+            format!("{content}\n\n{}", Self::NOTES)
+        }
+
+        /// The step measures `link` made (the summary calls left out).
+        fn step_measures(link: &FakeLink) -> Vec<GenerateRequest> {
+            link.measured()
+                .into_iter()
+                .filter(|r| r.messages[0].content != Summarize::SYSTEM_PROMPT)
+                .collect()
+        }
+
+        async fn prepare(
+            compactor: &mut Compactor,
+            messages: &[ChatMessage],
+            current: usize,
+            link: &FakeLink,
+        ) -> Compacted {
+            compactor
+                .prepare(
+                    messages,
+                    current,
+                    &[],
+                    false,
+                    Self::NO_LIMIT,
+                    Some(Self::NOTES),
+                    link,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn notes_block_follows_summary_note() {
+        let mut messages = vec![Fx::system()];
+        messages.extend(Nx::long_turns(3));
+        let current = messages.len();
+        messages.push(Fx::user("now"));
+        let link = Sx::link(vec![Sx::reply(SUMMARY, 1)]);
+        link.set_measure_by(Nx::by_bytes);
+        let sink = Arc::new(RecordingSink::new());
+        let mut compactor = Nx::compactor(ContextStrategy::Summarize, None, current, sink.clone());
+        let out = Nx::prepare(&mut compactor, &messages, current, &link).await;
+        let covers = sink.saved()[0].covers;
+        assert_eq!(covers, 5);
+        assert_eq!(
+            out.messages[0].content,
+            Nx::noted("you are helpful\n\n[Summary of the earlier conversation]\nS")
+        );
+        assert_eq!(out.messages[1..], messages[covers..]);
+        let record = out.record.unwrap();
+        assert_eq!(record.strategy, Summarize::STRATEGY);
+        // Every step measure carries the block, the last one is the prompt sent; the summary
+        // calls never carry it.
+        let steps = Nx::step_measures(&link);
+        assert!(steps.len() >= 2);
+        assert!(steps
+            .iter()
+            .all(|r| r.messages[0].content.ends_with(Nx::NOTES)));
+        let last = steps.last().unwrap();
+        assert_eq!(last.messages, out.messages);
+        assert_eq!(
+            record.after_tokens as usize,
+            Nx::by_bytes(last).prompt_tokens
+        );
+        let calls = link.requests();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].messages[1].content.contains(NotesBlock::HEADER));
+        assert!(link
+            .measured()
+            .iter()
+            .filter(|r| r.messages[0].content == Summarize::SYSTEM_PROMPT)
+            .all(|r| !r.messages[1].content.contains(NotesBlock::HEADER)));
+    }
+
+    #[tokio::test]
+    async fn notes_block_is_measured_under_trim() {
+        let mut messages = vec![Fx::system()];
+        messages.extend(Fx::tool_turn(0, Fx::big()));
+        let current = messages.len();
+        messages.push(Fx::user("now"));
+        let link = Sx::link(vec![]);
+        link.set_measure_by(Nx::by_bytes);
+        let sink = Arc::new(RecordingSink::new());
+        let mut compactor = Nx::compactor(ContextStrategy::Trim, None, current, sink);
+        let out = Nx::prepare(&mut compactor, &messages, current, &link).await;
+        assert_eq!(out.messages[0].content, Nx::noted("you are helpful"));
+        assert_eq!(out.messages[3].tool_result, Some(Fx::stub(&Fx::big())));
+        let measured = link.measured();
+        assert!(measured.len() >= 2, "the original and the trimmed prompt");
+        assert!(measured
+            .iter()
+            .all(|r| r.messages[0].content == Nx::noted("you are helpful")));
+        let record = out.record.unwrap();
+        assert_eq!(record.strategy, Trim::STRATEGY);
+        let last = measured.last().unwrap();
+        assert_eq!(last.messages, out.messages);
+        assert_eq!(
+            record.after_tokens as usize,
+            Nx::by_bytes(last).prompt_tokens
+        );
+    }
+
+    #[tokio::test]
+    async fn notes_block_without_system_prompt_keeps_summary_reuse() {
+        // Turn 1: no system prompt; the span before the previous turn is summarised.
+        let mut stored = Nx::long_turns(3);
+        let current = stored.len();
+        let mut messages = stored.clone();
+        messages.push(Fx::user("now"));
+        let link = Sx::link(vec![Sx::reply(SUMMARY, 1)]);
+        link.set_measure_by(Nx::by_bytes);
+        let sink = Arc::new(RecordingSink::new());
+        let mut compactor = Nx::compactor(ContextStrategy::Summarize, None, current, sink.clone());
+        let out = Nx::prepare(&mut compactor, &messages, current, &link).await;
+        let saved = sink.saved();
+        assert_eq!(saved.len(), 1);
+        // A stored-transcript index: the turn before the current one starts at 4.
+        assert_eq!(saved[0].covers, 4);
+        assert_eq!(out.messages[0].role, Role::System);
+        assert_eq!(
+            out.messages[0].content,
+            Nx::noted("[Summary of the earlier conversation]\nS")
+        );
+        assert_eq!(out.messages[1..], messages[4..]);
+        assert!(!out.record.unwrap().reused_summary);
+
+        // Turn 2 starts from the committed transcript and the saved summary.
+        stored.push(Fx::user("now"));
+        stored.push(Fx::assistant("done"));
+        let current = stored.len();
+        let mut messages = stored.clone();
+        messages.push(Fx::user("next"));
+        let link = Sx::link(vec![]);
+        link.set_measure_by(Nx::by_bytes);
+        let mut compactor = Nx::compactor(
+            ContextStrategy::Summarize,
+            Some(saved[0].clone()),
+            current,
+            sink.clone(),
+        );
+        let out = Nx::prepare(&mut compactor, &messages, current, &link).await;
+        assert!(link.requests().is_empty(), "the summary is reused");
+        assert_eq!(sink.saved().len(), 1);
+        let record = out.record.unwrap();
+        assert!(record.reused_summary);
+        assert_eq!(record.summarized_messages, 4);
+        assert_eq!(
+            out.messages[0].content,
+            Nx::noted("[Summary of the earlier conversation]\nS")
+        );
+        assert_eq!(out.messages[1..], messages[4..]);
+    }
+
+    #[tokio::test]
+    async fn off_strategy_still_carries_notes_block() {
+        let link = Sx::link(vec![]);
+        let messages = vec![Fx::user("q")];
+        let out = Nx::prepare(&mut Compactor::off(), &messages, 0, &link).await;
+        assert_eq!(
+            out.messages,
+            vec![ChatMessage::new(Role::System, Nx::NOTES), Fx::user("q")]
+        );
+        assert_eq!(out.record, None);
+        let messages = vec![Fx::system(), Fx::user("q")];
+        let out = Nx::prepare(&mut Compactor::off(), &messages, 1, &link).await;
+        assert_eq!(out.messages[0].content, Nx::noted("you are helpful"));
+        assert_eq!(out.messages[1..], messages[1..]);
+        assert!(link.measured().is_empty());
+        // No notes: the messages go out as they are.
+        let out = Compactor::off()
+            .prepare(&messages, 1, &[], false, Nx::NO_LIMIT, None, link.as_ref())
+            .await;
+        assert_eq!(out.messages, messages);
+    }
+
+    #[tokio::test]
+    async fn under_budget_and_failed_measure_still_carry_notes_block() {
+        let messages = vec![Fx::system(), Fx::user("q")];
+        let sink = Arc::new(RecordingSink::new());
+        // No measure set: measure_prompt fails, as on an old worker.
+        let failing = Sx::link(vec![]);
+        let mut compactor = Nx::compactor(ContextStrategy::Trim, None, 1, sink.clone());
+        let out = Nx::prepare(&mut compactor, &messages, 1, &failing).await;
+        assert_eq!(out.messages[0].content, Nx::noted("you are helpful"));
+        assert_eq!(out.record, None);
+        assert_eq!(compactor.logged_failures(), 1);
+        let fitting = Sx::link(vec![]);
+        fitting.set_measure_by(Nx::by_bytes);
+        let mut compactor = Nx::compactor(ContextStrategy::Summarize, None, 1, sink);
+        let out = Nx::prepare(&mut compactor, &messages, 1, &fitting).await;
+        assert_eq!(out.messages[0].content, Nx::noted("you are helpful"));
+        assert_eq!(out.record, None);
+        assert_eq!(
+            fitting.measured()[0].messages[0].content,
+            Nx::noted("you are helpful")
+        );
     }
 }

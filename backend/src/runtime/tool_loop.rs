@@ -1,6 +1,11 @@
 //! The tool loop: generate, run the requested tools, generate again, until the model answers.
 //! Each step's prompt first goes through the turn's [`Compactor`], which may send a compacted
 //! copy of the transcript; the transcript itself is never compacted.
+//!
+//! Each call runs under the turn's [`ToolScope`] (`TurnConfig.scope`): its write folder and
+//! session. Before every step the session's notes are re-read and their block goes on the
+//! prompt's system message, never into the transcript. A call that fails exactly as the one
+//! before it did gets a retry hint in its error result (see `RepeatGuard`).
 
 use std::fmt;
 use std::sync::Arc;
@@ -14,6 +19,7 @@ use serde_json::{json, Map, Value};
 
 use super::compaction::Compactor;
 use super::executor::ToolExecutor;
+use super::notes::NotesBlock;
 use super::registry::ToolRegistry;
 use super::tool::{ToolCallRequest, ToolScope};
 use super::trace::{CompactionRecord, StepOutcome, StepRecord, ToolTiming, TurnTrace};
@@ -85,6 +91,40 @@ pub struct TurnConfig {
     pub tools: Vec<String>,
     pub enable_thinking: bool,
     pub sampling: SamplingConfig,
+    /// Where the turn's tool calls work and which session they belong to; every call's
+    /// `execute` receives it, and its session's notes go into every step's prompt.
+    pub scope: ToolScope,
+}
+
+/// Within one turn, remembers the last tool call that failed, so an identical call failing
+/// again gets the retry hint. Any `ToolOutcome::Err` counts, executor refusals included.
+#[derive(Debug, Default)]
+struct RepeatGuard {
+    last_failed: Option<(String, Value)>,
+}
+
+impl RepeatGuard {
+    const FIELD_HINT: &'static str = "hint";
+    const HINT: &'static str = "This call already failed twice; try something different.";
+
+    /// True when this call failed and the remembered failure was the same name with equal
+    /// arguments. Remembers the call when it failed and forgets otherwise.
+    fn observe(&mut self, name: &str, args: &Value, ok: bool) -> bool {
+        let repeat = !ok
+            && self
+                .last_failed
+                .as_ref()
+                .is_some_and(|(n, a)| n == name && a == args);
+        self.last_failed = (!ok).then(|| (name.to_string(), args.clone()));
+        repeat
+    }
+
+    /// Adds the hint to an error result (`{"error": ..}`).
+    fn hint(result: &mut Value) {
+        if let Some(fields) = result.as_object_mut() {
+            fields.insert(Self::FIELD_HINT.into(), Value::String(Self::HINT.into()));
+        }
+    }
 }
 
 /// The link for one step, and the time spent loading the model to get it.
@@ -318,6 +358,13 @@ impl ToolLoop {
     /// and so the transcript returned for commit, is never compacted. Any summary call made
     /// on the way is consumed internally; none of its notes reach `sink`.
     ///
+    /// Each step re-reads the notes of `config.scope`'s session and hands their block to
+    /// `prepare`, which puts it on the sent prompt only. Every call is executed under
+    /// `config.scope`. Calls are checked in order, within and across steps, against the last
+    /// failed call of this run: an identical call (same name, equal arguments) that fails
+    /// again gets `"hint"` in its error object, in the `tool_result` note and the transcript
+    /// alike, and its timing is marked `repeat_failure`.
+    ///
     /// Every step is measured and reported to `trace` once, when it ends (after its tools, if
     /// any, and before the loop's own closing notes). A step that fails before reaching the
     /// worker is reported with no fill. When the sink closes inside a step, that step is
@@ -337,6 +384,7 @@ impl ToolLoop {
         let current_turn_start = scratch.len();
         scratch.push(ChatMessage::new(Role::User, content));
 
+        let mut guard = RepeatGuard::default();
         let mut steps = 0;
         while steps < config.step_budget {
             let mut meter = StepMeter::new(steps);
@@ -361,6 +409,7 @@ impl ToolLoop {
                 Err(e) => return Self::failed_step(trace, sink, meter, steps, e.0).await,
             };
             steps += 1;
+            let notes = Self::notes_block(&config.scope);
             let compacted = compactor
                 .prepare(
                     &scratch,
@@ -368,6 +417,7 @@ impl ToolLoop {
                     &tools,
                     config.enable_thinking,
                     config.sampling.max_tokens,
+                    notes.as_deref(),
                     link.as_ref(),
                 )
                 .await;
@@ -427,20 +477,21 @@ impl ToolLoop {
                 let started = Instant::now();
                 let outcome = self
                     .executor
-                    .execute(
-                        &Self::request_of(call),
-                        &config.tools,
-                        &ToolScope::default(),
-                    )
+                    .execute(&Self::request_of(call), &config.tools, &config.scope)
                     .await;
                 let ms = StepMeter::millis(started.elapsed());
-                let result = outcome.result_value();
+                let repeat = guard.observe(&call.name, &call.arguments, outcome.is_ok());
+                let mut result = outcome.result_value();
+                if repeat {
+                    RepeatGuard::hint(&mut result);
+                }
                 meter.tool(ToolTiming {
                     name: call.name.clone(),
                     id: call.id.clone(),
                     ok: outcome.is_ok(),
                     ms,
                     bytes: ToolTiming::result_bytes(&result) as u64,
+                    repeat_failure: repeat,
                 });
                 let params = json!({
                     "id": call.id,
@@ -458,6 +509,13 @@ impl ToolLoop {
                 .await?;
         }
         Self::ended(Self::finish(sink, steps, EndReason::StepLimit).await)
+    }
+
+    /// The notes block of the scope's session, read fresh; `None` without a session, once it
+    /// is deleted, or when it has no notes.
+    fn notes_block(scope: &ToolScope) -> Option<String> {
+        let notes = scope.session.as_ref()?.notes()?;
+        NotesBlock::text(&notes)
     }
 
     /// An end that commits nothing.
@@ -720,10 +778,11 @@ mod tests {
     use crate::agents::template::{CompactionState, ContextStrategy, DEFAULT_COMPACT_AT_PCT};
     use crate::engine::template::ChatTemplate;
     use crate::runtime::compaction::{Summarize, SummaryNote, SummarySink, Trim};
+    use crate::runtime::notes::NoteAddTool;
     use crate::runtime::policy::EnabledPolicy;
     use crate::runtime::test_support::{FakeConnector, FakeLink, Notes, RecordingSink, Scripted};
     use crate::runtime::test_tools::TestSource;
-    use crate::runtime::tool::ToolSource;
+    use crate::runtime::tool::{SessionHandle, ToolSource};
     use crate::runtime::trace::NoTrace;
     use crate::runtime::worker::PromptSize;
     use std::time::Duration;
@@ -841,6 +900,7 @@ mod tests {
                     tools: enabled.iter().map(|n| n.to_string()).collect(),
                     enable_thinking: false,
                     sampling: SamplingConfig::default(),
+                    scope: ToolScope::default(),
                 },
                 compactor: Compactor::off(),
                 sink: RecordingSink::new(),
@@ -1716,6 +1776,7 @@ You are terse.<|tool>declaration:echo{";
                 ok: true,
                 ms: r[0].tools[0].ms,
                 bytes,
+                repeat_failure: false,
             }]
         );
         assert_eq!(r[1].end, StepOutcome::Answered);
@@ -2333,5 +2394,210 @@ You are terse.<|tool>declaration:echo{";
         );
         assert_eq!(f.transcript.len(), 8);
         assert_eq!(f.transcript[..4], Compaction::long_turns()[..]);
+    }
+
+    /// A live session whose notes the test and the note tools share.
+    #[derive(Default)]
+    struct FakeSession {
+        notes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SessionHandle for FakeSession {
+        fn notes(&self) -> Option<Vec<String>> {
+            Some(self.notes.lock().unwrap().clone())
+        }
+
+        fn set_notes(&self, notes: Vec<String>) -> bool {
+            *self.notes.lock().unwrap() = notes;
+            true
+        }
+
+        fn exists(&self) -> bool {
+            true
+        }
+    }
+
+    /// Retry-guard fixtures.
+    struct Retry;
+
+    impl Retry {
+        const HINT: &'static str = "This call already failed twice; try something different.";
+
+        /// A call to a tool that does not exist, so it always fails.
+        fn failing(args: Value) -> Value {
+            Notes::call("c", "nope", args)
+        }
+
+        /// Whether each `tool_result` carries the hint, in order.
+        fn hinted(f: &Fixture) -> Vec<bool> {
+            f.tool_results()
+                .iter()
+                .map(|n| n.params["content"].get("hint").is_some())
+                .collect()
+        }
+
+        /// The tool results in the committed transcript, in order.
+        fn committed(f: &Fixture) -> Vec<Value> {
+            f.transcript
+                .iter()
+                .filter_map(|m| m.tool_result.clone())
+                .collect()
+        }
+
+        /// Runs `steps` of calls, then an answer.
+        async fn run(f: &mut Fixture, steps: Vec<Vec<Value>>) {
+            let mut scripts: Vec<Scripted> =
+                steps.into_iter().map(|c| Fixture::step("", c)).collect();
+            scripts.push(Fixture::step("done", vec![]));
+            let link = FakeLink::new(true, scripts);
+            assert_eq!(f.run(Some(link)).await.unwrap().reason, EndReason::Answered);
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_reaches_the_tool_context() {
+        let mut f = Fixture::with_sources(vec![TestSource::scope_boxed()], &["scope"]);
+        f.config.scope = ToolScope {
+            workspace: Some(std::path::PathBuf::from("sessions/s1")),
+            session: None,
+        };
+        let call = Notes::call("c", "scope", json!({}));
+        let link = FakeLink::new(
+            true,
+            vec![Fixture::step("", vec![call]), Fixture::step("ok", vec![])],
+        );
+        f.run(Some(link)).await.unwrap();
+        let params = &f.tool_results()[0].params;
+        assert_eq!(params["ok"], true);
+        assert_eq!(params["content"], json!({"workspace": "sessions/s1"}));
+    }
+
+    #[tokio::test]
+    async fn notes_block_is_sent_on_every_step_and_never_committed() {
+        let source = TestSource::new(vec![Arc::new(NoteAddTool)]);
+        let mut f = Fixture::with_sources(vec![Box::new(source)], &["note_add"]);
+        let session = Arc::new(FakeSession::default());
+        f.config.scope = ToolScope {
+            workspace: None,
+            session: Some(session.clone()),
+        };
+        f.transcript = vec![ChatMessage::new(Role::System, "sys")];
+        let call = Notes::call("c", "note_add", json!({"text": "remember x"}));
+        let link = FakeLink::new(
+            true,
+            vec![Fixture::step("", vec![call]), Fixture::step("done", vec![])],
+        );
+        let end = f.run(Some(link.clone())).await.unwrap();
+        assert_eq!(end.reason, EndReason::Answered);
+        let requests = link.requests();
+        // Step 1: no notes yet, the system prompt goes out as it is.
+        assert_eq!(requests[0].messages[0].content, "sys");
+        // Step 2 re-reads the notes the tool added.
+        assert_eq!(
+            requests[1].messages[0].content,
+            "sys\n\n[Your notes]\n1. remember x"
+        );
+        assert_eq!(session.notes().unwrap(), vec!["remember x".to_string()]);
+        assert_eq!(f.transcript[0].content, "sys");
+        assert!(f
+            .transcript
+            .iter()
+            .all(|m| !m.content.contains(NotesBlock::HEADER)));
+    }
+
+    #[tokio::test]
+    async fn second_identical_failure_carries_hint() {
+        let mut f = Fixture::new();
+        Retry::run(
+            &mut f,
+            vec![
+                vec![Retry::failing(json!({})), Retry::failing(json!({}))],
+                vec![Retry::failing(json!({"x": 1}))],
+                vec![Retry::failing(json!({}))],
+            ],
+        )
+        .await;
+        assert_eq!(Retry::hinted(&f), [false, true, false, false]);
+        let hinted = &f.tool_results()[1].params;
+        assert_eq!(hinted["ok"], false);
+        assert_eq!(
+            hinted["content"],
+            json!({"error": "unknown tool: nope", "hint": Retry::HINT})
+        );
+        // The transcript stores exactly what the model and the client saw.
+        let sent: Vec<Value> = f
+            .tool_results()
+            .iter()
+            .map(|n| n.params["content"].clone())
+            .collect();
+        assert_eq!(Retry::committed(&f), sent);
+    }
+
+    #[tokio::test]
+    async fn third_identical_failure_carries_hint_again() {
+        let mut f = Fixture::new();
+        Retry::run(
+            &mut f,
+            vec![
+                vec![Retry::failing(json!({"a": [1, 2]}))],
+                vec![Retry::failing(json!({"a": [1, 2]}))],
+                vec![Retry::failing(json!({"a": [1, 2]}))],
+            ],
+        )
+        .await;
+        assert_eq!(Retry::hinted(&f), [false, true, true]);
+    }
+
+    #[tokio::test]
+    async fn success_between_resets_guard() {
+        let mut f = Fixture::new();
+        Retry::run(
+            &mut f,
+            vec![vec![
+                Retry::failing(json!({})),
+                Fixture::echo_call("c"),
+                Retry::failing(json!({})),
+            ]],
+        )
+        .await;
+        assert_eq!(Retry::hinted(&f), [false, false, false]);
+        // A fresh run remembers nothing from the last one.
+        Retry::run(&mut f, vec![vec![Retry::failing(json!({}))]]).await;
+        assert_eq!(Retry::hinted(&f), [false, false, false, false]);
+    }
+
+    #[tokio::test]
+    async fn repeat_failure_is_traced() {
+        let mut f = Fixture::new();
+        Retry::run(
+            &mut f,
+            vec![
+                vec![Retry::failing(json!({}))],
+                vec![Retry::failing(json!({}))],
+            ],
+        )
+        .await;
+        let r = &f.trace.records;
+        assert!(!r[0].tools[0].repeat_failure);
+        assert!(r[1].tools[0].repeat_failure);
+        assert!(!r[0].tools[0].ok && !r[1].tools[0].ok);
+        let plain = serde_json::to_value(&r[0].tools[0]).unwrap();
+        assert!(plain.get("repeat_failure").is_none(), "{plain}");
+        let repeated = serde_json::to_value(&r[1].tools[0]).unwrap();
+        assert_eq!(repeated["repeat_failure"], true);
+        let bytes = ToolTiming::result_bytes(&f.tool_results()[1].params["content"]) as u64;
+        assert_eq!(r[1].tools[0].bytes, bytes);
+    }
+
+    #[test]
+    fn repeat_guard_compares_name_and_arguments() {
+        let mut guard = RepeatGuard::default();
+        assert!(!guard.observe("a", &json!({"x": 1}), false));
+        assert!(!guard.observe("b", &json!({"x": 1}), false));
+        assert!(guard.observe("b", &json!({"x": 1}), false));
+        assert!(!guard.observe("b", &json!({"x": 1}), true));
+        assert!(!guard.observe("b", &json!({"x": 1}), false));
+        assert!(!guard.observe("b", &json!({"x": 2}), false));
+        assert_eq!(guard.last_failed, Some(("b".into(), json!({"x": 2}))));
     }
 }

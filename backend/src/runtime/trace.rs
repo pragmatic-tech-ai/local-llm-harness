@@ -45,6 +45,10 @@ pub struct ToolTiming {
     pub ok: bool,
     pub ms: u64,
     pub bytes: u64,
+    /// The call failed exactly as the one before it did, so its result carries the retry
+    /// hint.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat_failure: bool,
 }
 
 impl ToolTiming {
@@ -711,6 +715,7 @@ mod tests {
                     ok: true,
                     ms: 4,
                     bytes: 26,
+                    repeat_failure: false,
                 }],
                 error: None,
                 compaction: None,
