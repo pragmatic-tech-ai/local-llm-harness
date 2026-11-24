@@ -92,12 +92,31 @@ pub struct StepLink {
     pub load: Option<Duration>,
 }
 
+/// Why a step got no link, and the time spent on a model load that failed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkFailure {
+    pub message: String,
+    /// `Some` only when this `link` call started a model load (which then failed).
+    pub load: Option<Duration>,
+}
+
+impl From<String> for LinkFailure {
+    /// A failure that loaded nothing.
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            load: None,
+        }
+    }
+}
+
 /// Where the loop gets the worker link for each step.
 #[async_trait]
 pub trait TurnLinks: Send + Sync {
-    /// The link to use for zero-based `step`. The `Err` text is reported as `turn_error`; at
-    /// step 0 the loop then ends `NoHarness`, at later steps `Error`.
-    async fn link(&self, step: usize) -> Result<StepLink, String>;
+    /// The link to use for zero-based `step`. The `Err` message is reported as `turn_error`;
+    /// at step 0 the loop then ends `NoHarness`, at later steps `Error`. Its load time, if
+    /// any, goes on the failed step's record.
+    async fn link(&self, step: usize) -> Result<StepLink, LinkFailure>;
 }
 
 /// What the loop measures about one step, turned into its trace record when the step ends.
@@ -311,7 +330,9 @@ impl ToolLoop {
                     meter.load = step_link.load;
                     step_link.link
                 }
-                Err(message) => {
+                Err(failure) => {
+                    meter.load = failure.load;
+                    let message = failure.message;
                     let record = meter.record(StepOutcome::Error, Some(message.clone()));
                     trace.step(record, sink).await?;
                     if steps == 0 {
@@ -696,7 +717,7 @@ mod tests {
 
     #[async_trait]
     impl TurnLinks for StepRecorder {
-        async fn link(&self, step: usize) -> Result<StepLink, String> {
+        async fn link(&self, step: usize) -> Result<StepLink, LinkFailure> {
             self.steps.lock().unwrap().push(step);
             Ok(StepLink {
                 link: self.link.clone(),
@@ -750,12 +771,13 @@ mod tests {
 
     #[async_trait]
     impl TurnLinks for StepLinks {
-        async fn link(&self, _step: usize) -> Result<StepLink, String> {
+        async fn link(&self, _step: usize) -> Result<StepLink, LinkFailure> {
             self.results
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("link asked more often than scripted")
+                .map_err(LinkFailure::from)
         }
     }
 

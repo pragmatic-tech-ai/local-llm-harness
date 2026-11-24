@@ -162,8 +162,11 @@ These are the author's calls; the owner can overrule any of them.
   the top.
 - **Turn numbers.** A turn number is allocated in memory when the turn starts. On first
   use after startup, the counter becomes the highest `turn` in any record (step or
-  turn), plus 1. A turn that crashed before writing any record can reuse its number,
-  which is harmless because nothing of it was written.
+  turn), plus 1. The number is reserved as it is handed out, so turns whose records
+  fail to write never share one. A log that cannot be read when the number is
+  allocated runs the turn untraced, after one `trace_warning`. A turn that crashed
+  before writing any record can reuse its number after a restart, which is harmless
+  because nothing of it was written.
 
 ### Protocol (runtime :8779)
 

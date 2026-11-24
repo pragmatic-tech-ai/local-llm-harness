@@ -11,7 +11,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
-use super::tool_loop::{LoopSink, SinkClosed, StepLink, ToolLoop, TurnLinks};
+use super::tool_loop::{LinkFailure, LoopSink, SinkClosed, StepLink, ToolLoop, TurnLinks};
 use super::worker::{GenerateRequest, LinkError, Note, WorkerLink};
 
 /// What one `generate` call yields: a stream of items, or an immediate failure.
@@ -203,10 +203,10 @@ impl FakeConnector {
 #[async_trait]
 impl TurnLinks for FakeConnector {
     /// A connector with no link reports "no model running", as the production adapter does.
-    async fn link(&self, _step: usize) -> Result<StepLink, String> {
+    async fn link(&self, _step: usize) -> Result<StepLink, LinkFailure> {
         let link = self
             .connect()
-            .ok_or_else(|| ToolLoop::NO_MODEL.to_string())?;
+            .ok_or_else(|| LinkFailure::from(ToolLoop::NO_MODEL.to_string()))?;
         Ok(StepLink { link, load: None })
     }
 }

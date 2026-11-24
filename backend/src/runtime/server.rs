@@ -66,7 +66,9 @@ use tokio_tungstenite::tungstenite::Message;
 pub use super::catalog_source::{CatalogSource, CatalogView};
 use super::hub::{ConnId, Hub};
 use super::registry::ToolRegistry;
-use super::tool_loop::{LoopSink, SinkClosed, StepLink, ToolLoop, TurnConfig, TurnLinks};
+use super::tool_loop::{
+    LinkFailure, LoopSink, SinkClosed, StepLink, ToolLoop, TurnConfig, TurnLinks,
+};
 use super::trace::{NoTrace, SessionTrace, TraceLog, TraceStore, TurnTrace};
 use super::worker::WorkerLink;
 use crate::agents::dispatcher::{Dispatcher, Placement};
@@ -175,9 +177,10 @@ impl<'a> SessionLinks<'a> {
 
 #[async_trait]
 impl TurnLinks for SessionLinks<'_> {
-    async fn link(&self, step: usize) -> Result<StepLink, String> {
+    async fn link(&self, step: usize) -> Result<StepLink, LinkFailure> {
         if step == 0 {
-            // The load time is the whole lookup, recorded only when it had to load.
+            // The load time is the whole lookup, recorded only when it had to load (whether
+            // the load then succeeded or failed).
             let started = Instant::now();
             let mut loaded = false;
             let link = self
@@ -191,7 +194,10 @@ impl TurnLinks for SessionLinks<'_> {
                     );
                 })
                 .await
-                .map_err(|e| e.0)?;
+                .map_err(|e| LinkFailure {
+                    message: e.0,
+                    load: loaded.then(|| started.elapsed()),
+                })?;
             *self.bound() = self.dispatcher.identity(&self.req);
             return Ok(StepLink {
                 link,
@@ -201,13 +207,13 @@ impl TurnLinks for SessionLinks<'_> {
         let bound = self.bound().clone();
         if let (Some(bound), Some(now)) = (bound, self.dispatcher.identity(&self.req)) {
             if bound != now {
-                return Err(Self::MODEL_CHANGED.to_string());
+                return Err(LinkFailure::from(Self::MODEL_CHANGED.to_string()));
             }
         }
         self.dispatcher
             .current_link(&self.req)
             .map(Self::plain)
-            .ok_or_else(|| ToolLoop::NO_MODEL.to_string())
+            .ok_or_else(|| LinkFailure::from(ToolLoop::NO_MODEL.to_string()))
     }
 }
 
@@ -669,9 +675,9 @@ impl RuntimeConnection {
     }
 
     /// Runs the turn sent by `conn`, traced into `log` (untraced, after one `trace_warning`,
-    /// when there is no log). The transcript is committed only when the loop ends `Answered`,
-    /// after `loop_done`; the turn record follows the commit decision and goes out before the
-    /// result and `sessions_changed`.
+    /// when there is no log or it cannot be read to number the turn). The transcript is
+    /// committed only when the loop ends `Answered`, after `loop_done`; the turn record follows
+    /// the commit decision and goes out before the result and `sessions_changed`.
     async fn run_turn(
         deps: &RuntimeDeps,
         conn: ConnId,
@@ -696,8 +702,14 @@ impl RuntimeConnection {
             hub: &deps.hub,
             session: id,
         };
-        let mut session_trace = match log {
-            Ok(log) => Some(SessionTrace::new(log, id.to_string(), content)),
+        let started = match log {
+            Ok(log) => SessionTrace::start(log, id.to_string(), content)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(message) => Err(message),
+        };
+        let mut session_trace = match started {
+            Ok(trace) => Some(trace),
             Err(message) => {
                 // Best effort: a closed sink is noticed by the loop's first note.
                 let params = SessionTrace::warning(id, &message);
@@ -858,7 +870,7 @@ impl SharedRequests {
                 }
                 Self::sessions_changed(deps)
             }
-            RuntimeConnection::M_GET_TRACE => self.get_trace(params),
+            RuntimeConnection::M_GET_TRACE => self.get_trace(params).await,
             RuntimeConnection::M_LOAD_SESSION_MODEL => self.load_session_model(params).await,
             // Allowed while the session is busy: the running turn keeps its current step, and
             // its next step finds no model and ends `Error` with `no model running`.
@@ -878,8 +890,9 @@ impl SharedRequests {
         }
     }
 
-    /// A page of the session's trace, newest turn first, records in their log-line shape.
-    fn get_trace(&self, params: Value) -> Result<Value, RpcError> {
+    /// A page of the session's trace, newest turn first, records in their log-line shape. The
+    /// page reads the whole log, so it runs on the blocking pool.
+    async fn get_trace(&self, params: Value) -> Result<Value, RpcError> {
         let p: GetTraceParams = Frames::params(params)?;
         // Taken before the check, so a session deleted in between never leaves a cached handle.
         let log = self.deps.traces.log(&p.id);
@@ -887,8 +900,10 @@ impl SharedRequests {
             Self::forget_trace_if_gone(&self.deps, &p.id);
             return Err(RpcError::internal(SessionError::unknown(&p.id)));
         }
-        let page = log
-            .and_then(|log| log.page(p.before, p.limit))
+        let log = log.map_err(RpcError::internal)?;
+        let page = tokio::task::spawn_blocking(move || log.page(p.before, p.limit))
+            .await
+            .map_err(RpcError::internal)?
             .map_err(RpcError::internal)?;
         Ok(page.wire())
     }
@@ -1192,7 +1207,7 @@ mod tests {
 
     #[async_trait]
     impl TurnLinks for SwapBeforeSecondStep<'_> {
-        async fn link(&self, step: usize) -> Result<StepLink, String> {
+        async fn link(&self, step: usize) -> Result<StepLink, LinkFailure> {
             if step == 1 {
                 self.rt.load();
             }
@@ -1692,7 +1707,7 @@ mod tests {
         rt.load();
         assert_eq!(
             links.link(2).await.err().unwrap(),
-            SessionLinks::MODEL_CHANGED
+            LinkFailure::from(SessionLinks::MODEL_CHANGED.to_string())
         );
     }
 
@@ -2098,7 +2113,7 @@ mod tests {
             .unwrap();
         let links = Client::links(&rt, &rec);
         let err = links.link(1).await.err().unwrap();
-        assert_eq!(err, ToolLoop::NO_MODEL);
+        assert_eq!(err, LinkFailure::from(ToolLoop::NO_MODEL.to_string()));
         assert_eq!(rt.host.ensure_ready_calls(), 0);
         rt.load();
         assert!(links.link(1).await.is_ok());
@@ -2122,7 +2137,10 @@ mod tests {
             .unwrap();
         assert_eq!(rt.host.unload_calls(), 1);
         // The turn's next step finds no model, which the loop reports as `turn_error`.
-        assert_eq!(links.link(1).await.err().unwrap(), ToolLoop::NO_MODEL);
+        assert_eq!(
+            links.link(1).await.err().unwrap(),
+            LinkFailure::from(ToolLoop::NO_MODEL.to_string())
+        );
     }
 
     #[tokio::test]
@@ -2250,22 +2268,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unwritable_log_warns_and_turn_still_commits() {
-        let rt = TestRuntime::new("tracewarn", Client::answering());
+    async fn failed_first_message_load_keeps_its_load_ms() {
+        let rt = TestRuntime::new("traceloadfail", Client::idle());
+        rt.host.fail_ensure(Some(LOAD_ERROR));
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        assert_eq!(a.send().await.unwrap(), Value::Null);
+        assert_eq!(rt.host.ensure_ready_calls(), 1);
+        let page = a.trace(&id).await;
+        let step = &page[TURNS][0][STEPS][0];
+        assert_eq!(step[END], "error");
+        assert_eq!(step["error"], LOAD_ERROR);
+        assert!(step[LOAD_MS].is_u64(), "{step}");
+        assert_eq!(page[TURNS][0][SUMMARY][REASON], "no_harness");
+    }
+
+    #[tokio::test]
+    async fn unwritable_log_numbers_each_turn_and_both_commit() {
+        let link = FakeLink::repeating(true, Client::answer(ANSWER));
+        let rt = TestRuntime::new("tracewarn", link);
         rt.load();
         let mut a = Client::new(&rt);
         let id = a.open_session().await;
+        // A log that can be read (so turns are numbered) but not written.
+        let file = Client::trace_file(&rt, &id);
+        std::fs::write(&file, "").unwrap();
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&file, perms.clone()).unwrap();
+        a.drain();
+        let mut turns = Vec::new();
+        for _ in 0..2 {
+            assert_eq!(a.send().await.unwrap(), Value::Null);
+            let frames = a.drain();
+            let warnings = TestClient::params_of(&frames, SessionTrace::M_TRACE_WARNING);
+            assert!(!warnings.is_empty(), "{:?}", Client::methods(&frames));
+            assert_eq!(warnings[0]["id"], id.as_str());
+            assert!(!warnings[0]["message"].as_str().unwrap().is_empty());
+            let summary = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0][RECORD];
+            assert_eq!(summary[COMMITTED], true);
+            let step = &TestClient::params_of(&frames, SessionTrace::M_TRACE_STEP)[0][RECORD];
+            assert_eq!(step[TURN], summary[TURN]);
+            turns.push(summary[TURN].clone());
+        }
+        // Each turn reserved its own number although neither reached the file.
+        assert_eq!(turns, [json!(1), json!(2)]);
+        assert_eq!(rt.deps.sessions.get(&id).unwrap().transcript.len(), 4);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&file, perms).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreadable_log_runs_the_turn_untraced_with_one_warning() {
+        let rt = TestRuntime::new("traceunread", Client::answering());
+        rt.load();
+        let mut a = Client::new(&rt);
+        let id = a.open_session().await;
+        // A directory in the log's place: the turn number cannot be read.
         std::fs::create_dir(Client::trace_file(&rt, &id)).unwrap();
         a.drain();
         assert_eq!(a.send().await.unwrap(), Value::Null);
         let frames = a.drain();
+        let methods = Client::methods(&frames);
         let warnings = TestClient::params_of(&frames, SessionTrace::M_TRACE_WARNING);
-        assert!(!warnings.is_empty(), "{:?}", Client::methods(&frames));
+        assert_eq!(warnings.len(), 1, "{methods:?}");
         assert_eq!(warnings[0]["id"], id.as_str());
         assert!(!warnings[0]["message"].as_str().unwrap().is_empty());
+        for traced in [SessionTrace::M_TRACE_STEP, SessionTrace::M_TRACE_TURN] {
+            assert!(!methods.iter().any(|m| m == traced), "{methods:?}");
+        }
+        assert!(methods.iter().any(|m| m == LOOP_DONE), "{methods:?}");
         assert_eq!(rt.deps.sessions.get(&id).unwrap().transcript.len(), 2);
-        let summary = &TestClient::params_of(&frames, SessionTrace::M_TRACE_TURN)[0][RECORD];
-        assert_eq!(summary[COMMITTED], true);
     }
 
     #[tokio::test]

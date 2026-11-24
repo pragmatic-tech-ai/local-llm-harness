@@ -250,20 +250,25 @@ impl TraceLog {
         file.flush()
     }
 
-    /// The highest `turn` in any step or turn record, plus 1; scanned once, then cached.
-    /// A missing file gives 1. A read error is returned and nothing is cached.
+    /// Hands out the next turn number and reserves it at once, so two turns never share a
+    /// number even when their records never reach the file. The first call scans the log for
+    /// the highest `turn` in any step or turn record (a missing file counts as none); later
+    /// calls only advance the counter. A read error is returned and nothing is cached.
     pub fn next_turn(&self) -> io::Result<u64> {
         let mut next = Self::guard(&self.next);
-        if let Some(n) = *next {
-            return Ok(n);
-        }
-        let highest = Self::read_records(&self.path)?
-            .iter()
-            .filter_map(Self::turn_of)
-            .max()
-            .unwrap_or(0);
-        *next = Some(highest + 1);
-        Ok(highest + 1)
+        let turn = match *next {
+            Some(n) => n,
+            None => {
+                Self::read_records(&self.path)?
+                    .iter()
+                    .filter_map(Self::turn_of)
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            }
+        };
+        *next = Some(turn + 1);
+        Ok(turn)
     }
 
     /// Turns newest first, those below `before` (exclusive), at most `limit` of them
@@ -302,20 +307,11 @@ impl TraceLog {
         })
     }
 
-    /// Removes the log file; a missing file is fine.
-    pub fn delete(&self) -> io::Result<()> {
-        let mut state = Self::guard(&self.write);
-        self.remove_file(&mut state)
-    }
-
-    /// Deletes the file and drops every later append: the session is gone.
+    /// Deletes the file (a missing file is fine) and drops every later append: the session
+    /// is gone.
     fn retire(&self) -> io::Result<()> {
         let mut state = Self::guard(&self.write);
         state.deleted = true;
-        self.remove_file(&mut state)
-    }
-
-    fn remove_file(&self, state: &mut WriteState) -> io::Result<()> {
         *Self::guard(&self.next) = None;
         state.tail_clean = false;
         match fs::remove_file(&self.path) {
@@ -472,8 +468,6 @@ pub struct SessionTrace {
     out_tokens: u32,
     think_tokens: u32,
     peak_fill: f64,
-    /// A failure from before the first record (allocating the turn number), sent with it.
-    warning: Option<String>,
 }
 
 impl SessionTrace {
@@ -485,33 +479,36 @@ impl SessionTrace {
     pub const M_TRACE_WARNING: &'static str = "trace_warning";
     /// The turn reason of a turn cut off because no connection was left.
     pub const REASON_ABORTED: &'static str = "aborted";
-    /// The turn number used when the log cannot be read to allocate one.
-    const FALLBACK_TURN: u64 = 0;
     /// The stored user message is cut to this many characters.
     const USER_CHARS: usize = 200;
     const FIELD_ID: &'static str = "id";
     const FIELD_RECORD: &'static str = "record";
     const FIELD_MESSAGE: &'static str = "message";
 
-    /// Starts the trace of a new turn: allocates its number from `log` and starts its clock.
-    /// An unreadable log gives turn 0 and a warning sent with the first record.
-    pub fn new(log: Arc<TraceLog>, session: String, user: &str) -> SessionTrace {
-        let (turn, warning) = match log.next_turn() {
-            Ok(turn) => (turn, None),
-            Err(e) => (Self::FALLBACK_TURN, Some(e.to_string())),
-        };
-        SessionTrace {
+    /// Starts the trace of a new turn: starts its clock and reserves its number from `log`.
+    /// The first allocation reads the whole log, so it runs on the blocking pool. A log that
+    /// cannot be read is an error: the caller runs the turn untraced.
+    pub async fn start(
+        log: Arc<TraceLog>,
+        session: String,
+        user: &str,
+    ) -> io::Result<SessionTrace> {
+        let started = Instant::now();
+        let allocating = Arc::clone(&log);
+        let turn = tokio::task::spawn_blocking(move || allocating.next_turn())
+            .await
+            .map_err(io::Error::other)??;
+        Ok(SessionTrace {
             log,
             session,
             turn,
             user: user.chars().take(Self::USER_CHARS).collect(),
-            started: Instant::now(),
+            started,
             steps: 0,
             out_tokens: 0,
             think_tokens: 0,
             peak_fill: 0.0,
-            warning,
-        }
+        })
     }
 
     /// Appends the turn record, then sends it as `trace_turn`.
@@ -550,11 +547,7 @@ impl SessionTrace {
         method: &str,
         sink: &mut dyn LoopSink,
     ) -> Result<(), SinkClosed> {
-        let appended = self.log.append(&record);
-        if let Some(message) = self.warning.take() {
-            self.warn(message, sink).await?;
-        }
-        if let Err(e) = appended {
+        if let Err(e) = self.log.append(&record) {
             self.warn(e.to_string(), sink).await?;
         }
         let live = record.line_value();
@@ -696,8 +689,10 @@ mod tests {
         }
 
         /// A session trace over this directory's log, for the user message "hi".
-        fn session_trace(&self) -> SessionTrace {
-            SessionTrace::new(Arc::new(self.log()), SESSION.into(), "hi")
+        async fn session_trace(&self) -> SessionTrace {
+            SessionTrace::start(Arc::new(self.log()), SESSION.into(), "hi")
+                .await
+                .unwrap()
         }
     }
 
@@ -903,7 +898,7 @@ mod tests {
     #[tokio::test]
     async fn session_trace_appends_then_notifies_and_finishes() {
         let d = TempDir::new("strace");
-        let mut trace = d.session_trace();
+        let mut trace = d.session_trace().await;
         let mut sink = RecordingSink::new();
         trace
             .step(TempDir::step_record(0, 1), &mut sink)
@@ -946,9 +941,11 @@ mod tests {
         let d = TempDir::new("snumber");
         let log = Arc::new(d.log());
         let mut sink = RecordingSink::new();
-        let first = SessionTrace::new(Arc::clone(&log), SESSION.into(), &"é".repeat(300));
+        let first = SessionTrace::start(Arc::clone(&log), SESSION.into(), &"é".repeat(300))
+            .await
+            .unwrap();
         first.finish("answered", true, &mut sink).await.unwrap();
-        let second = SessionTrace::new(log, SESSION.into(), "x");
+        let second = SessionTrace::start(log, SESSION.into(), "x").await.unwrap();
         second
             .finish(SessionTrace::REASON_ABORTED, false, &mut sink)
             .await
@@ -970,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn session_trace_totals_add_up_over_steps() {
         let d = TempDir::new("stotals");
-        let mut trace = d.session_trace();
+        let mut trace = d.session_trace().await;
         let mut sink = RecordingSink::new();
         let fills = [
             (Some(100), Some(1000), 5, 1),
@@ -1004,7 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn session_trace_write_failure_warns_and_still_notifies() {
         let d = TempDir::new("sfail");
-        let mut trace = d.session_trace();
+        let mut trace = d.session_trace().await;
         fs::create_dir(d.0.join(FILE)).unwrap();
         let mut sink = RecordingSink::new();
         trace
@@ -1021,36 +1018,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_trace_over_an_unreadable_log_uses_turn_zero_and_warns_once() {
+    async fn session_trace_over_an_unreadable_log_does_not_start() {
         let d = TempDir::new("sunread");
         fs::create_dir(d.0.join(FILE)).unwrap();
-        let mut trace = d.session_trace();
-        let mut sink = RecordingSink::new();
-        trace
-            .step(TempDir::step_record(0, 1), &mut sink)
-            .await
-            .unwrap();
-        // The turn-number failure, then this append's failure, then the record.
-        assert_eq!(
-            sink.methods(),
-            [
-                SessionTrace::M_TRACE_WARNING,
-                SessionTrace::M_TRACE_WARNING,
-                SessionTrace::M_TRACE_STEP
-            ]
-        );
-        assert_eq!(sink.notes[2].params["record"]["turn"], 0);
-        trace.finish("answered", true, &mut sink).await.unwrap();
-        assert_eq!(
-            &sink.methods()[3..],
-            [SessionTrace::M_TRACE_WARNING, SessionTrace::M_TRACE_TURN]
-        );
+        let started = SessionTrace::start(Arc::new(d.log()), SESSION.into(), "hi").await;
+        assert!(started.is_err());
+    }
+
+    #[test]
+    fn next_turn_reserves_each_number_without_a_write() {
+        let d = TempDir::new("reserve");
+        let log = d.log();
+        log.append(&TempDir::step(4, 1)).unwrap();
+        assert_eq!(log.next_turn().unwrap(), 5);
+        // Neither turn wrote anything, yet each got its own number.
+        assert_eq!(log.next_turn().unwrap(), 6);
+        assert_eq!(log.next_turn().unwrap(), 7);
+        // A record above the counter still moves it past that turn.
+        log.append(&TempDir::step(9, 1)).unwrap();
+        assert_eq!(log.next_turn().unwrap(), 10);
     }
 
     #[tokio::test]
     async fn session_trace_appends_even_when_sink_is_closed() {
         let d = TempDir::new("sclosed");
-        let mut trace = d.session_trace();
+        let mut trace = d.session_trace().await;
         let mut sink = RecordingSink::closing_after(0);
         assert_eq!(
             trace.step(TempDir::step_record(0, 1), &mut sink).await,

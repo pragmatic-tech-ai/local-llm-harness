@@ -229,10 +229,12 @@ impl GemmaToolFormat {
     const CALL_OPEN: &'static str = "<|tool_call>";
     const CALL_CLOSE: &'static str = "<tool_call|>";
     const RESPONSE_OPEN: &'static str = "<|tool_response>";
-    const MODEL_TURN: &'static str = "<|turn>model
-";
-    const EMPTY_THOUGHT_TAIL: &'static str = "<|channel>thought
-<channel|>";
+    /// The Gemma 4 generation prompt that opens a model turn.
+    pub(crate) const MODEL_TURN: &'static str = "<|turn>model\n";
+    const EMPTY_THOUGHT_TAIL: &'static str = "<|channel>thought\n<channel|>";
+    const QUOTE: &'static str = "<|\"|>";
+    const CALL_PREFIX: &'static str = "call:";
+    const MAX_DEPTH: usize = 64;
 
     /// True iff `prompt` ends with a Gemma 4 generation prompt.
     fn ends_with_generation_prompt(prompt: &str) -> bool {
@@ -241,9 +243,6 @@ impl GemmaToolFormat {
             .unwrap_or(prompt);
         head.ends_with(Self::MODEL_TURN) || OpenChannel::at_tail(prompt).is_some()
     }
-    const QUOTE: &'static str = "<|\"|>";
-    const CALL_PREFIX: &'static str = "call:";
-    const MAX_DEPTH: usize = 64;
 
     /// Parses one value of the Gemma 4 grammar; trailing non-whitespace is an error.
     pub fn parse_value(text: &str) -> Result<Value, String> {
@@ -1091,8 +1090,6 @@ mod tests {
     struct CounterFeed;
 
     impl CounterFeed {
-        const MODEL_TURN: &'static str = "<|turn>model\n";
-
         fn run(prompt: &str, chunks: &[(&str, usize)]) -> usize {
             let mut counter = GemmaThinkCounter::new(prompt);
             for (text, tokens) in chunks {
@@ -1110,7 +1107,7 @@ mod tests {
             ("<channel|>", 1),
             ("Answer.", 2),
         ];
-        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 3);
+        assert_eq!(CounterFeed::run(GemmaToolFormat::MODEL_TURN, &chunks), 3);
     }
 
     #[test]
@@ -1130,15 +1127,18 @@ mod tests {
             ("nel|>", 1),
             ("after", 5),
         ];
-        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 2);
+        assert_eq!(CounterFeed::run(GemmaToolFormat::MODEL_TURN, &chunks), 2);
         let split_open = [("<|chan", 1), ("nel>thought\nx", 1), ("y", 4)];
-        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &split_open), 4);
+        assert_eq!(
+            CounterFeed::run(GemmaToolFormat::MODEL_TURN, &split_open),
+            4
+        );
     }
 
     #[test]
     fn answer_only_step_has_zero_think() {
         let chunks = [("Hello", 1), (" world", 2)];
-        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 0);
+        assert_eq!(CounterFeed::run(GemmaToolFormat::MODEL_TURN, &chunks), 0);
     }
 
     #[test]
@@ -1198,7 +1198,7 @@ mod tests {
             ("y", 5),
         ];
         assert_eq!(
-            CounterFeed::run(CounterFeed::MODEL_TURN, &chunks),
+            CounterFeed::run(GemmaToolFormat::MODEL_TURN, &chunks),
             1 + 3 + 5
         );
     }
@@ -1211,21 +1211,23 @@ mod tests {
             ("<channel|>", 2),
             ("z", 9),
         ];
-        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 1 + 2);
+        assert_eq!(
+            CounterFeed::run(GemmaToolFormat::MODEL_TURN, &chunks),
+            1 + 2
+        );
     }
 
     #[test]
     fn several_markers_in_one_chunk_apply_in_order() {
         let open_close_open = "<|channel>thought\n<channel|><|channel>thought\n";
         let chunks = [(open_close_open, 1), ("a", 4)];
-        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 4);
-        let open_close = "<|channel>thought
-<channel|>";
+        assert_eq!(CounterFeed::run(GemmaToolFormat::MODEL_TURN, &chunks), 4);
+        let open_close = "<|channel>thought\n<channel|>";
         let chunks = [(open_close, 1), ("a", 4)];
-        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 0);
+        assert_eq!(CounterFeed::run(GemmaToolFormat::MODEL_TURN, &chunks), 0);
         let close_open_close = "<channel|><|channel>thought\n<channel|>";
         let chunks = [("<|channel>thought\n", 1), (close_open_close, 2), ("a", 4)];
-        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 2);
+        assert_eq!(CounterFeed::run(GemmaToolFormat::MODEL_TURN, &chunks), 2);
     }
 
     #[test]
