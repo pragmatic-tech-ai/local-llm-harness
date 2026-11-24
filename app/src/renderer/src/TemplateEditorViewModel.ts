@@ -1,7 +1,8 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import { TypedSignal } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
-import type { AgentTemplate, CatalogInfo, ContextStrategy, SamplingConfig, TemplateLeafNode, ToolSpec, WorkspaceMode } from './agents'
+import { RepositoryKind, TemplateRepository, type AgentTemplate, type CatalogInfo, type CatalogModel, type CatalogRepository, type ContextStrategy,
+    type OpenRouterModelInfo, type SamplingConfig, type TemplateLeafNode, type ToolSpec, type WorkspaceMode } from './agents'
 import type { TemplateTreeNodeViewModel } from './TemplateTreeNodeViewModel'
 import { ChoiceItem } from './ChoiceItem'
 import { ToolChoice, type IToolChoiceOwner } from './ToolChoice'
@@ -10,13 +11,19 @@ import { TextFormat } from './TextFormat'
 /**
  * The host-area template editor. One stable instance: Open shows a template from the tree, OpenNew an unsaved
  * `Untitled` draft, Clear the empty state. The number fields are text so a typo can be shown rather than sent: one
- * that does not parse gets a field error and disables Save. Runtime / model / host come from `list_catalog`, the
- * models filtered by the runtime; a value the catalog lacks stays as a marked choice. A template that parses but
- * fails validation (`get_template`'s `error`, the tree marks it broken) opens with its real fields and the error in
+ * that does not parse gets a field error and disables Save. Repository / runtime / model come from `list_catalog`:
+ * the models are the repository's, a Pragmatic one's filtered by the runtime; an OpenRouter repository has no runtime
+ * choice (its runtime is `openrouter`, the Runtime row hidden), and picking one of its models sets the context size
+ * to min(context_length, 32768). A value the catalog lacks stays as a marked choice. A template saved before
+ * repositories (`host`, or neither) reads as its host or `hive`; Save always sends `repository`, never `host`.
+ * A template that parses but fails validation (`get_template`'s `error`, the tree marks it broken) opens with its real fields and the error in
  * ErrorText; only a file that does not load at all (it does not parse, or its id is a duplicate) opens with the
  * fields seeded from the defaults plus what the tree node carries. Either way Save repairs it. Validation errors from
  * `save_template` show in ErrorText; a catalog failure shows in CatalogError until a retry (EnsureCatalog, on the
  * next open or refresh) succeeds.
+ *
+ * HiddenTextRule (see RepositoryEditorViewModel): a bound text changed while its part is collapsed keeps its old
+ * render, so Changed raises the visibility props that are now true first and those now false last.
  */
 export class TemplateEditorViewModel extends Observable implements IToolChoiceOwner
 {
@@ -27,7 +34,10 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly DefaultCompactAtPct = 75
     private static readonly MinCompactAtPct = 10
     private static readonly MaxCompactAtPct = 95
-    private static readonly AnyHostLabel = '(any host)'
+    /** The runtime value of every OpenRouter template. */
+    private static readonly OpenRouterRuntime = 'openrouter'
+    /** The default context size of an OpenRouter model is its context length, capped here. */
+    private static readonly OpenRouterContextCap = 32768
     private static readonly RootLabel = '(root)'
     private static readonly NewHeaderFormat = 'New template in {0}'
     private static readonly HeaderFormat = '{0} in {1}'
@@ -57,11 +67,13 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private static readonly PropEnableThinking = 'EnableThinking'
     private static readonly PropTemperatureText = 'TemperatureText'
     private static readonly PropTopPText = 'TopPText'
-    private static readonly PropHost = 'Host'
+    private static readonly PropRepository = 'Repository'
     private static readonly PropWorkspace = 'Workspace'
     private static readonly PropWorkspaceName = 'WorkspaceName'
     private static readonly WorkspaceNamed: WorkspaceMode = 'named'
     private static readonly DefaultWorkspace: WorkspaceMode = 'session'
+    /** What a pre-repository runtime's hosts are taken to offer (the editor only reads their kind and models). */
+    private static readonly LegacyCapabilities = { measure_prompt: 'exact', tokenize: true, raw_prompt: true, logprobs: true, load_unload: true } as const
     /** The backend's workspace name rule (WorkspaceConfig::validate), with its messages verbatim. */
     private static readonly WorkspaceNamePattern = /^[A-Za-z0-9_-]{1,64}$/
     private static readonly WorkspaceNameRequired = 'workspace name is required for named mode'
@@ -79,18 +91,21 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         TemplateEditorViewModel.PropStepBudgetText, TemplateEditorViewModel.PropRuntime, TemplateEditorViewModel.PropModel,
         TemplateEditorViewModel.PropContextSizeText, TemplateEditorViewModel.PropContext, TemplateEditorViewModel.PropCompactAtText,
         TemplateEditorViewModel.PropEnableThinking,
-        TemplateEditorViewModel.PropTemperatureText, TemplateEditorViewModel.PropTopPText, TemplateEditorViewModel.PropHost,
+        TemplateEditorViewModel.PropTemperatureText, TemplateEditorViewModel.PropTopPText, TemplateEditorViewModel.PropRepository,
         TemplateEditorViewModel.PropWorkspace, TemplateEditorViewModel.PropWorkspaceName,
         TemplateEditorViewModel.PropPath, TemplateEditorViewModel.PropTemplateId]
     private static readonly DerivedProps = ['HasTemplate', 'IsEmpty', 'IsNew', 'IsDirty', 'CanSave', 'CanRevert', 'IsLoading',
         'IsEditable', 'CatalogError', 'HasCatalogError', 'HeaderText', 'ErrorText',
         'HasErrorText', 'NameError', 'HasNameError', 'StepBudgetError', 'HasStepBudgetError', 'ContextSizeError',
         'HasContextSizeError', 'CompactAtError', 'HasCompactAtError', 'ContextChoice', 'TemperatureError', 'HasTemperatureError', 'TopPError', 'HasTopPError', 'RuntimeChoice',
-        'ModelChoice', 'HostChoice', 'WorkspaceChoice', 'IsWorkspaceNameEnabled', 'WorkspaceNameError', 'HasWorkspaceNameError']
+        'ModelChoice', 'RepositoryChoice', 'WorkspaceChoice', 'IsWorkspaceNameEnabled', 'WorkspaceNameError', 'HasWorkspaceNameError']
 
+    /** Bound to a Visibility (true = shown); raised around the other props per HiddenTextRule. */
+    private static readonly VisibilityProps = ['IsRuntimeVisible']
+
+    public readonly RepositoryChoices = new ObservableCollection<ChoiceItem>()
     public readonly RuntimeChoices = new ObservableCollection<ChoiceItem>()
     public readonly ModelChoices = new ObservableCollection<ChoiceItem>()
-    public readonly HostChoices = new ObservableCollection<ChoiceItem>()
     /** Off, Trim, Summarize: what the session does when the prompt nears the window. */
     public readonly ContextChoices = new ObservableCollection<ChoiceItem>()
     /** Session, Shared, Named: which folder the file tools write to. */
@@ -135,7 +150,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     private enableThinking = false
     private temperatureText = ''
     private topPText = ''
-    private host = ''
+    private repository: string = TemplateRepository.Default
     private workspace: WorkspaceMode = TemplateEditorViewModel.DefaultWorkspace
     private workspaceName = ''
     private sampling: Partial<SamplingConfig> | undefined = undefined
@@ -346,13 +361,15 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         return this.model
     }
 
+    /** Picking an OpenRouter model also sets the runtime to `openrouter` and the context size to its default. */
     public set Model(value: string)
     {
         this.SetField(TemplateEditorViewModel.PropModel, this.model, value, () =>
         {
             this.model = value
+            this.ApplyOpenRouterModel()
             this.RebuildChoices()
-        })
+        }, true)
     }
 
     public get ModelChoice(): ChoiceItem | null
@@ -551,35 +568,47 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         return this.TopPError.length > 0
     }
 
-    /** The preferred host ("" = any). */
-    public get Host(): string
+    /** The repository the model comes from (`hive` when the template names none). */
+    public get Repository(): string
     {
-        return this.host
+        return this.repository
     }
 
-    public set Host(value: string)
+    /**
+     * Changing the repository re-lists the models. An OpenRouter one sets the runtime to `openrouter`; a Pragmatic one
+     * takes the catalog's first runtime when the current one is not a catalog runtime. A model the repository lacks is
+     * replaced by its first (an OpenRouter pick then sets the context size).
+     */
+    public set Repository(value: string)
     {
-        this.SetField(TemplateEditorViewModel.PropHost, this.host, value, () =>
+        this.SetField(TemplateEditorViewModel.PropRepository, this.repository, value, () =>
         {
-            this.host = value
+            this.repository = value
+            this.FitToRepository()
             this.RebuildChoices()
-        })
+        }, true)
     }
 
-    public get HostChoice(): ChoiceItem | null
+    public get RepositoryChoice(): ChoiceItem | null
     {
-        return TemplateEditorViewModel.FindChoice(this.HostChoices, this.host)
+        return TemplateEditorViewModel.FindChoice(this.RepositoryChoices, this.repository)
     }
 
-    public set HostChoice(choice: ChoiceItem | null)
+    public set RepositoryChoice(choice: ChoiceItem | null)
     {
         if (choice instanceof ChoiceItem)
         {
-            this.Host = choice.Value
+            this.Repository = choice.Value
         }
     }
 
-    /** Reads the catalog (runtime / model / host choices) and the whole tool registry (the tool checkboxes). */
+    /** The Runtime row shows only for a Pragmatic repository (an unknown one counts as Pragmatic). */
+    public get IsRuntimeVisible(): boolean
+    {
+        return !this.IsOpenRouter
+    }
+
+    /** Reads the catalog (repository / runtime / model choices) and the whole tool registry (the tool checkboxes). */
     public async LoadCatalog(): Promise<void>
     {
         this.catalogLoading = true
@@ -866,7 +895,22 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
             enable_thinking: false,
             context_strategy: TemplateEditorViewModel.DefaultContextStrategy,
             compact_at_pct: TemplateEditorViewModel.DefaultCompactAtPct,
+            repository: this.DefaultRepository(chosenRuntime, chosenModel),
         }
+    }
+
+    /**
+     * The repository of a fresh or seeded template: for an `openrouter` runtime the OpenRouter repository listing the
+     * model (else the first OpenRouter one), otherwise `hive`.
+     */
+    private DefaultRepository(runtime: string, model: string): string
+    {
+        if (runtime !== TemplateEditorViewModel.OpenRouterRuntime)
+        {
+            return TemplateRepository.Default
+        }
+        const remote = this.Repositories().filter(r => r.kind === RepositoryKind.OpenRouter)
+        return (remote.find(r => TemplateEditorViewModel.ModelIds(r).includes(model)) ?? remote[0])?.name ?? TemplateRepository.Default
     }
 
     /** Fills the form from a template; that becomes the clean state. */
@@ -885,7 +929,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         this.sampling = template.sampling
         this.temperatureText = template.sampling?.temperature !== undefined ? String(template.sampling.temperature) : ''
         this.topPText = template.sampling?.top_p !== undefined ? String(template.sampling.top_p) : ''
-        this.host = template.host ?? ''
+        this.repository = TemplateRepository.Of(template)
         this.workspace = template.workspace?.mode ?? TemplateEditorViewModel.DefaultWorkspace
         this.workspaceName = template.workspace?.name ?? ''
         this.enabled = new Set(template.tools)
@@ -932,10 +976,7 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
         template.workspace = this.workspace === TemplateEditorViewModel.WorkspaceNamed
             ? { mode: this.workspace, name: this.workspaceName.trim() }
             : { mode: this.workspace }
-        if (this.host.length > 0)
-        {
-            template.host = this.host
-        }
+        template.repository = this.repository
         return template
     }
 
@@ -946,21 +987,113 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     }
 
     /**
-     * Rebuilds the runtime / model / host lists for the current values. A value missing from them stays as a marked
-     * choice: "(not in catalog)", or for a catalog model the runtime cannot load "(not served by {runtime})". While
-     * the catalog is unknown nothing is marked.
+     * Rebuilds the repository / runtime / model lists for the current values. The models are the repository's (a
+     * Pragmatic one's those the runtime loads). A value missing from them stays as a marked choice: "(not in catalog)",
+     * or for a model of the repository the runtime cannot load "(not served by {runtime})". While the catalog is
+     * unknown nothing is marked.
      */
     private RebuildChoices(): void
     {
         const catalog = this.catalog
+        const repository = this.CurrentRepository()
         const runtimes = (catalog?.runtimes ?? []).map(r => new ChoiceItem(r.name))
-        const models = (catalog?.models ?? []).filter(m => m.runtimes.includes(this.runtime)).map(m => new ChoiceItem(m.name))
-        const hosts = [new ChoiceItem('', TemplateEditorViewModel.AnyHostLabel), ...(catalog?.hosts ?? []).map(h => new ChoiceItem(h))]
-        const modelInCatalog = catalog?.models.some(m => m.name === this.model) === true
+        const models = this.ModelsOf(repository).map(m => new ChoiceItem(m))
+        const repositories = this.Repositories().map(r => new ChoiceItem(r.name))
+        const modelInRepository = repository !== null && TemplateEditorViewModel.ModelIds(repository).includes(this.model)
+        TemplateEditorViewModel.Replace(this.RepositoryChoices, this.WithValue(repositories, this.repository, ChoiceItem.Missing(this.repository)))
         TemplateEditorViewModel.Replace(this.RuntimeChoices, this.WithValue(runtimes, this.runtime, ChoiceItem.Missing(this.runtime)))
         TemplateEditorViewModel.Replace(this.ModelChoices, this.WithValue(models, this.model,
-            modelInCatalog ? ChoiceItem.NotServed(this.model, this.runtime) : ChoiceItem.Missing(this.model)))
-        TemplateEditorViewModel.Replace(this.HostChoices, this.WithValue(hosts, this.host, ChoiceItem.Missing(this.host)))
+            modelInRepository ? ChoiceItem.NotServed(this.model, this.runtime) : ChoiceItem.Missing(this.model)))
+    }
+
+    /** The catalog's repositories; a runtime older than repositories offers its hosts as Pragmatic ones over its models. */
+    private Repositories(): CatalogRepository[]
+    {
+        const catalog = this.catalog
+        if (catalog === null)
+        {
+            return []
+        }
+        return catalog.repositories ?? catalog.hosts.map(name => ({
+            name, kind: RepositoryKind.Pragmatic, capabilities: TemplateEditorViewModel.LegacyCapabilities, models: catalog.models,
+        }))
+    }
+
+    private CurrentRepository(): CatalogRepository | null
+    {
+        return this.Repositories().find(r => r.name === this.repository) ?? null
+    }
+
+    private get IsOpenRouter(): boolean
+    {
+        return this.CurrentRepository()?.kind === RepositoryKind.OpenRouter
+    }
+
+    /** The model choices of a repository: an OpenRouter one's every model, a Pragmatic one's those the runtime loads. */
+    private ModelsOf(repository: CatalogRepository | null): string[]
+    {
+        if (repository === null)
+        {
+            return []
+        }
+        if (repository.kind === RepositoryKind.OpenRouter)
+        {
+            return TemplateEditorViewModel.ModelIds(repository)
+        }
+        return repository.models
+            .filter((m): m is CatalogModel => TemplateEditorViewModel.IsCatalogModel(m) && m.runtimes.includes(this.runtime))
+            .map(m => m.name)
+    }
+
+    /** Every model id a repository lists (a Pragmatic model's name, an OpenRouter model's id). */
+    private static ModelIds(repository: CatalogRepository): string[]
+    {
+        return repository.models.map(m => TemplateEditorViewModel.IsCatalogModel(m) ? m.name : m.id)
+    }
+
+    private static IsCatalogModel(model: CatalogModel | OpenRouterModelInfo): model is CatalogModel
+    {
+        return !('id' in model)
+    }
+
+    /** After a repository change: the runtime and model it can run (see the Repository setter). */
+    private FitToRepository(): void
+    {
+        const repository = this.CurrentRepository()
+        if (repository === null)
+        {
+            return
+        }
+        if (repository.kind === RepositoryKind.OpenRouter)
+        {
+            this.runtime = TemplateEditorViewModel.OpenRouterRuntime
+        }
+        else if (!(this.catalog?.runtimes ?? []).some(r => r.name === this.runtime))
+        {
+            this.runtime = this.catalog?.runtimes[0]?.name ?? ''
+        }
+        const models = this.ModelsOf(repository)
+        if (!models.includes(this.model) && models.length > 0)
+        {
+            this.model = models[0]
+        }
+        this.ApplyOpenRouterModel()
+    }
+
+    /** An OpenRouter model was picked: the runtime is `openrouter` and the context size min(context_length, 32768). */
+    private ApplyOpenRouterModel(): void
+    {
+        const repository = this.CurrentRepository()
+        if (repository?.kind !== RepositoryKind.OpenRouter)
+        {
+            return
+        }
+        this.runtime = TemplateEditorViewModel.OpenRouterRuntime
+        const model = repository.models.find((m): m is OpenRouterModelInfo => !TemplateEditorViewModel.IsCatalogModel(m) && m.id === this.model)
+        if (model !== undefined && model.context_length > 0)
+        {
+            this.contextSizeText = String(Math.min(model.context_length, TemplateEditorViewModel.OpenRouterContextCap))
+        }
     }
 
     /** One checkbox per registry tool, then any enabled tool the registry lacks (so it can be seen and unticked). */
@@ -1059,32 +1192,52 @@ export class TemplateEditorViewModel extends Observable implements IToolChoiceOw
     {
         const workspaceName = this.IsWorkspaceNameEnabled ? this.workspaceName : ''
         return JSON.stringify([this.name, this.systemPrompt, this.stepBudgetText, this.runtime, this.model, this.contextSizeText,
-            this.context, this.compactAtText, this.enableThinking, this.temperatureText, this.topPText, this.host, this.workspace, workspaceName, [...this.enabled].sort()])
+            this.context, this.compactAtText, this.enableThinking, this.temperatureText, this.topPText, this.repository, this.workspace, workspaceName, [...this.enabled].sort()])
     }
 
-    private SetField<T>(prop: string, old: T, value: T, assign: () => void): void
+    /** Assigns and raises; `cascades` for a field whose assignment may change others (all fields are then raised). */
+    private SetField<T>(prop: string, old: T, value: T, assign: () => void, cascades: boolean = false): void
     {
         if (old === value)
         {
             return
         }
         assign()
+        if (cascades)
+        {
+            this.RaiseAll()
+            return
+        }
         this.RaisePropertyChanged(prop, old, value)
         this.Changed()
     }
 
-    /** Raises everything derived from the form (dirty, errors, choices) and refreshes the commands. */
-    private Changed(): void
+    /**
+     * Raises everything derived from the form (dirty, errors, choices) and refreshes the commands; with `withFields`
+     * the fields too. Visibility props now true go first and those now false last (HiddenTextRule).
+     */
+    private Changed(withFields: boolean = false): void
     {
+        this.RaiseVisibility(true)
+        if (withFields)
+        {
+            this.RaiseNamed(TemplateEditorViewModel.FieldProps)
+        }
         this.RaiseNamed(TemplateEditorViewModel.DerivedProps)
+        this.RaiseVisibility(false)
         this.saveCommand.RaiseCanExecuteChanged()
         this.revertCommand.RaiseCanExecuteChanged()
     }
 
     private RaiseAll(): void
     {
-        this.RaiseNamed(TemplateEditorViewModel.FieldProps)
-        this.Changed()
+        this.Changed(true)
+    }
+
+    /** Raises the visibility props whose value is `shown` (HiddenTextRule). */
+    private RaiseVisibility(shown: boolean): void
+    {
+        this.RaiseNamed(TemplateEditorViewModel.VisibilityProps.filter(name => Boolean((this as unknown as Record<string, unknown>)[name]) === shown))
     }
 
     private RaiseNamed(names: readonly string[]): void

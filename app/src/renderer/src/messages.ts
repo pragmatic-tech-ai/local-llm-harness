@@ -17,11 +17,18 @@ export class UserMessage extends Observable
     }
 }
 
-/** An assistant turn whose Text grows as chunks stream in. */
+/**
+ * An assistant turn whose Text grows as chunks stream in. Reasoning chunks grow Reasoning instead (shown dimmed above
+ * the answer, never committed, so a history reload has none). HasReasoning turns true before the first reasoning text
+ * is written, so its block is visible when the text lands (HiddenTextRule, see RepositoryEditorViewModel).
+ */
 export class AssistantMessage extends Observable
 {
     private static readonly TextProperty = 'Text'
+    private static readonly ReasoningProperty = 'Reasoning'
+    private static readonly HasReasoningProperty = 'HasReasoning'
     private _text: string
+    private _reasoning = ''
 
     constructor(text: string)
     {
@@ -34,11 +41,37 @@ export class AssistantMessage extends Observable
         return this._text
     }
 
+    public get Reasoning(): string
+    {
+        return this._reasoning
+    }
+
+    public get HasReasoning(): boolean
+    {
+        return this._reasoning.length > 0
+    }
+
     public Append(delta: string): void
     {
         const old = this._text
         this._text = old + delta
         this.RaisePropertyChanged(AssistantMessage.TextProperty, old, this._text)
+    }
+
+    public AppendReasoning(delta: string): void
+    {
+        if (delta.length === 0)
+        {
+            return
+        }
+        const old = this._reasoning
+        const had = this.HasReasoning
+        this._reasoning = old + delta
+        if (!had)
+        {
+            this.RaisePropertyChanged(AssistantMessage.HasReasoningProperty, had, true)
+        }
+        this.RaisePropertyChanged(AssistantMessage.ReasoningProperty, old, this._reasoning)
     }
 }
 

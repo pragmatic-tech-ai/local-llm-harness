@@ -57,7 +57,7 @@ describe('NewSessionDialogViewModel', () =>
         await rig.Respond('get_template', { id: 't1', path: 'Examples', template: {
             name: 'Researcher', system_prompt: 'read', tools: ['read_file'], step_budget: 4, runtime: 'llamacpp', model: 'gemma-4', n_ctx: 8192, enable_thinking: false,
         } })
-        expect(rig.vm.Summary).toBe('Model: gemma-4 (llamacpp, context 8192)\nTools: read_file\nStep budget: 4')
+        expect(rig.vm.Summary).toBe('Model: gemma-4 (llamacpp, context 8192)\nRepository: hive\nTools: read_file\nStep budget: 4')
         expect(rig.vm.CreateCommand.CanExecute(undefined)).toBe(true)
     })
 
@@ -83,5 +83,12 @@ describe('NewSessionDialogViewModel', () =>
         expect(rig.vm.StatusText).toBe('could not create the session: unknown template: t1')
         expect(rig.created).toEqual([])
         expect(rig.vm.CreateCommand.CanExecute(undefined)).toBe(true)
+    })
+    it('summary_names_the_repository', () =>
+    {
+        const template = { name: 'R', system_prompt: '', tools: [], step_budget: 4, runtime: 'openrouter', model: 'google/gemma-small', n_ctx: 8192, enable_thinking: false }
+        expect(NewSessionDialogViewModel.Describe({ ...template, repository: 'or' }))
+            .toBe('Model: google/gemma-small (openrouter, context 8192)\nRepository: or\nTools: none\nStep budget: 4')
+        expect(NewSessionDialogViewModel.Describe({ ...template, host: 'hive' })).toContain('\nRepository: hive\n')
     })
 })

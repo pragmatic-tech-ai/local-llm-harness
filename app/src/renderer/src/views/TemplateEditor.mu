@@ -1,6 +1,6 @@
-// Template editor (host area): Save / Revert over the template's fields: name, system prompt, step budget, runtime
-// and model (from the catalog, models filtered by the runtime), context size, context strategy and compact-at
-// percent, thinking, sampling defaults (blank = none), preferred host and the tool checkboxes. A field that does not parse shows its error under it and disables
+// Template editor (host area): Save / Revert over the template's fields: name, system prompt, step budget, repository,
+// runtime (Pragmatic repositories only) and model (the repository's, filtered by the runtime), context size, context
+// strategy and compact-at percent, thinking, sampling defaults (blank = none) and the tool checkboxes. A field that does not parse shows its error under it and disables
 // Save; load and save errors show above the form, and a catalog failure in a banner that stays until a retry works.
 // The form is read-only while the template loads. Merged app-global by app.mu.
 import TemplateEditorViewModel from "../TemplateEditorViewModel.js"
@@ -58,8 +58,14 @@ resources TemplateEditorResources {
                             TextBox [ Text = $StepBudgetText, HorizontalAlignment = Stretch ]
                             TextBlock [ Text = $StepBudgetError, Style = @BodySm, Foreground = @StateDanger, Visibility = $HasStepBudgetError << ToVisibility ]
 
-                            TextBlock [ Text = "Runtime", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
-                            ComboBox [ ItemsSource = $RuntimeChoices, SelectedItem = $RuntimeChoice, HorizontalAlignment = Stretch ]
+                            TextBlock [ Text = "Repository", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
+                            ComboBox [ ItemsSource = $RepositoryChoices, SelectedItem = $RepositoryChoice, HorizontalAlignment = Stretch ]
+
+                            // Only a Pragmatic repository has runtimes; an OpenRouter one's is always openrouter.
+                            StackPanel [ Orientation = Vertical, Visibility = $IsRuntimeVisible << ToVisibility ] {
+                                TextBlock [ Text = "Runtime", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
+                                ComboBox [ ItemsSource = $RuntimeChoices, SelectedItem = $RuntimeChoice, HorizontalAlignment = Stretch ]
+                            }
 
                             TextBlock [ Text = "Model", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
                             ComboBox [ ItemsSource = $ModelChoices, SelectedItem = $ModelChoice, HorizontalAlignment = Stretch ]
@@ -93,9 +99,6 @@ resources TemplateEditorResources {
                             TextBlock [ Text = "Top P (blank = worker default)", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
                             TextBox [ Text = $TopPText, HorizontalAlignment = Stretch, Placeholder = "default" ]
                             TextBlock [ Text = $TopPError, Style = @BodySm, Foreground = @StateDanger, Visibility = $HasTopPError << ToVisibility ]
-
-                            TextBlock [ Text = "Preferred host", Style = @BodySm, Foreground = @Fg2, Margin = (0,8,0,0) ]
-                            ComboBox [ ItemsSource = $HostChoices, SelectedItem = $HostChoice, HorizontalAlignment = Stretch ]
 
                             TextBlock [ Text = "Tools", Style = @BodySm, Foreground = @Fg2, Margin = (0,12,0,4) ]
                             ItemsControl [ ItemsSource = $Tools, ItemsPanel = @AgentToolsPanel ]

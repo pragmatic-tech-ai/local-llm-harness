@@ -1,20 +1,20 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import { TypedSignal } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
-import type { AgentTemplate, SessionSummary } from './agents'
+import { TemplateRepository, type AgentTemplate, type SessionSummary } from './agents'
 import { TemplateTreeNodeViewModel } from './TemplateTreeNodeViewModel'
 import { TextFormat } from './TextFormat'
 
 /**
- * Body of the New session dialog: the template tree and a short summary of the selected template (model, tools,
- * budget). Create makes the session and raises OnCreated; the owner closes the dialog and opens the session.
+ * Body of the New session dialog: the template tree and a short summary of the selected template (model, repository,
+ * tools, budget). Create makes the session and raises OnCreated; the owner closes the dialog and opens the session.
  */
 export class NewSessionDialogViewModel extends Observable
 {
     private static readonly PropSelectedNode = 'SelectedNode'
     private static readonly PropSummary = 'Summary'
     private static readonly PropStatusText = 'StatusText'
-    private static readonly SummaryFormat = 'Model: {0} ({1}, context {2})\nTools: {3}\nStep budget: {4}'
+    private static readonly SummaryFormat = 'Model: {0} ({1}, context {2})\nRepository: {3}\nTools: {4}\nStep budget: {5}'
     private static readonly NoTools = 'none'
     private static readonly ToolsSeparator = ', '
     private static readonly GroupHint = 'Choose a template.'
@@ -104,12 +104,12 @@ export class NewSessionDialogViewModel extends Observable
         }
     }
 
-    /** One summary for a template: its model, tools and step budget. */
+    /** One summary for a template: its model, repository, tools and step budget. */
     public static Describe(template: AgentTemplate): string
     {
         const tools = template.tools.length > 0 ? template.tools.join(NewSessionDialogViewModel.ToolsSeparator) : NewSessionDialogViewModel.NoTools
         return TextFormat.Format(NewSessionDialogViewModel.SummaryFormat,
-            template.model, template.runtime, template.n_ctx, tools, template.step_budget)
+            template.model, template.runtime, template.n_ctx, TemplateRepository.Of(template), tools, template.step_budget)
     }
 
     private async ShowSummaryFor(node: TemplateTreeNodeViewModel | null): Promise<void>

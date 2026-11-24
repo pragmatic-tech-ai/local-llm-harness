@@ -1,5 +1,5 @@
 // Instrument panel: sampling knobs, thinking toggle, context fill, agent trace, raw prompt,
-// per-token logprobs, tokenization. Merged app-global by app.mu.
+// per-token logprobs, tokenization (a feature the provider lacks reads "not available for this provider"). Merged app-global by app.mu.
 import InstrumentPanelViewModel from "../InstrumentPanelViewModel.js"
 import LogprobVM from "../LogprobVM.js"
 
@@ -59,27 +59,34 @@ resources InstrumentPanelResources {
                 ContentControl [ Content = $Trace ]
 
                 TextBlock [ Text = "Raw prompt", Style = @BodySm, Foreground = @Fg2 ]
-                Border [ Stroke = Pen [ Brush = @Border ], CornerRadius = 4, Padding = (6,4,6,4), Margin = (0,0,0,8), ClipToBounds = true ] {
+                Border [ Stroke = Pen [ Brush = @Border ], CornerRadius = 4, Padding = (6,4,6,4), Margin = (0,0,0,8), ClipToBounds = true,
+                         Visibility = $IsRawPromptAvailable << ToVisibility ] {
                     ScrollViewer [ MaxHeight = 200, HorizontalScrollEnabled = false ] {
                         TextBlock [ Text = $Prompt, TextWrapping = Wrap, FontFamily = "Consolas" ]
                     }
                 }
+                TextBlock [ Text = $NotAvailableText, Foreground = @Fg2, Margin = (0,0,0,8), Visibility = $IsRawPromptUnavailable << ToVisibility ]
 
                 TextBlock [ Text = "Logprobs (last reply)", Style = @BodySm, Foreground = @Fg2 ]
-                Border [ Stroke = Pen [ Brush = @Border ], CornerRadius = 4, Padding = (6,4,6,4), Margin = (0,0,0,8), ClipToBounds = true ] {
+                Border [ Stroke = Pen [ Brush = @Border ], CornerRadius = 4, Padding = (6,4,6,4), Margin = (0,0,0,8), ClipToBounds = true,
+                         Visibility = $IsLogprobsAvailable << ToVisibility ] {
                     ScrollViewer [ MaxHeight = 200, HorizontalScrollEnabled = false ] {
                         ItemsControl [ ItemsSource = $Logprobs, ItemsPanel = @VerticalStackPanel ]
                     }
                 }
+                TextBlock [ Text = $NotAvailableText, Foreground = @Fg2, Margin = (0,0,0,8), Visibility = $IsLogprobsUnavailable << ToVisibility ]
 
                 TextBlock [ Text = "Tokenize", Style = @BodySm, Foreground = @Fg2 ]
-                DockPanel [ LastChildFill = true ] {
-                    Button [ DockPanel.Dock = Right, Command = $TokenizeCommand, Margin = (6,0,0,0) ] {
-                        TextBlock [ Text = "Tokenize" ]
+                StackPanel [ Orientation = Vertical, Visibility = $IsTokenizeAvailable << ToVisibility ] {
+                    DockPanel [ LastChildFill = true ] {
+                        Button [ DockPanel.Dock = Right, Command = $TokenizeCommand, Margin = (6,0,0,0) ] {
+                            TextBlock [ Text = "Tokenize" ]
+                        }
+                        TextBox [ Text = $TokenizeInput, Placeholder = "Text to tokenize…" ]
                     }
-                    TextBox [ Text = $TokenizeInput, Placeholder = "Text to tokenize…" ]
+                    TextBlock [ Text = $TokenizeResult, TextWrapping = Wrap, FontFamily = "Consolas", Margin = (0,4,0,0) ]
                 }
-                TextBlock [ Text = $TokenizeResult, TextWrapping = Wrap, FontFamily = "Consolas", Margin = (0,4,0,0) ]
+                TextBlock [ Text = $NotAvailableText, Foreground = @Fg2, Visibility = $IsTokenizeUnavailable << ToVisibility ]
             }
         }
     }

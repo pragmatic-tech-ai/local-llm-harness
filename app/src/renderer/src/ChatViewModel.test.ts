@@ -430,4 +430,27 @@ describe('ChatViewModel', () =>
         rig.Notify('turn_chunk', { text: 'late', tokens: [], stop: false })
         expect(rig.Count()).toBe(1)
     })
+    it('reasoning_chunks_render_dimmed_not_in_content', () =>
+    {
+        const rig = new Rig(true)
+        rig.Send('hi')
+        const raised: string[] = []
+        for (const name of ['HasReasoning', 'Reasoning'])
+        {
+            rig.Reply(1).PropertyChanged(name).subscribe(() => raised.push(name))
+        }
+        expect(rig.Reply(1).HasReasoning).toBe(false)
+        rig.Notify('turn_chunk', { text: 'let me ', tokens: [], stop: false, reasoning: true })
+        rig.Notify('turn_chunk', { text: 'think', tokens: [], stop: false, reasoning: true })
+        rig.Notify('turn_chunk', { text: 'Answer', tokens: [], stop: true })
+        expect(rig.Reply(1).Reasoning).toBe('let me think')
+        expect(rig.Reply(1).HasReasoning).toBe(true)
+        expect(rig.Reply(1).Text).toBe('Answer')
+        // The reasoning block is shown before its text is first written (HiddenTextRule).
+        expect(raised[0]).toBe('HasReasoning')
+        rig.vm.LoadHistory([{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'Answer' }])
+        expect(rig.Reply(1).Text).toBe('Answer')
+        expect(rig.Reply(1).Reasoning).toBe('')
+        expect(rig.Reply(1).HasReasoning).toBe(false)
+    })
 })

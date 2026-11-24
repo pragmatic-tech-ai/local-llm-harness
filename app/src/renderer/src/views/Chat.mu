@@ -37,9 +37,14 @@ resources ChatResources {
         }
     }
 
+    // Assistant reply: the model's reasoning (if any) dimmed above the answer.
     DataTemplate [ DataType = AssistantMessage ] {
         Border [ Padding = (10,6,10,6), Margin = (0,3,40,3) ] {
-            TextBlock [ Text = $Text, TextWrapping = Wrap ]
+            StackPanel [ Orientation = Vertical ] {
+                TextBlock [ Text = $Reasoning, Style = @BodySm, Foreground = @Fg2, TextWrapping = Wrap, Margin = (0,0,0,4),
+                            Visibility = $HasReasoning << ToVisibility ]
+                TextBlock [ Text = $Text, TextWrapping = Wrap ]
+            }
         }
     }
 

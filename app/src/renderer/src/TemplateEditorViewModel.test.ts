@@ -3,7 +3,7 @@ import { RuntimeClient } from './RuntimeClient'
 import { FakeSocket } from './FakeSocket'
 import { TemplateEditorViewModel } from './TemplateEditorViewModel'
 import { TemplateTreeNodeViewModel } from './TemplateTreeNodeViewModel'
-import type { AgentTemplate, CatalogInfo, TemplateLeafNode, ToolSpec } from './agents'
+import { RepositoryKind, type AgentTemplate, type CatalogInfo, type CatalogModel, type ProviderCapabilities, type TemplateLeafNode, type ToolSpec } from './agents'
 
 class Rig
 {
@@ -19,14 +19,29 @@ class Rig
         this.editor.OnSaved.Subscribe(id => this.saved.push(id))
     }
 
+    public static readonly HiveModels: CatalogModel[] = [
+        { name: 'gemma-4', runtimes: ['llamacpp'], size_hint: null },
+        { name: 'tiny', runtimes: ['candle', 'llamacpp'], size_hint: null },
+        { name: 'phi', runtimes: ['candle'], size_hint: null },
+    ]
+
+    public static readonly Full: ProviderCapabilities = { measure_prompt: 'exact', tokenize: true, raw_prompt: true, logprobs: true, load_unload: true }
+
+    public static readonly Remote: ProviderCapabilities = { measure_prompt: 'estimated', tokenize: false, raw_prompt: false, logprobs: false, load_unload: false }
+
     public static readonly Catalog: CatalogInfo = {
         runtimes: [{ name: 'llamacpp', kind: 'llamacpp' }, { name: 'candle', kind: 'candle' }],
-        models: [
-            { name: 'gemma-4', runtimes: ['llamacpp'], size_hint: null },
-            { name: 'tiny', runtimes: ['candle', 'llamacpp'], size_hint: null },
-            { name: 'phi', runtimes: ['candle'], size_hint: null },
-        ],
+        models: Rig.HiveModels,
         hosts: ['hive'],
+        repositories: [
+            { name: 'hive', kind: RepositoryKind.Pragmatic, capabilities: Rig.Full, models: Rig.HiveModels },
+            {
+                name: 'or', kind: RepositoryKind.OpenRouter, capabilities: Rig.Remote, models: [
+                    { id: 'anthropic/claude-x', name: 'Claude X', context_length: 200000, prompt_price: 3, completion_price: 15, reasoning: true },
+                    { id: 'google/gemma-small', name: 'Gemma small', context_length: 8192, prompt_price: 0.1, completion_price: 0.2, reasoning: false },
+                ],
+            },
+        ],
     }
 
     public static readonly Tools: ToolSpec[] = [
@@ -103,8 +118,8 @@ describe('TemplateEditorViewModel', () =>
         expect(e.ContextSizeText).toBe('8192')
         expect(e.TemperatureText).toBe('0.7')
         expect(e.TopPText).toBe('0.9')
-        expect(e.Host).toBe('hive')
-        expect(e.HostChoice?.Value).toBe('hive')
+        expect(e.Repository).toBe('hive')
+        expect(e.RepositoryChoice?.Value).toBe('hive')
         expect(e.Tools.ToArray().map(t => [t.Name, t.Description, t.Enabled])).toEqual([['read_file', 'Read a file', true], ['get_time', 'The time', false]])
         expect(e.IsDirty).toBe(false)
         expect(e.SaveCommand.CanExecute(undefined)).toBe(false)
@@ -121,7 +136,7 @@ describe('TemplateEditorViewModel', () =>
         e.TemperatureText = '0.5'
         e.EnableThinking = true
         e.Tools.Get(1)!.Enabled = true
-        e.HostChoice = e.HostChoices.ToArray().find(c => c.Value === 'hive')!
+        e.RepositoryChoice = e.RepositoryChoices.ToArray().find(c => c.Value === 'hive')!
         expect(e.IsDirty).toBe(true)
         expect(e.SaveCommand.CanExecute(undefined)).toBe(true)
         e.SaveCommand.Execute(undefined)
@@ -133,7 +148,7 @@ describe('TemplateEditorViewModel', () =>
             template: {
                 name: 'Researcher 2', system_prompt: 'read', tools: ['read_file', 'get_time'], step_budget: 4, runtime: 'llamacpp',
                 model: 'gemma-4', n_ctx: 8192, enable_thinking: true, context_strategy: 'off', compact_at_pct: 75,
-                sampling: { temperature: 0.5, top_p: 0.95 }, host: 'hive', workspace: { mode: 'session' },
+                sampling: { temperature: 0.5, top_p: 0.95 }, workspace: { mode: 'session' }, repository: 'hive',
             },
         })
         await rig.Respond('save_template', { id: 't1' })
@@ -563,5 +578,90 @@ describe('TemplateEditorViewModel', () =>
         rig.editor.Name = 'Typing'
         await rig.Respond('get_template', { id: 't1', path: 'Examples', template: { ...Rig.Researcher, name: 'Server' } })
         expect(rig.editor.Name).toBe('Typing')
+    })
+    it('editor_repository_combo_filters_models', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open()
+        const e = rig.editor
+        expect(e.RepositoryChoices.ToArray().map(c => c.Value)).toEqual(['hive', 'or'])
+        expect(e.RepositoryChoice?.Value).toBe('hive')
+        expect(e.ModelChoices.ToArray().map(c => c.Value)).toEqual(['gemma-4', 'tiny'])
+        e.RepositoryChoice = e.RepositoryChoices.Get(1)!
+        expect(e.Repository).toBe('or')
+        expect(e.ModelChoices.ToArray().map(c => c.Value)).toEqual(['anthropic/claude-x', 'google/gemma-small'])
+        e.RepositoryChoice = e.RepositoryChoices.Get(0)!
+        expect(e.Repository).toBe('hive')
+        expect(e.Runtime).toBe('llamacpp')
+        expect(e.ModelChoices.ToArray().map(c => c.Value)).toEqual(['gemma-4', 'tiny'])
+        expect(e.Model).toBe('gemma-4')
+    })
+
+    it('openrouter_model_hides_runtime_and_defaults_ctx', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open()
+        const e = rig.editor
+        expect(e.IsRuntimeVisible).toBe(true)
+        const raised: string[] = []
+        for (const name of ['IsRuntimeVisible', 'RuntimeChoice', 'ContextSizeText'])
+        {
+            e.PropertyChanged(name).subscribe(() => raised.push(name))
+        }
+        e.Repository = 'or'
+        expect(e.IsRuntimeVisible).toBe(false)
+        expect(e.Runtime).toBe('openrouter')
+        expect(e.Model).toBe('anthropic/claude-x')
+        expect(e.ContextSizeText).toBe('32768')
+        // A row being hidden disappears after its texts changed (HiddenTextRule).
+        expect(raised.lastIndexOf('IsRuntimeVisible')).toBeGreaterThan(raised.lastIndexOf('RuntimeChoice'))
+        e.ModelChoice = e.ModelChoices.Get(1)!
+        expect(e.Model).toBe('google/gemma-small')
+        expect(e.ContextSizeText).toBe('8192')
+        expect(e.Runtime).toBe('openrouter')
+        raised.length = 0
+        e.Repository = 'hive'
+        expect(e.IsRuntimeVisible).toBe(true)
+        // A row being shown appears before its texts change.
+        expect(raised.indexOf('IsRuntimeVisible')).toBeLessThan(raised.indexOf('RuntimeChoice'))
+    })
+
+    it('legacy_host_template_loads_as_hive', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open({ ...Rig.Researcher, host: 'hive' })
+        expect(rig.editor.Repository).toBe('hive')
+        expect(rig.editor.RepositoryChoice?.Value).toBe('hive')
+        expect(rig.editor.IsRuntimeVisible).toBe(true)
+        expect(rig.editor.IsDirty).toBe(false)
+        const bare = new Rig()
+        await bare.Open()
+        expect(bare.editor.Repository).toBe('hive')
+        expect(bare.editor.IsDirty).toBe(false)
+        const named = new Rig()
+        await named.Open({ ...Rig.Researcher, runtime: 'openrouter', model: 'google/gemma-small', repository: 'or', host: 'hive' })
+        expect(named.editor.Repository).toBe('or')
+        expect(named.editor.IsRuntimeVisible).toBe(false)
+        expect(named.editor.ModelChoice?.Value).toBe('google/gemma-small')
+        // Opening an OpenRouter template keeps its context size (only a pick sets the default).
+        expect(named.editor.ContextSizeText).toBe('8192')
+        expect(named.editor.IsDirty).toBe(false)
+    })
+
+    it('save_sends_repository_not_host', async () =>
+    {
+        const rig = new Rig()
+        await rig.Open({ ...Rig.Researcher, host: 'hive' })
+        rig.editor.Name = 'Renamed'
+        rig.editor.SaveCommand.Execute(undefined)
+        const legacy = rig.Frames().pop()!.params.template as AgentTemplate
+        expect(legacy.repository).toBe('hive')
+        expect('host' in legacy).toBe(false)
+        await rig.Respond('save_template', { id: 't1' })
+        rig.editor.Repository = 'or'
+        rig.editor.SaveCommand.Execute(undefined)
+        const remote = rig.Frames().pop()!.params.template as AgentTemplate
+        expect(remote).toMatchObject({ repository: 'or', runtime: 'openrouter', model: 'anthropic/claude-x', n_ctx: 32768 })
+        expect('host' in remote).toBe(false)
     })
 })

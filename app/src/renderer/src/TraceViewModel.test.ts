@@ -440,4 +440,22 @@ describe('TraceViewModel', () =>
             expect(step.HasCompaction).toBe(false)
         }
     })
+    it('trace_line_shows_cost_and_estimate', () =>
+    {
+        const step = new TraceStepViewModel(Rig.Step(1, 1, { estimated: true, cost: 0.00123 }))
+        expect(step.Text).toBe('1  ≈ctx 3 102/8 192 (38%) · $0.0012')
+        expect(new TraceStepViewModel(Rig.Step(1, 1, { cost: 0.5 })).Text).toBe('1  ctx 3 102/8 192 (38%) · $0.5000')
+        expect(new TraceStepViewModel(Rig.Step(1, 1, { prompt_tokens: null, n_ctx: null, cost: 0.01 })).Text).toBe('1  — · $0.0100')
+        expect(new TraceStepViewModel(Rig.Step(1, 1)).Text).toBe('1  ctx 3 102/8 192 (38%)')
+        const trim: CompactionRecord = {
+            strategy: 'trim', before_tokens: 7420, after_tokens: 5980, elided_results: 3, dropped_turns: 0, summarized_messages: 0,
+            summary_ms: null, reused_summary: false, fallback: false, summary_prompt_tokens: null, summary_out_tokens: null, summary_error: null,
+        }
+        // An estimated step's compaction counts are estimates too.
+        expect(new TraceStepViewModel(Rig.Step(1, 1, { estimated: true, compaction: trim })).CompactionText)
+            .toBe('⟲ trim: ≈7 420 → ≈5 980 tokens · 3 results elided · 0 turns dropped')
+        const summary: CompactionRecord = { ...trim, strategy: 'summarize', elided_results: 0, summarized_messages: 14, after_tokens: 3100, summary_ms: 18200, summary_cost: 0.0003 }
+        expect(new TraceStepViewModel(Rig.Step(1, 1, { compaction: summary })).CompactionText)
+            .toBe('⟲ summarize: 7 420 → 3 100 tokens · covers 14 messages · 18.2 s · $0.0003')
+    })
 })

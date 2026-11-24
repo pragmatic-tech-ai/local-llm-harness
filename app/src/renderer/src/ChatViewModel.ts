@@ -91,7 +91,7 @@ export class ChatViewModel extends Observable
         {
             this.subscriptions.push(
                 client.OnTurnStarted.Subscribe(() => this.OnPassStarted()),
-                client.OnTurnChunk.Subscribe(p => this.OnChunk(p.text)),
+                client.OnTurnChunk.Subscribe(p => this.OnChunk(p.text, p.reasoning === true)),
                 client.OnTurnDone.Subscribe(() => { this.segment = null }),
                 client.OnTurnError.Subscribe(p => this.ReportFailure(TextFormat.Format(ChatViewModel.ErrorFormat, p.message))),
                 client.OnTurnRejected.Subscribe(p => this.ReportFailure(TextFormat.Format(ChatViewModel.RejectedFormat, p.needed, p.total))),
@@ -234,8 +234,11 @@ export class ChatViewModel extends Observable
         }
     }
 
-    /** Chunks go to the live segment; after a tool call closed it, the next chunk of the pass opens a new one below the call. */
-    private OnChunk(text: string): void
+    /**
+     * Chunks go to the live segment (a reasoning chunk to its reasoning text); after a tool call closed it, the next
+     * chunk of the pass opens a new one below the call.
+     */
+    private OnChunk(text: string, reasoning: boolean): void
     {
         if (this.segment === null)
         {
@@ -246,7 +249,14 @@ export class ChatViewModel extends Observable
             this.segment = new AssistantMessage('')
             this.Transcript.Add(this.segment)
         }
-        this.segment.Append(text)
+        if (reasoning)
+        {
+            this.segment.AppendReasoning(text)
+        }
+        else
+        {
+            this.segment.Append(text)
+        }
     }
 
     /** The runtime loads the session's model before this turn: say so where the reply will appear. */

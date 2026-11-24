@@ -212,6 +212,41 @@ describe('InstrumentPanelViewModel', () =>
         rig.Send('two')
         expect(rig.SamplingSent().map(c => c.temperature)).toEqual([1, 1])
     })
+
+    it('instrument_features_marked_not_available', () =>
+    {
+        const rig = new Rig()
+        const panel = rig.vm.Panel
+        expect(panel.IsTokenizeAvailable).toBe(true)
+        expect(panel.IsRawPromptAvailable).toBe(true)
+        expect(panel.IsLogprobsAvailable).toBe(true)
+        expect(panel.NotAvailableText).toBe('not available for this provider')
+        panel.ApplyCapabilities({ measure_prompt: 'estimated', tokenize: false, raw_prompt: false, logprobs: true, load_unload: false })
+        expect(panel.IsTokenizeAvailable).toBe(false)
+        expect(panel.IsTokenizeUnavailable).toBe(true)
+        expect(panel.IsRawPromptAvailable).toBe(false)
+        expect(panel.IsRawPromptUnavailable).toBe(true)
+        expect(panel.IsLogprobsAvailable).toBe(true)
+        expect(panel.IsLogprobsUnavailable).toBe(false)
+        // A gone repository (null) shows every feature, as before capabilities existed.
+        panel.ApplyCapabilities(null)
+        expect(panel.IsTokenizeAvailable).toBe(true)
+        expect(panel.IsRawPromptAvailable).toBe(true)
+    })
+
+    it('estimated_context_shows_approx', () =>
+    {
+        const rig = new Rig()
+        rig.Send('one')
+        rig.Notify('turn_started', { prompt: null, prompt_tokens: 1024, n_ctx: 4096, estimated: true })
+        expect(rig.vm.Panel.ContextLabel).toBe('≈1024 / 4096 (25%)')
+        expect(rig.vm.Panel.Prompt).toBe('')
+        rig.Notify('turn_started', { prompt: 'RAW', prompt_tokens: 1024, n_ctx: 4096 })
+        expect(rig.vm.Panel.ContextLabel).toBe('1024 / 4096 (25%)')
+        // An estimating provider marks the fill before its first turn too.
+        rig.vm.Panel.ApplyCapabilities({ measure_prompt: 'estimated', tokenize: false, raw_prompt: false, logprobs: false, load_unload: false })
+        expect(rig.vm.Panel.ContextLabel).toBe('≈1024 / 4096 (25%)')
+    })
 })
 
 describe('LogprobVM', () =>

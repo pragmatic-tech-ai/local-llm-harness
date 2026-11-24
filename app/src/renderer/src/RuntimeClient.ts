@@ -51,9 +51,12 @@ export interface TokenInfo
 
 export interface TurnStarted
 {
-    prompt: string
+    /** Null from a provider that has no raw prompt to show. */
+    prompt: string | null
     prompt_tokens: number
     n_ctx: number
+    /** The prompt token count is an estimate (absent = exact). */
+    estimated?: boolean
 }
 
 export interface TurnChunk
@@ -61,6 +64,8 @@ export interface TurnChunk
     text: string
     tokens: TokenInfo[]
     stop: boolean
+    /** Reasoning text, shown apart from the answer and never committed (absent = answer text). */
+    reasoning?: boolean
 }
 
 export interface TurnError

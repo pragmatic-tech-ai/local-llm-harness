@@ -1,4 +1,5 @@
-// Session view (host area): a header line (template · model @ host, placement, Load / Unload model, tools) over the
+// Session view (host area): a header line (template · model @ host, placement, Load / Unload model when the provider
+// loads models, tools) over the
 // existing chat + instrument panel; an empty state when no session is shown. Merged app-global by app.mu.
 import SessionViewModel from "../SessionViewModel.js"
 import NoteRowViewModel from "../NoteRowViewModel.js"
@@ -10,10 +11,11 @@ resources SessionViewResources {
                         Visibility = $IsEmpty << ToVisibility ]
             DockPanel [ LastChildFill = true, Visibility = $HasSession << ToVisibility ] {
                 DockPanel [ DockPanel.Dock = Top, LastChildFill = true, Margin = (12,12,12,0) ] {
-                    Button [ DockPanel.Dock = Right, Command = $UnloadCommand, Margin = (6,0,0,0) ] {
+                    // Hidden for a provider with nothing to load (OpenRouter).
+                    Button [ DockPanel.Dock = Right, Command = $UnloadCommand, Margin = (6,0,0,0), Visibility = $IsLoadable << ToVisibility ] {
                         TextBlock [ Text = "Unload model" ]
                     }
-                    Button [ DockPanel.Dock = Right, Command = $LoadCommand, Margin = (6,0,0,0) ] {
+                    Button [ DockPanel.Dock = Right, Command = $LoadCommand, Margin = (6,0,0,0), Visibility = $IsLoadable << ToVisibility ] {
                         TextBlock [ Text = $LoadLabel ]
                     }
                     StackPanel [ Orientation = Vertical, VerticalAlignment = Center ] {

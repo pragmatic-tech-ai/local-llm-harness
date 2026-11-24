@@ -41,7 +41,22 @@ export interface AgentTemplate
     sampling?: Partial<SamplingConfig>
     /** Absent in a template saved before workspaces existed: read as `session`. */
     workspace?: WorkspaceConfig
+    /** The repository the model comes from; absent reads as `hive`. */
+    repository?: string
+    /** The old name of `repository`, still read (a save never sends it). */
     host?: string
+}
+
+/** Which repository a template names: `repository`, else the legacy `host`, else `hive`. */
+export class TemplateRepository
+{
+    /** The Pragmatic repository a template without one runs on. */
+    public static readonly Default = 'hive'
+
+    public static Of(template: AgentTemplate): string
+    {
+        return template.repository ?? template.host ?? TemplateRepository.Default
+    }
 }
 
 export interface TemplateGroupNode
@@ -101,6 +116,8 @@ export interface SessionSummary
     updated: number
     placement: Placement
     busy: boolean
+    /** The provider's capabilities; null when the session's repository is gone (absent from an older runtime). */
+    capabilities?: ProviderCapabilities | null
 }
 
 /** One OpenAI-style call an assistant message carries in the committed transcript. */
@@ -128,6 +145,8 @@ export interface AttachedSession
     sampling: SamplingConfig
     enable_thinking: boolean
     placement: Placement
+    /** The provider's capabilities; null when the session's repository is gone (absent from an older runtime). */
+    capabilities?: ProviderCapabilities | null
 }
 
 export interface CatalogRuntime
@@ -148,7 +167,10 @@ export interface CatalogInfo
 {
     runtimes: CatalogRuntime[]
     models: CatalogModel[]
+    /** Kept for older apps; the editor reads `repositories`. */
     hosts: string[]
+    /** Absent from a runtime older than repositories. */
+    repositories?: CatalogRepository[]
 }
 
 export interface ToolSpec
@@ -215,6 +237,8 @@ export interface CompactionRecord
     summary_prompt_tokens: number | null
     summary_out_tokens: number | null
     summary_error: string | null
+    /** The provider-reported cost of the summary calls (USD); absent when none was reported. */
+    summary_cost?: number
 }
 
 /** One model call of a turn. `v` and `kind` are the log-line envelope; `kind` discriminates it from a TurnRecord. */
@@ -237,6 +261,10 @@ export interface StepRecord
     tools: ToolTiming[]
     error: string | null
     compaction?: CompactionRecord | null
+    /** The provider-reported cost of the step (USD); absent when none was reported. */
+    cost?: number
+    /** The prompt token count is an estimate (absent = exact). */
+    estimated?: boolean
 }
 
 /** A turn's closing summary. `reason` is a loop_done reason or 'aborted'. */
@@ -305,6 +333,15 @@ export interface ProviderCapabilities
     raw_prompt: boolean
     logprobs: boolean
     load_unload: boolean
+}
+
+/** One `list_catalog` repository: the editor's source for repository and model choices. */
+export interface CatalogRepository
+{
+    name: string
+    kind: RepositoryKind
+    capabilities: ProviderCapabilities
+    models: (CatalogModel | OpenRouterModelInfo)[]
 }
 
 /** One `list_repositories` row. The key itself never travels; `key_hint` is its last 4 characters. */

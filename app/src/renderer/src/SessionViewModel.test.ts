@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { RuntimeClient } from './RuntimeClient'
 import { FakeSocket } from './FakeSocket'
 import { SessionViewModel } from './SessionViewModel'
-import { PlacementState, type AttachedSession, type Placement } from './agents'
+import { PlacementState, type AttachedSession, type Placement, type ProviderCapabilities } from './agents'
 
 class Rig
 {
@@ -351,5 +351,36 @@ describe('SessionViewModel', () =>
         expect(rig.Frame('get_notes')?.params).toEqual({ id: 's2' })
         await rig.Respond('get_notes', { notes: ['plan B'] })
         expect(rig.view.Notes.ToArray().map(n => n.Text)).toEqual(['1. plan B'])
+    })
+    it('load_buttons_hidden_without_load_unload', async () =>
+    {
+        const remote: ProviderCapabilities = { measure_prompt: 'estimated', tokenize: false, raw_prompt: false, logprobs: false, load_unload: false }
+        const rig = new Rig()
+        expect(rig.view.IsLoadable).toBe(true)
+        const raised: string[] = []
+        for (const name of ['IsLoadable', 'LoadLabel'])
+        {
+            rig.view.PropertyChanged(name).subscribe(() => raised.push(name))
+        }
+        const done = rig.view.Attach('s1')
+        await rig.Respond('attach_session', { ...Rig.Attached({ state: PlacementState.Ready, host: 'or' }), capabilities: remote })
+        await done
+        expect(rig.view.Capabilities).toEqual(remote)
+        expect(rig.view.IsLoadable).toBe(false)
+        // The buttons disappear after their label changed (HiddenTextRule).
+        expect(raised.lastIndexOf('IsLoadable')).toBeGreaterThan(raised.lastIndexOf('LoadLabel'))
+        expect(rig.view.Panel.IsTokenizeAvailable).toBe(false)
+
+        const local = new Rig()
+        await local.Show({ state: PlacementState.Ready, host: 'local' })
+        // Absent (an older runtime) or full capabilities keep Load and Unload.
+        expect(local.view.Capabilities).toBe(null)
+        expect(local.view.IsLoadable).toBe(true)
+        const gone = new Rig()
+        const goneDone = gone.view.Attach('s1')
+        await gone.Respond('attach_session', { ...Rig.Attached({ state: PlacementState.Unavailable, reason: 'repository not found: or' }), capabilities: null })
+        await goneDone
+        expect(gone.view.IsLoadable).toBe(true)
+        expect(gone.view.Panel.IsTokenizeAvailable).toBe(true)
     })
 })

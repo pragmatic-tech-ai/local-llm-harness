@@ -1,7 +1,7 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import type { IDisposable } from './JsonRpcConnection'
 import type { RuntimeClient } from './RuntimeClient'
-import { PlacementState, type AgentTemplate, type AttachedSession, type Placement } from './agents'
+import { PlacementState, type AgentTemplate, type AttachedSession, type Placement, type ProviderCapabilities } from './agents'
 import { PlacementText } from './PlacementText'
 import { ChatViewModel } from './ChatViewModel'
 import type { InstrumentPanelViewModel } from './InstrumentPanelViewModel'
@@ -12,7 +12,9 @@ import { NoteRowViewModel } from './NoteRowViewModel'
 /**
  * The host-area view of the shown session: a header (template · model @ host, placement, Load / Unload, tools) over
  * the existing chat and instrument panel. One stable instance; Attach re-points it at a session over the shared
- * runtime connection, Clear empties it.
+ * runtime connection, Clear empties it. The session's provider capabilities hide Load and Unload for a provider with
+ * nothing to load (IsLoadable), and go to the instrument panel. IsLoadable is raised before the header texts when it
+ * turns true and after them when it turns false (HiddenTextRule, see RepositoryEditorViewModel).
  */
 export class SessionViewModel extends Observable
 {
@@ -38,6 +40,8 @@ export class SessionViewModel extends Observable
     private static readonly PropNotesHeader = 'NotesHeader'
     private static readonly PropIsNotesExpanded = 'IsNotesExpanded'
     private static readonly PropHasNotes = 'HasNotes'
+    private static readonly PropIsLoadable = 'IsLoadable'
+    private static readonly PropCapabilities = 'Capabilities'
     private static readonly Props = [SessionViewModel.PropHasNotes, SessionViewModel.PropNotesHeader, 'HasSession', 'IsEmpty', 'HeaderText', 'PlacementText', 'CanLoad', 'CanUnload', 'LoadLabel', 'ToolsText', 'IsStale']
 
     public readonly Chat = new ChatViewModel()
@@ -54,6 +58,8 @@ export class SessionViewModel extends Observable
     private shownId: string | null = null
     private snapshot: AgentTemplate | null = null
     private placement: Placement | null = null
+    /** The session's provider capabilities; null when unknown (none shown, an older runtime) or its repository is gone. */
+    private capabilities: ProviderCapabilities | null = null
     /** A transient line (attaching, loading, an error) shown in place of the placement text. */
     private status = ''
     /** A Load command is in flight. */
@@ -140,7 +146,7 @@ export class SessionViewModel extends Observable
         {
             return ''
         }
-        const host = this.placement?.host ?? snapshot.host
+        const host = this.placement?.host ?? snapshot.repository ?? snapshot.host
         return host
             ? TextFormat.Format(SessionViewModel.HeaderFormat, snapshot.name, snapshot.model, host)
             : TextFormat.Format(SessionViewModel.HeaderNoHostFormat, snapshot.name, snapshot.model)
@@ -163,6 +169,18 @@ export class SessionViewModel extends Observable
         }
         const text = SessionViewModel.Describe(placement)
         return this.stale ? TextFormat.Format(SessionViewModel.StaleFormat, text) : text
+    }
+
+    /** The shown session's provider capabilities, or null when unknown or its repository is gone. */
+    public get Capabilities(): ProviderCapabilities | null
+    {
+        return this.capabilities
+    }
+
+    /** Load and Unload show unless the provider has nothing to load (`load_unload` false). */
+    public get IsLoadable(): boolean
+    {
+        return this.capabilities?.load_unload !== false
     }
 
     public get CanLoad(): boolean
@@ -279,9 +297,11 @@ export class SessionViewModel extends Observable
         {
             this.snapshot = attached.snapshot
             this.placement = placementNewer ? this.placement : attached.placement
+            this.capabilities = attached.capabilities ?? null
             this.status = ''
         })
         this.Chat.Bind(this.client)
+        this.Panel.ApplyCapabilities(this.capabilities)
         this.Chat.LoadHistory(attached.transcript)
         this.Panel.ApplySession(attached.sampling, attached.enable_thinking)
         // Attach, switch and re-attach after a reconnect all reload the trace's first page; a busy session's newest
@@ -369,6 +389,7 @@ export class SessionViewModel extends Observable
         {
             this.snapshot = null
             this.placement = null
+            this.capabilities = null
             this.status = ''
             this.loading = false
             this.turnLoading = false
@@ -471,13 +492,28 @@ export class SessionViewModel extends Observable
         }
     }
 
+    private RaiseLoadable(): void
+    {
+        this.RaisePropertyChanged(SessionViewModel.PropCapabilities, undefined, this.capabilities)
+        this.RaisePropertyChanged(SessionViewModel.PropIsLoadable, undefined, this.IsLoadable)
+    }
+
     /** Applies a state change, then notifies every header property (cheap; keeps the derived getters single-sourced). */
     private Update(mutate: () => void): void
     {
         mutate()
+        const loadable = this.IsLoadable
+        if (loadable)
+        {
+            this.RaiseLoadable()
+        }
         for (const name of SessionViewModel.Props)
         {
             this.RaisePropertyChanged(name, undefined, (this as unknown as Record<string, unknown>)[name])
+        }
+        if (!loadable)
+        {
+            this.RaiseLoadable()
         }
         this.loadCommand.RaiseCanExecuteChanged()
         this.unloadCommand.RaiseCanExecuteChanged()

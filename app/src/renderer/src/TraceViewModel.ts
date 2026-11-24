@@ -76,7 +76,13 @@ export class TraceToolViewModel extends Observable
 export class TraceStepViewModel extends Observable
 {
     private static readonly FillFormat = '{0}  ctx {1}/{2} ({3}%)'
+    private static readonly EstimatedFillFormat = '{0}  ≈ctx {1}/{2} ({3}%)'
     private static readonly NoFillFormat = '{0}  —'
+    /** A provider-reported cost in USD, appended to the step or compaction line. */
+    private static readonly CostFormat = ' · ${0}'
+    private static readonly CostDecimals = 4
+    /** Marks a token count that is an estimate. */
+    private static readonly ApproxMark = '≈'
     private static readonly OutFormat = 'out {0}'
     private static readonly ThinkFormat = ' (think {0})'
     private static readonly LoadFormat = '  load {0} s'
@@ -115,15 +121,23 @@ export class TraceStepViewModel extends Observable
         return this.record.step
     }
 
+    /** `{step}  ctx {used}/{n_ctx} ({pct}%)`, `≈ctx` when the count is an estimate, then ` · ${cost}` when one was reported. */
     public get Text(): string
     {
         const r = this.record
-        if (!TraceStepViewModel.HasFill(r))
-        {
-            return TextFormat.Format(TraceStepViewModel.NoFillFormat, r.step)
-        }
-        return TextFormat.Format(TraceStepViewModel.FillFormat, r.step, TraceNumbers.Thousands(r.prompt_tokens!),
-            TraceNumbers.Thousands(r.n_ctx!), TraceNumbers.Percent(r.prompt_tokens! / r.n_ctx!))
+        const fill = TraceStepViewModel.HasFill(r)
+            ? TextFormat.Format(r.estimated === true ? TraceStepViewModel.EstimatedFillFormat : TraceStepViewModel.FillFormat, r.step,
+                TraceNumbers.Thousands(r.prompt_tokens!), TraceNumbers.Thousands(r.n_ctx!), TraceNumbers.Percent(r.prompt_tokens! / r.n_ctx!))
+            : TextFormat.Format(TraceStepViewModel.NoFillFormat, r.step)
+        return fill + TraceStepViewModel.CostText(r.cost)
+    }
+
+    /** ` · $0.0012` for a reported cost, '' when none was. */
+    private static CostText(cost: number | undefined): string
+    {
+        return cost === undefined || cost === null
+            ? ''
+            : TextFormat.Format(TraceStepViewModel.CostFormat, cost.toFixed(TraceStepViewModel.CostDecimals))
     }
 
     /** Prompt tokens over the window, clamped to [0, 1]; 0 when the step never reached the worker. */
@@ -170,7 +184,10 @@ export class TraceStepViewModel extends Observable
         return text
     }
 
-    /** The step's compaction line (`⟲ ...`), or '' when compaction did not run. */
+    /**
+     * The step's compaction line (`⟲ ...`), or '' when compaction did not run. An estimated step's token counts are
+     * marked `≈`; a reported summary cost is appended as ` · ${cost}`.
+     */
     public get CompactionText(): string
     {
         const c = this.record.compaction
@@ -178,8 +195,14 @@ export class TraceStepViewModel extends Observable
         {
             return ''
         }
-        const before = TraceNumbers.Thousands(c.before_tokens)
-        const after = TraceNumbers.Thousands(c.after_tokens)
+        return this.CompactionLine(c) + TraceStepViewModel.CostText(c.summary_cost)
+    }
+
+    private CompactionLine(c: CompactionRecord): string
+    {
+        const mark = this.record.estimated === true ? TraceStepViewModel.ApproxMark : ''
+        const before = mark + TraceNumbers.Thousands(c.before_tokens)
+        const after = mark + TraceNumbers.Thousands(c.after_tokens)
         if (c.strategy === TraceStepViewModel.StrategySummarize && c.fallback)
         {
             const line = TextFormat.Format(TraceStepViewModel.FallbackFormat, before, after, c.elided_results, c.dropped_turns)

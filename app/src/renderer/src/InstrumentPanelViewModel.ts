@@ -1,11 +1,16 @@
 import { Observable, ObservableCollection, RelayCommand, type ICommand } from '@pragmatic-tech-ai/mural/runtime'
 import { RuntimeClient, type IDisposable } from './RuntimeClient'
-import type { SamplingConfig } from './agents'
+import type { ProviderCapabilities, SamplingConfig } from './agents'
 import { LogprobVM } from './LogprobVM'
 import { TextFormat } from './TextFormat'
 import type { TraceViewModel } from './TraceViewModel'
 
-/** Low-level state of the model: sampling knobs, raw prompt, context fill, logprobs, tokenization. */
+/**
+ * Low-level state of the model: sampling knobs, raw prompt, context fill, logprobs, tokenization. The session's
+ * provider capabilities decide which features show: one the provider lacks reads `not available for this provider`,
+ * and an estimated context fill is marked `≈`. Visibility props now true are raised before those now false
+ * (HiddenTextRule, see RepositoryEditorViewModel).
+ */
 export class InstrumentPanelViewModel extends Observable
 {
     private static readonly WarningFormat = 'context window full: needs {0} tokens, only {1} available — shorten the conversation'
@@ -19,6 +24,13 @@ export class InstrumentPanelViewModel extends Observable
     /** Pixel width of the context-fill track; the fill Border is bound to a fraction of it. */
     private static readonly BarPixels = 300
     private static readonly PropTrace = 'Trace'
+    private static readonly PropContextLabel = 'ContextLabel'
+    private static readonly NotAvailableText = 'not available for this provider'
+    private static readonly ApproxMark = '≈'
+    private static readonly MeasureEstimated: ProviderCapabilities['measure_prompt'] = 'estimated'
+    /** Bound to a Visibility (true = shown); raised in HiddenTextRule order when the capabilities change. */
+    private static readonly FeatureProps = ['IsTokenizeAvailable', 'IsTokenizeUnavailable', 'IsRawPromptAvailable', 'IsRawPromptUnavailable',
+        'IsLogprobsAvailable', 'IsLogprobsUnavailable']
 
     private _temperature = 0.8
     private _topP = 0.95
@@ -35,6 +47,10 @@ export class InstrumentPanelViewModel extends Observable
     private _warning = ''
     private _tokenizeInput = ''
     private _tokenizeResult = ''
+    /** The session's provider capabilities; null (unknown, or the repository is gone) shows every feature. */
+    private capabilities: ProviderCapabilities | null = null
+    /** The last turn_started reported an estimated prompt count. */
+    private turnEstimated = false
     private readonly _tokenizeCommand: RelayCommand
 
     public readonly Logprobs = new ObservableCollection<LogprobVM>()
@@ -74,13 +90,15 @@ export class InstrumentPanelViewModel extends Observable
         this.Change('Prompt', this._prompt, '', x => this._prompt = x)
         this.SetWarning('')
         this.SetModelName('')
+        this.turnEstimated = false
         this.SetContext(0, 0)
         if (client)
         {
             this.subscriptions.push(client.OnTurnStarted.Subscribe(p =>
             {
                 this.Logprobs.Clear()
-                this.Change('Prompt', this._prompt, p.prompt, x => this._prompt = x)
+                this.Change('Prompt', this._prompt, p.prompt ?? '', x => this._prompt = x)
+                this.turnEstimated = p.estimated === true
                 this.SetContext(p.prompt_tokens, p.n_ctx)
             }))
             this.subscriptions.push(client.OnTurnChunk.Subscribe(p =>
@@ -117,6 +135,69 @@ export class InstrumentPanelViewModel extends Observable
                 this.SetContext(this._contextUsed, props.n_ctx)
             },
             () => undefined)
+    }
+
+    /** The attached session's provider capabilities (null when unknown or its repository is gone: every feature shows). */
+    public ApplyCapabilities(capabilities: ProviderCapabilities | null): void
+    {
+        this.capabilities = capabilities ?? null
+        this.RaiseFeatures(true)
+        this.RaisePropertyChanged(InstrumentPanelViewModel.PropContextLabel, undefined, this.ContextLabel)
+        this.RaiseFeatures(false)
+    }
+
+    public get NotAvailableText(): string
+    {
+        return InstrumentPanelViewModel.NotAvailableText
+    }
+
+    public get IsTokenizeAvailable(): boolean
+    {
+        return this.capabilities?.tokenize !== false
+    }
+
+    public get IsTokenizeUnavailable(): boolean
+    {
+        return !this.IsTokenizeAvailable
+    }
+
+    public get IsRawPromptAvailable(): boolean
+    {
+        return this.capabilities?.raw_prompt !== false
+    }
+
+    public get IsRawPromptUnavailable(): boolean
+    {
+        return !this.IsRawPromptAvailable
+    }
+
+    public get IsLogprobsAvailable(): boolean
+    {
+        return this.capabilities?.logprobs !== false
+    }
+
+    public get IsLogprobsUnavailable(): boolean
+    {
+        return !this.IsLogprobsAvailable
+    }
+
+    /** The context fill is an estimate: the last turn said so, or the provider only estimates. */
+    public get IsContextEstimated(): boolean
+    {
+        return this.turnEstimated || this.capabilities?.measure_prompt === InstrumentPanelViewModel.MeasureEstimated
+    }
+
+    /** Raises the feature visibility props whose value is `shown` (HiddenTextRule). */
+    private RaiseFeatures(shown: boolean): void
+    {
+        for (const name of InstrumentPanelViewModel.FeatureProps)
+        {
+            const value = Boolean((this as unknown as Record<string, unknown>)[name])
+            if (value === shown)
+            {
+                this.RaisePropertyChanged(name, undefined, value)
+            }
+        }
     }
 
     /** Seeds the knobs from an attached session's effective values and records them as what the session runs with. */
@@ -302,7 +383,8 @@ export class InstrumentPanelViewModel extends Observable
     public get ContextLabel(): string
     {
         const pct = Math.round(this.ContextFraction * InstrumentPanelViewModel.PercentScale)
-        return TextFormat.Format(InstrumentPanelViewModel.ContextFormat, this._contextUsed, this._contextTotal, pct)
+        const label = TextFormat.Format(InstrumentPanelViewModel.ContextFormat, this._contextUsed, this._contextTotal, pct)
+        return this.IsContextEstimated ? InstrumentPanelViewModel.ApproxMark + label : label
     }
 
     /** Basename only: the backend reports a full path. */
@@ -386,7 +468,7 @@ export class InstrumentPanelViewModel extends Observable
         this.Change('ContextTotal', this._contextTotal, total, x => this._contextTotal = x)
         this.RaisePropertyChanged('ContextFraction', undefined, this.ContextFraction)
         this.RaisePropertyChanged('ContextBarWidth', undefined, this.ContextBarWidth)
-        this.RaisePropertyChanged('ContextLabel', undefined, this.ContextLabel)
+        this.RaisePropertyChanged(InstrumentPanelViewModel.PropContextLabel, undefined, this.ContextLabel)
     }
 
     /** Assigns the new value (via `assign`) BEFORE raising INPC. A TwoWay binding re-reads the
