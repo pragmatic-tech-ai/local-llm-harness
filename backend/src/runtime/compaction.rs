@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::trace::CompactionRecord;
+use super::trace::{CompactionRecord, ToolTiming};
 use super::worker::PromptSize;
 use crate::engine::{ChatMessage, Role};
 
@@ -15,7 +15,9 @@ pub trait PromptMeasure: Send + Sync {
     async fn measure(&self, messages: &[ChatMessage]) -> Result<PromptSize, String>;
 }
 
-/// A strategy's output: the messages to send and what was done (`None` when nothing was).
+/// A compaction's output: the messages to send and what was done. `record` is `None` only on
+/// the `Compactor`'s no-op paths (strategy off, under budget, measure failed); a strategy that
+/// ran, such as [`Trim::compact`], always returns `Some`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Compacted {
     pub messages: Vec<ChatMessage>,
@@ -71,8 +73,13 @@ impl Trim {
     /// enough, the oldest earlier turns are dropped whole. Index 0 when it is the system
     /// message, `current_turn_start..` and summary notes are never touched. When nothing
     /// earlier can be removed the messages come back unchanged with `after == before`. The
-    /// returned messages have always been measured; the record (always present) carries that
-    /// last measure as `after_tokens`.
+    /// returned messages have always been measured; the record carries that last measure as
+    /// `after_tokens`.
+    ///
+    /// The record is always `Some`, even when `before` already fits (then all counts are zero
+    /// and nothing is measured). Callers decide whether to compact at all: the `Compactor`
+    /// calls this only when the prompt is over budget, so an all-zero record never reaches the
+    /// trace.
     pub async fn compact(
         messages: &[ChatMessage],
         current_turn_start: usize,
@@ -118,11 +125,6 @@ impl Trim {
     /// The stub text that replaces a `tool` result of `bytes` serialized bytes.
     fn stub_text(tool: &str, bytes: usize) -> String {
         format!("[{tool} result elided: {bytes} bytes]")
-    }
-
-    /// The serialized length of a tool result (the trace's tool-timing `bytes`).
-    fn bytes(result: &Value) -> usize {
-        serde_json::to_string(result).map_or(0, |s| s.len())
     }
 
     /// The name of the call `messages[index]` answers, from the nearest earlier message
@@ -180,12 +182,12 @@ impl<'a> TrimPlan<'a> {
             if message.role != Role::Tool || !self.touchable(index) {
                 continue;
             }
-            let bytes = Trim::bytes(result);
+            let bytes = ToolTiming::result_bytes(result);
             let stub = Value::String(Trim::stub_text(
                 Trim::tool_name(self.messages, index),
                 bytes,
             ));
-            if Trim::bytes(&stub) >= bytes {
+            if ToolTiming::result_bytes(&stub) >= bytes {
                 continue;
             }
             let mut replacement = message.clone();
@@ -502,6 +504,74 @@ mod tests {
         assert_eq!(record.elided_results, 0);
         assert_eq!(record.dropped_turns, 0);
         assert_eq!(measure.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn trim_without_system_message_drops_first_user_turn_keeps_current() {
+        let short = json!({"ok": true});
+        let mut messages = vec![Fx::user(&"a".repeat(BIG)), Fx::assistant("ok")];
+        messages.extend(Fx::tool_turn(1, short.clone()));
+        let current = messages.len();
+        let current_turn = Fx::tool_turn(2, Fx::big());
+        messages.extend(current_turn.clone());
+        assert_eq!(Turns::starts(&messages), vec![0, 2, 6]);
+        let before = FakeMeasure::tokens(&messages);
+        let budget = before + RESERVATION - 500;
+        let out = Trim::compact(
+            &messages,
+            current,
+            budget,
+            RESERVATION,
+            before,
+            &FakeMeasure::new(),
+        )
+        .await
+        .unwrap();
+        let mut expected = Fx::tool_turn(1, short);
+        expected.extend(current_turn);
+        assert_eq!(out.messages, expected);
+        let record = out.record.unwrap();
+        assert_eq!(record.dropped_turns, 1);
+        assert_eq!(record.elided_results, 0);
+        assert!(record.after_tokens as usize <= budget - RESERVATION);
+    }
+
+    #[tokio::test]
+    async fn stubbed_transcript_renders_stub_in_the_matching_tool_response() {
+        const GEMMA4: &str = include_str!("../../tests/fixtures/gemma4-chat-template.jinja");
+        const GET_TIME: &str = "get_time";
+        let mut messages = vec![Fx::system()];
+        messages.extend(Fx::tool_turn(0, Fx::big()));
+        messages.push(Fx::user("q1"));
+        messages.push(Fx::call("c1", GET_TIME));
+        messages.push(Fx::result("c1", json!({"utc": "x"})));
+        messages.push(Fx::assistant("done"));
+        let current = messages.len();
+        messages.push(Fx::user("now"));
+        let before = FakeMeasure::tokens(&messages);
+        let budget = before + RESERVATION - Fx::saving() / 2;
+        let out = Trim::compact(
+            &messages,
+            current,
+            budget,
+            RESERVATION,
+            before,
+            &FakeMeasure::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.record.unwrap().elided_results, 1);
+
+        let template = crate::engine::template::ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let prompt = template.render(&out.messages, true, false, &[]).unwrap();
+        let bytes = serde_json::to_string(&Fx::big()).unwrap().len();
+        let stubbed = format!(
+            "<|tool_call>call:read_file{{}}<tool_call|><|tool_response>response:read_file{{value:<|\"|>[read_file result elided: {bytes} bytes]<|\"|>}}<tool_response|>"
+        );
+        assert!(prompt.contains(&stubbed), "{prompt}");
+        let kept = "<|tool_call>call:get_time{}<tool_call|><|tool_response>response:get_time{utc:<|\"|>x<|\"|>}<tool_response|>";
+        assert!(prompt.contains(kept), "{prompt}");
+        assert!(!prompt.contains(&"x".repeat(BIG)), "{prompt}");
     }
 
     #[test]

@@ -411,7 +411,7 @@ impl ToolLoop {
                     id: call.id.clone(),
                     ok: outcome.is_ok(),
                     ms,
-                    bytes: Self::result_bytes(&result),
+                    bytes: ToolTiming::result_bytes(&result) as u64,
                 });
                 let params = json!({
                     "id": call.id,
@@ -462,11 +462,6 @@ impl ToolLoop {
             .step(meter.record(StepOutcome::Aborted, None), sink)
             .await;
         Err(closed)
-    }
-
-    /// Byte length of the serialized tool result.
-    fn result_bytes(result: &Value) -> u64 {
-        serde_json::to_string(result).map_or(0, |s| s.len() as u64)
     }
 
     /// The trace text of a `turn_rejected`.

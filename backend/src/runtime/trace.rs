@@ -47,6 +47,14 @@ pub struct ToolTiming {
     pub bytes: u64,
 }
 
+impl ToolTiming {
+    /// The byte length of a tool result's serialized JSON: the timing's `bytes`, and the
+    /// `{bytes}` of a trim stub. The one home of that measure.
+    pub fn result_bytes(result: &Value) -> usize {
+        serde_json::to_string(result).map_or(0, |s| s.len())
+    }
+}
+
 /// One loop step, written when the step's tools (if any) have finished.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct StepRecord {
