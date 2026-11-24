@@ -1,4 +1,4 @@
-//! Agent templates, sessions, hosts and the dispatcher.
+//! Agent templates, sessions, the model requirement and the dispatcher.
 
 pub mod atomic_file;
 pub mod dispatcher;

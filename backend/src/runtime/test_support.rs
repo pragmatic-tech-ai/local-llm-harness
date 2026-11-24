@@ -439,8 +439,9 @@ impl TestRuntime {
         use super::policy::EnabledPolicy;
         use super::registry::ToolRegistry;
         use super::test_tools::TestSource;
-        use crate::agents::dispatcher::{Dispatcher, ExplicitLoadPolicy};
-        use crate::agents::host::{FakeHost, ModelHost};
+        use crate::agents::dispatcher::Dispatcher;
+        use crate::agents::host::FakeHost;
+        use crate::providers::{Provider, StaticProviders};
         use crate::agents::session_store::SessionStore;
         use crate::agents::template_store::TemplateStore;
 
@@ -460,7 +461,7 @@ impl TestRuntime {
             Self::TOOL_TIMEOUT,
         ));
         let host = FakeHost::serving_with_link(Self::HOST, &[(Self::RUNTIME, Self::MODEL)], link);
-        let hosts: Vec<Arc<dyn ModelHost>> = vec![host.clone()];
+        let providers = vec![(Self::HOST.to_string(), host.clone() as Arc<dyn Provider>)];
         let templates =
             TemplateStore::open(&dir.0.join(Self::TEMPLATES_DIR), Self::rules(&registry))
                 .expect("template store");
@@ -468,7 +469,7 @@ impl TestRuntime {
         let deps = super::server::RuntimeDeps {
             templates: Arc::new(templates),
             sessions: Arc::new(sessions),
-            dispatcher: Arc::new(Dispatcher::new(hosts, Box::new(ExplicitLoadPolicy))),
+            dispatcher: Arc::new(Dispatcher::new(Arc::new(StaticProviders(providers)))),
             registry: registry.clone(),
             tool_loop: Arc::new(super::tool_loop::ToolLoop::new(executor, registry)),
             catalog: Arc::new(Self::catalog()),

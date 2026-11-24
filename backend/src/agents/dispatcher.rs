@@ -1,10 +1,10 @@
-//! The dispatcher: decides which model host serves a session's model requirement, and when the
-//! model loads.
+//! The dispatcher: routes a session's model requirement to the provider its repository names,
+//! and decides when the model loads.
 //!
-//! Placement is a replaceable [`PlacementPolicy`]. The shipped [`ExplicitLoadPolicy`] is the
-//! "explicit load" rule: a session opens read-only (`status` never loads anything) and the model
-//! loads only on an explicit [`Dispatcher::load`] or on the first message
-//! ([`Dispatcher::link_for_turn`]).
+//! Routing is exact: the requirement's `repository` picks one provider from the
+//! [`ProviderSource`], and there is no fallback to another. A session opens read-only (`status`
+//! never loads anything) and the model loads only on an explicit [`Dispatcher::load`] or on the
+//! first message ([`Dispatcher::link_for_turn`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -12,8 +12,9 @@ use futures::stream::{self, StreamExt};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::agents::host::{HarnessIdentity, ModelHost, ModelRequirement};
+use crate::agents::host::{HarnessIdentity, ModelRequirement};
 use crate::agents::session::SessionRecord;
+use crate::providers::{Provider, ProviderCapabilities, ProviderSource};
 use crate::runtime::worker::WorkerLink;
 
 /// Where a requirement stands right now. Serialized as `{"state":"ready","host":..}`,
@@ -39,63 +40,22 @@ pub enum Placement {
 #[error("{0}")]
 pub struct DispatchError(pub String);
 
-/// Chooses a host for a requirement and says whether a turn may trigger a load.
-pub trait PlacementPolicy: Send + Sync {
-    fn choose_host<'a>(
-        &self,
-        req: &ModelRequirement,
-        hosts: &'a [Arc<dyn ModelHost>],
-    ) -> Option<&'a Arc<dyn ModelHost>>;
-
-    /// Whether sending a message may load the model (otherwise an explicit load is required).
-    fn turn_may_load(&self) -> bool;
-}
-
-/// The preferred host if it serves the requirement, otherwise the first host that does; the
-/// first message may load.
-pub struct ExplicitLoadPolicy;
-
-impl PlacementPolicy for ExplicitLoadPolicy {
-    fn choose_host<'a>(
-        &self,
-        req: &ModelRequirement,
-        hosts: &'a [Arc<dyn ModelHost>],
-    ) -> Option<&'a Arc<dyn ModelHost>> {
-        // The final search also covers the preferred host; this pass only makes it win.
-        if let Some(preferred) = req.host.as_deref() {
-            if let Some(host) = hosts
-                .iter()
-                .find(|h| h.name() == preferred && h.serves(req))
-            {
-                return Some(host);
-            }
-        }
-        hosts.iter().find(|h| h.serves(req))
-    }
-
-    fn turn_may_load(&self) -> bool {
-        true
-    }
-}
-
 pub struct Dispatcher {
-    hosts: Vec<Arc<dyn ModelHost>>,
-    policy: Box<dyn PlacementPolicy>,
+    source: Arc<dyn ProviderSource>,
     events: broadcast::Sender<()>,
-    /// The single task merging every host's signal into `events`, started by the first
+    /// The single task merging every provider's signal into `events`, started by the first
     /// `subscribe` and aborted when the dispatcher is dropped.
     merger: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Dispatcher {
     const EVENT_CAPACITY: usize = 16;
-    const NO_HOST_PREFIX: &'static str = "no host serves ";
-    const ERR_NOT_LOADED: &'static str = "model not loaded";
+    const ERR_REPOSITORY_NOT_FOUND: &'static str = "repository not found: ";
+    const ERR_MODEL_NOT_IN_REPOSITORY: &'static str = "model not in repository ";
 
-    pub fn new(hosts: Vec<Arc<dyn ModelHost>>, policy: Box<dyn PlacementPolicy>) -> Self {
+    pub fn new(source: Arc<dyn ProviderSource>) -> Self {
         Dispatcher {
-            hosts,
-            policy,
+            source,
             events: broadcast::channel(Self::EVENT_CAPACITY).0,
             merger: Mutex::new(None),
         }
@@ -106,32 +66,53 @@ impl Dispatcher {
         ModelRequirement::of(&record.snapshot)
     }
 
-    fn unavailable_reason(req: &ModelRequirement) -> String {
-        format!("{}{}/{}", Self::NO_HOST_PREFIX, req.runtime, req.model)
+    /// The provider `req`'s repository names, whether or not it serves the model.
+    fn named_provider(&self, req: &ModelRequirement) -> Result<Arc<dyn Provider>, DispatchError> {
+        self.source.provider(&req.repository).ok_or_else(|| {
+            DispatchError(format!(
+                "{}{}",
+                Self::ERR_REPOSITORY_NOT_FOUND,
+                req.repository
+            ))
+        })
     }
 
-    fn host_for(&self, req: &ModelRequirement) -> Result<&Arc<dyn ModelHost>, DispatchError> {
-        self.policy
-            .choose_host(req, &self.hosts)
-            .ok_or_else(|| DispatchError(Self::unavailable_reason(req)))
+    /// The provider that serves `req`: exactly the one its repository names.
+    fn provider_for(&self, req: &ModelRequirement) -> Result<Arc<dyn Provider>, DispatchError> {
+        let provider = self.named_provider(req)?;
+        if provider.serves(req) {
+            Ok(provider)
+        } else {
+            Err(DispatchError(format!(
+                "{}{}: {}",
+                Self::ERR_MODEL_NOT_IN_REPOSITORY,
+                req.repository,
+                req.model
+            )))
+        }
     }
 
-    /// Where `req` stands. Never loads anything. While the host is mid-load (even of `req`
+    /// What the provider behind `req`'s repository supports; `None` when there is no such
+    /// repository.
+    pub fn capabilities(&self, req: &ModelRequirement) -> Option<ProviderCapabilities> {
+        self.named_provider(req).ok().map(|p| p.capabilities())
+    }
+
+    /// Where `req` stands. Never loads anything. While the provider is mid-load (even of `req`
     /// itself) the answer is `NeedsLoad` with `evicts: None`, because nothing is loaded yet; the
     /// three states are kept and callers learn about progress through `subscribe`.
     pub fn status(&self, req: &ModelRequirement) -> Placement {
-        let Some(host) = self.policy.choose_host(req, &self.hosts) else {
-            return Placement::Unavailable {
-                reason: Self::unavailable_reason(req),
-            };
+        let provider = match self.provider_for(req) {
+            Ok(provider) => provider,
+            Err(e) => return Placement::Unavailable { reason: e.0 },
         };
-        let host_name = host.name().to_string();
-        if host.current_link(req).is_some() {
+        let host_name = provider.name().to_string();
+        if provider.current_link(req).is_some() {
             Placement::Ready { host: host_name }
         } else {
             Placement::NeedsLoad {
                 host: host_name,
-                evicts: host.state().loaded.map(|(_, model, _)| model),
+                evicts: provider.state().loaded.map(|(_, model, _)| model),
             }
         }
     }
@@ -139,71 +120,76 @@ impl Dispatcher {
     /// A link to the model if it is loaded right now; no side effects. Used for loop steps after
     /// the first, so an eviction mid-turn surfaces as an error.
     pub fn current_link(&self, req: &ModelRequirement) -> Option<Arc<dyn WorkerLink>> {
-        self.policy.choose_host(req, &self.hosts)?.current_link(req)
+        self.provider_for(req).ok()?.current_link(req)
     }
 
-    /// The harness the host chosen for `req` serves right now (whatever model it is), if any.
+    /// The harness the provider chosen for `req` serves right now (whatever model it is), if any.
     /// A turn records it with its first link and compares it before every later step.
     pub fn identity(&self, req: &ModelRequirement) -> Option<HarnessIdentity> {
-        self.policy.choose_host(req, &self.hosts)?.identity()
+        self.provider_for(req).ok()?.identity()
     }
 
-    /// Re-reads which models every host serves, then signals subscribers so placements that
+    /// Re-reads which models every provider serves, then signals subscribers so placements that
     /// changed with it (a model dropped on disk or removed) are announced.
     pub fn refresh(&self) {
-        for host in &self.hosts {
-            host.refresh();
+        for provider in self.source.providers() {
+            provider.refresh();
         }
         let _ = self.events.send(());
     }
 
-    /// Load the model (evicting what is loaded on the chosen host) and return its link.
+    /// Load the model (evicting what is loaded on the chosen provider) and return its link.
     pub async fn load(&self, req: &ModelRequirement) -> Result<Arc<dyn WorkerLink>, DispatchError> {
-        let host = self.host_for(req)?;
-        host.ensure_ready(req).await.map_err(|e| DispatchError(e.0))
+        let provider = self.provider_for(req)?;
+        provider
+            .ensure_ready(req)
+            .await
+            .map_err(|e| DispatchError(e.0))
     }
 
-    /// The link for a turn's first step. If the model is not loaded, either refuses (policy
-    /// forbids loading on a turn) or calls `notify_loading` once and loads it. No lock is held
-    /// across the load, so `status` calls from other connections are never blocked by it.
+    /// The link for a turn's first step. If the model is not loaded, calls `notify_loading` once
+    /// and loads it. No lock is held across the load, so `status` calls from other connections
+    /// are never blocked by it.
     pub async fn link_for_turn(
         &self,
         req: &ModelRequirement,
         notify_loading: impl FnOnce(),
     ) -> Result<Arc<dyn WorkerLink>, DispatchError> {
-        let host = self.host_for(req)?;
-        if let Some(link) = host.current_link(req) {
+        let provider = self.provider_for(req)?;
+        if let Some(link) = provider.current_link(req) {
             return Ok(link);
         }
-        if !self.policy.turn_may_load() {
-            return Err(DispatchError(Self::ERR_NOT_LOADED.to_string()));
-        }
         notify_loading();
-        host.ensure_ready(req).await.map_err(|e| DispatchError(e.0))
+        provider
+            .ensure_ready(req)
+            .await
+            .map_err(|e| DispatchError(e.0))
     }
 
-    /// Unload `req`'s model from its host. Does nothing if that host has some other model
+    /// Unload `req`'s model from its provider. Does nothing if that provider has some other model
     /// (runtime or model name differs) loaded, so one session cannot evict another's model; the
-    /// check and the stop are atomic on the host (`ModelHost::unload_if`).
+    /// check and the stop are atomic on the provider (`Provider::unload_if`).
     pub async fn unload(&self, req: &ModelRequirement) -> Result<(), DispatchError> {
-        let host = self.host_for(req)?;
-        host.unload_if(req)
+        let provider = self.provider_for(req)?;
+        provider
+            .unload_if(req)
             .await
             .map(|_| ())
             .map_err(|e| DispatchError(e.0))
     }
 
-    /// Fires whenever any host's state changes. Must be called inside a tokio runtime.
+    /// Fires whenever any provider's state changes. Must be called inside a tokio runtime.
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         // Take the receiver first so the caller cannot miss an event sent once the merger runs.
         let rx = self.events.subscribe();
         let mut merger = self.merger.lock().unwrap_or_else(|e| e.into_inner());
         if merger.is_none() {
             let sources: Vec<_> = self
-                .hosts
+                .source
+                .providers()
                 .iter()
-                .map(|h| {
-                    Box::pin(stream::unfold(h.subscribe(), |mut rx| async move {
+                .map(|p| {
+                    Box::pin(stream::unfold(p.subscribe(), |mut rx| async move {
                         match rx.recv().await {
                             Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => Some(((), rx)),
                             Err(broadcast::error::RecvError::Closed) => None,
@@ -235,6 +221,7 @@ impl Drop for Dispatcher {
 mod tests {
     use super::*;
     use crate::agents::host::{FakeHost, HostState};
+    use crate::providers::{Measure, Provider, ProviderCapabilities, StaticProviders};
     use crate::agents::template::{
         AgentTemplate, ContextStrategy, WorkspaceConfig, DEFAULT_COMPACT_AT_PCT,
     };
@@ -245,12 +232,12 @@ mod tests {
     struct Fixtures;
 
     impl Fixtures {
-        fn req(model: &str, n_ctx: u32, host: Option<&str>) -> ModelRequirement {
+        fn req(model: &str, n_ctx: u32, repository: &str) -> ModelRequirement {
             ModelRequirement {
                 runtime: "llamacpp".to_string(),
                 model: model.to_string(),
                 n_ctx,
-                host: host.map(str::to_string),
+                repository: repository.to_string(),
             }
         }
 
@@ -262,31 +249,20 @@ mod tests {
         }
 
         fn dispatcher(hosts: &[&Arc<FakeHost>]) -> Dispatcher {
-            let hosts: Vec<Arc<dyn ModelHost>> = hosts
-                .iter()
-                .map(|h| Arc::clone(h) as Arc<dyn ModelHost>)
-                .collect();
-            Dispatcher::new(hosts, Box::new(ExplicitLoadPolicy))
+            Dispatcher::new(Self::source(hosts))
+        }
+
+        fn source(hosts: &[&Arc<FakeHost>]) -> Arc<StaticProviders> {
+            Arc::new(StaticProviders(
+                hosts
+                    .iter()
+                    .map(|h| (h.name().to_string(), Arc::clone(h) as Arc<dyn Provider>))
+                    .collect(),
+            ))
         }
 
         fn same_link(a: &Arc<dyn WorkerLink>, b: &Arc<FakeLink>) -> bool {
             std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
-        }
-    }
-
-    struct NoTurnLoadPolicy;
-
-    impl PlacementPolicy for NoTurnLoadPolicy {
-        fn choose_host<'a>(
-            &self,
-            req: &ModelRequirement,
-            hosts: &'a [Arc<dyn ModelHost>],
-        ) -> Option<&'a Arc<dyn ModelHost>> {
-            ExplicitLoadPolicy.choose_host(req, hosts)
-        }
-
-        fn turn_may_load(&self) -> bool {
-            false
         }
     }
 
@@ -295,7 +271,7 @@ mod tests {
         let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-3")]);
         let d = Fixtures::dispatcher(&[&hive]);
         for _ in 0..5 {
-            d.status(&Fixtures::req("gemma-3", 4096, None));
+            d.status(&Fixtures::req("gemma-3", 4096, "hive"));
         }
         assert_eq!(hive.ensure_ready_calls(), 0);
     }
@@ -304,7 +280,7 @@ mod tests {
     async fn identity_follows_reloads_and_refresh_signals() {
         let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-4")]);
         let d = Fixtures::dispatcher(&[&hive]);
-        let req = Fixtures::req("gemma-4", 8192, None);
+        let req = Fixtures::req("gemma-4", 8192, "hive");
         assert_eq!(d.identity(&req), None);
         hive.set_state(Fixtures::loaded("gemma-4", 8192));
         let first = d.identity(&req).expect("loaded");
@@ -324,7 +300,7 @@ mod tests {
         hive.set_state(Fixtures::loaded("gemma-4", 8192));
         let d = Fixtures::dispatcher(&[&hive]);
         assert_eq!(
-            d.status(&Fixtures::req("gemma-3", 4096, None)),
+            d.status(&Fixtures::req("gemma-3", 4096, "hive")),
             Placement::NeedsLoad {
                 host: "hive".into(),
                 evicts: Some("gemma-4".into())
@@ -337,7 +313,7 @@ mod tests {
         let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-3")]);
         let d = Fixtures::dispatcher(&[&hive]);
         assert_eq!(
-            d.status(&Fixtures::req("gemma-3", 4096, None)),
+            d.status(&Fixtures::req("gemma-3", 4096, "hive")),
             Placement::NeedsLoad {
                 host: "hive".into(),
                 evicts: None
@@ -351,7 +327,7 @@ mod tests {
         hive.set_state(Fixtures::loaded("gemma-4", 8192));
         let d = Fixtures::dispatcher(&[&hive]);
         assert_eq!(
-            d.status(&Fixtures::req("gemma-4", 4096, None)),
+            d.status(&Fixtures::req("gemma-4", 4096, "hive")),
             Placement::NeedsLoad {
                 host: "hive".into(),
                 evicts: Some("gemma-4".into())
@@ -364,7 +340,7 @@ mod tests {
         let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-4")]);
         hive.set_state(Fixtures::loaded("gemma-4", 8192));
         let d = Fixtures::dispatcher(&[&hive]);
-        let req = Fixtures::req("gemma-4", 8192, None);
+        let req = Fixtures::req("gemma-4", 8192, "hive");
         assert_eq!(
             d.status(&req),
             Placement::Ready {
@@ -373,7 +349,7 @@ mod tests {
         );
         assert!(d.current_link(&req).is_some());
         assert!(d
-            .current_link(&Fixtures::req("gemma-4", 4096, None))
+            .current_link(&Fixtures::req("gemma-4", 4096, "hive"))
             .is_none());
     }
 
@@ -382,7 +358,7 @@ mod tests {
         let link = FakeLink::new(false, Vec::new());
         let hive = FakeHost::serving_with_link("hive", &[("llamacpp", "gemma-3")], link.clone());
         let d = Fixtures::dispatcher(&[&hive]);
-        let req = Fixtures::req("gemma-3", 4096, None);
+        let req = Fixtures::req("gemma-3", 4096, "hive");
         let notified = AtomicUsize::new(0);
         let got = d
             .link_for_turn(&req, || {
@@ -405,29 +381,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn link_for_turn_refuses_when_policy_forbids_loading() {
-        let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-3")]);
-        let d = Dispatcher::new(
-            vec![Arc::clone(&hive) as Arc<dyn ModelHost>],
-            Box::new(NoTurnLoadPolicy),
-        );
-        let notified = AtomicUsize::new(0);
-        let err = d
-            .link_for_turn(&Fixtures::req("gemma-3", 4096, None), || {
-                notified.fetch_add(1, Ordering::SeqCst);
-            })
-            .await
-            .err();
-        assert_eq!(err, Some(DispatchError("model not loaded".into())));
-        assert_eq!(notified.load(Ordering::SeqCst), 0);
-        assert_eq!(hive.ensure_ready_calls(), 0);
-    }
-
-    #[tokio::test]
     async fn explicit_load_and_load_failure() {
         let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-3")]);
         let d = Fixtures::dispatcher(&[&hive]);
-        let req = Fixtures::req("gemma-3", 4096, None);
+        let req = Fixtures::req("gemma-3", 4096, "hive");
         d.load(&req).await.unwrap();
         assert_eq!(
             d.status(&req),
@@ -437,39 +394,79 @@ mod tests {
         );
         hive.fail_ensure(Some("boom"));
         assert_eq!(
-            d.load(&Fixtures::req("gemma-3", 8192, None)).await.err(),
+            d.load(&Fixtures::req("gemma-3", 8192, "hive")).await.err(),
             Some(DispatchError("boom".into()))
         );
     }
 
-    #[test]
-    fn preferred_host_wins() {
+    #[tokio::test]
+    async fn routes_only_to_named_repository() {
         let a = FakeHost::serving("a", &[("llamacpp", "gemma-3")]);
         let b = FakeHost::serving("b", &[("llamacpp", "gemma-3")]);
         let d = Fixtures::dispatcher(&[&a, &b]);
+        let req = Fixtures::req("gemma-3", 4096, "b");
         assert_eq!(
-            d.status(&Fixtures::req("gemma-3", 4096, Some("b"))),
+            d.status(&req),
             Placement::NeedsLoad {
                 host: "b".into(),
                 evicts: None
             }
         );
+        d.load(&req).await.unwrap();
+        d.link_for_turn(&req, || {}).await.unwrap();
+        assert_eq!(b.ensure_ready_calls(), 1);
+        assert_eq!(a.ensure_ready_calls(), 0);
+        assert_eq!(a.state(), HostState::default());
+    }
+
+    #[test]
+    fn capabilities_come_from_the_provider() {
+        let a = FakeHost::serving("a", &[("llamacpp", "m")]);
+        let b = FakeHost::serving("b", &[("llamacpp", "m")]);
+        let limited = ProviderCapabilities {
+            measure_prompt: Measure::Estimated,
+            tokenize: false,
+            raw_prompt: false,
+            logprobs: false,
+            load_unload: false,
+        };
+        b.set_capabilities(limited);
+        let d = Fixtures::dispatcher(&[&a, &b]);
         assert_eq!(
-            d.status(&Fixtures::req("gemma-3", 4096, None)),
-            Placement::NeedsLoad {
-                host: "a".into(),
-                evicts: None
-            }
+            d.capabilities(&Fixtures::req("m", 1, "a")),
+            Some(ProviderCapabilities::FULL)
         );
+        assert_eq!(d.capabilities(&Fixtures::req("m", 1, "b")), Some(limited));
+        assert_eq!(d.capabilities(&Fixtures::req("m", 1, "c")), None);
     }
 
     #[tokio::test]
-    async fn unserved_model_is_unavailable() {
+    async fn missing_repository_is_unavailable_with_reason() {
+        let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-3")]);
+        let d = Fixtures::dispatcher(&[&hive]);
+        let req = Fixtures::req("gemma-3", 4096, "nowhere");
+        let reason = "repository not found: nowhere".to_string();
+        assert_eq!(
+            d.status(&req),
+            Placement::Unavailable {
+                reason: reason.clone()
+            }
+        );
+        assert_eq!(
+            d.link_for_turn(&req, || {}).await.err(),
+            Some(DispatchError(reason))
+        );
+        assert!(d.capabilities(&req).is_none());
+        assert_eq!(hive.ensure_ready_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn unserved_model_is_unavailable_with_reason() {
         let hive = FakeHost::with_link("hive", FakeLink::new(false, Vec::new()));
         let empty = FakeHost::new("empty");
         let d = Fixtures::dispatcher(&[&hive, &empty]);
-        let req = Fixtures::req("x", 4096, None);
-        let reason = "no host serves llamacpp/x".to_string();
+        let req = Fixtures::req("x", 4096, "hive");
+        let reason = "model not in repository hive: x".to_string();
         assert_eq!(
             d.status(&req),
             Placement::Unavailable {
@@ -493,16 +490,16 @@ mod tests {
         let hive = FakeHost::serving("hive", &[("llamacpp", "gemma-3"), ("llamacpp", "gemma-4")]);
         hive.set_state(Fixtures::loaded("gemma-4", 8192));
         let d = Fixtures::dispatcher(&[&hive]);
-        d.unload(&Fixtures::req("gemma-3", 4096, None))
+        d.unload(&Fixtures::req("gemma-3", 4096, "hive"))
             .await
             .unwrap();
         assert_eq!(hive.unload_calls(), 0);
-        d.unload(&Fixtures::req("gemma-4", 4096, None))
+        d.unload(&Fixtures::req("gemma-4", 4096, "hive"))
             .await
             .unwrap();
         assert_eq!(hive.unload_calls(), 1);
         // Nothing left to unload: a repeat is a no-op.
-        d.unload(&Fixtures::req("gemma-4", 4096, None))
+        d.unload(&Fixtures::req("gemma-4", 4096, "hive"))
             .await
             .unwrap();
         assert_eq!(hive.unload_calls(), 1);
@@ -517,7 +514,7 @@ mod tests {
         });
         let d = Fixtures::dispatcher(&[&hive]);
         assert_eq!(
-            d.status(&Fixtures::req("gemma-3", 4096, None)),
+            d.status(&Fixtures::req("gemma-3", 4096, "hive")),
             Placement::NeedsLoad {
                 host: "hive".into(),
                 evicts: None
@@ -535,7 +532,7 @@ mod tests {
         for model in ["gemma-3", "gemma-4"] {
             let d = Arc::clone(&d);
             turns.push(tokio::spawn(async move {
-                d.link_for_turn(&Fixtures::req(model, 4096, None), || {})
+                d.link_for_turn(&Fixtures::req(model, 4096, "hive"), || {})
                     .await
                     .map(|_| ())
             }));
@@ -561,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_with_no_hosts_returns_a_receiver() {
-        let d = Dispatcher::new(Vec::new(), Box::new(ExplicitLoadPolicy));
+        let d = Dispatcher::new(Arc::new(StaticProviders(Vec::new())));
         let mut rx = d.subscribe();
         assert!(rx.try_recv().is_err());
     }
@@ -599,7 +596,7 @@ mod tests {
             n_ctx: 4096,
             enable_thinking: false,
             sampling: None,
-            host: Some("hive".into()),
+            host: None,
             context_strategy: ContextStrategy::default(),
             compact_at_pct: DEFAULT_COMPACT_AT_PCT,
             workspace: WorkspaceConfig::default(),
@@ -607,8 +604,11 @@ mod tests {
         let record = SessionRecord::new("s1".into(), "T".into(), "t", template, 0);
         assert_eq!(
             Dispatcher::requirement(&record),
-            Fixtures::req("gemma-3", 4096, Some("hive"))
+            Fixtures::req("gemma-3", 4096, "hive")
         );
+        let mut elsewhere = record.snapshot.clone();
+        elsewhere.host = Some("lab".into());
+        assert_eq!(ModelRequirement::of(&elsewhere).repository, "lab");
     }
 
     #[test]

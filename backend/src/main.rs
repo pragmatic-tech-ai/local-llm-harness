@@ -1,5 +1,5 @@
-use backend::agents::dispatcher::{Dispatcher, ExplicitLoadPolicy};
-use backend::agents::host::{LocalHarness, LocalSupervisorHost, ModelHost};
+use backend::agents::dispatcher::Dispatcher;
+use backend::providers::{LocalHarness, PragmaticProvider, Provider, StaticProviders};
 use backend::agents::session_store::SessionStore;
 use backend::agents::template_store::{TemplateNode, TemplateStore};
 use backend::engine::{build_engine, EngineConfig, EngineKind};
@@ -193,21 +193,22 @@ impl AgentsStack {
         tool_loop: Arc<ToolLoop>,
         sandbox: Option<Sandbox>,
     ) -> RuntimeDeps {
-        let hosts: Vec<Arc<dyn ModelHost>> = self
+        let providers: Vec<(String, Arc<dyn Provider>)> = self
             .host_names
             .into_iter()
             .map(|name| {
-                Arc::new(LocalSupervisorHost::new(
-                    name,
+                let provider = Arc::new(PragmaticProvider::new(
+                    name.clone(),
                     manager.clone(),
                     &self.catalog,
-                )) as Arc<dyn ModelHost>
+                )) as Arc<dyn Provider>;
+                (name, provider)
             })
             .collect();
         RuntimeDeps {
             templates: Arc::new(self.templates),
             sessions: Arc::new(self.sessions),
-            dispatcher: Arc::new(Dispatcher::new(hosts, Box::new(ExplicitLoadPolicy))),
+            dispatcher: Arc::new(Dispatcher::new(Arc::new(StaticProviders(providers)))),
             registry,
             tool_loop,
             catalog: self.source,
