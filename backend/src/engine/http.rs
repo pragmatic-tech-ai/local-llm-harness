@@ -58,6 +58,23 @@ impl HttpEngine {
         }
     }
 
+    /// The `/completion` request body. `n_probs` > 0 makes the server report one
+    /// `completion_probabilities` entry per generated token, which is the token count.
+    fn completion_body(prompt: &str, cfg: &SamplingConfig) -> Value {
+        json!({
+            "prompt": prompt,
+            "stream": true,
+            "cache_prompt": true,
+            "n_probs": TOP_LOGPROBS,
+            "temperature": cfg.temperature,
+            "top_p": cfg.top_p,
+            "top_k": cfg.top_k,
+            "repeat_penalty": cfg.repeat_penalty,
+            "seed": cfg.seed,
+            "n_predict": cfg.max_tokens,
+        })
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -168,18 +185,7 @@ impl Engine for HttpEngine {
         prompt: &str,
         cfg: &SamplingConfig,
     ) -> Result<BoxStream<'static, Result<CompletionChunk>>> {
-        let body = json!({
-            "prompt": prompt,
-            "stream": true,
-            "cache_prompt": true,
-            "n_probs": TOP_LOGPROBS,
-            "temperature": cfg.temperature,
-            "top_p": cfg.top_p,
-            "top_k": cfg.top_k,
-            "repeat_penalty": cfg.repeat_penalty,
-            "seed": cfg.seed,
-            "n_predict": cfg.max_tokens,
-        });
+        let body = Self::completion_body(prompt, cfg);
         let response = self
             .client
             .post(self.url(COMPLETION_PATH))
@@ -336,5 +342,21 @@ impl SseParser {
             return Some(lp as f32);
         }
         v.get("prob").and_then(Value::as_f64).map(|p| p.ln() as f32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_chunk_has_one_token_info_per_generated_token() {
+        let payload = r#"{"content":"hi there","stop":false,"completion_probabilities":[
+            {"token":"hi","logprob":-0.1,"top_logprobs":[{"token":"hi","logprob":-0.1}]},
+            {"token":" there","logprob":-0.2,"top_logprobs":[{"token":" there","logprob":-0.2}]}]}"#;
+        let chunk = SseParser::parse_payload(payload).unwrap();
+        assert_eq!(chunk.tokens.len(), 2);
+        let body = HttpEngine::completion_body("p", &SamplingConfig::default());
+        assert!(body["n_probs"].as_u64().unwrap() > 0);
     }
 }

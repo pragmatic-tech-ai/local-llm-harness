@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 
+use super::template::OpenChannel;
+
 /// One tool call decoded from model output.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParsedCall {
@@ -31,6 +33,106 @@ pub trait ToolCallFormat: Send + Sync {
 
     /// A fresh streaming parser for one generation.
     fn new_parser(&self) -> Box<dyn ToolCallParser>;
+
+    /// A fresh thinking-token counter for one generation that continues `prompt`.
+    fn think_counter(&self, prompt: &str) -> Box<dyn ThinkCounter>;
+}
+
+/// Counts the tokens of one generation that were spent inside a thinking channel.
+pub trait ThinkCounter: Send {
+    /// Feeds one streamed chunk: its text and the number of tokens it carried.
+    fn push(&mut self, text: &str, tokens: usize);
+
+    /// Tokens counted as thinking so far.
+    fn think_tokens(&self) -> usize;
+}
+
+/// The counter for formats without channel markers: always zero.
+#[derive(Default)]
+pub struct NoThinkCounter;
+
+impl ThinkCounter for NoThinkCounter {
+    fn push(&mut self, _text: &str, _tokens: usize) {}
+
+    fn think_tokens(&self) -> usize {
+        0
+    }
+}
+
+/// Counts thinking tokens in Gemma 4 output. A chunk is attributed to the state the counter
+/// was in at the start of the chunk; the state then flips on each opener or closer found in
+/// the chunk. A short carry of the previous tail lets a marker split across chunks be seen.
+pub struct GemmaThinkCounter {
+    inside: bool,
+    think: usize,
+    carry: String,
+}
+
+impl GemmaThinkCounter {
+    const THINK_OPEN: &'static str = "<|channel>thought";
+    const CHANNEL_CLOSE: &'static str = "<channel|>";
+
+    /// Starts inside a thinking channel when `prompt` ends with the `thought` opener.
+    pub fn new(prompt: &str) -> Self {
+        let inside = OpenChannel::at_tail(prompt)
+            .map_or(false, |opener| opener.trim_end() == Self::THINK_OPEN);
+        Self {
+            inside,
+            think: 0,
+            carry: String::new(),
+        }
+    }
+
+    /// Bytes of tail kept between chunks: one short of the longest marker.
+    const CARRY_LEN: usize = Self::THINK_OPEN.len() - 1;
+}
+
+impl ThinkCounter for GemmaThinkCounter {
+    fn push(&mut self, text: &str, tokens: usize) {
+        if self.inside {
+            self.think += tokens;
+        }
+        let carried = self.carry.len();
+        let window = format!("{}{}", self.carry, text);
+        let mut markers: Vec<(usize, bool)> = Vec::new();
+        for (marker, opens) in [(Self::THINK_OPEN, true), (Self::CHANNEL_CLOSE, false)] {
+            for (at, _) in window.match_indices(marker) {
+                // Markers wholly inside the carry were already applied.
+                if at + marker.len() > carried {
+                    markers.push((at, opens));
+                }
+            }
+        }
+        markers.sort_by_key(|(at, _)| *at);
+        for (_, opens) in markers {
+            self.inside = opens;
+        }
+        let mut start = window.len().saturating_sub(Self::CARRY_LEN);
+        while !window.is_char_boundary(start) {
+            start += 1;
+        }
+        self.carry = window[start..].to_string();
+    }
+
+    fn think_tokens(&self) -> usize {
+        self.think
+    }
+}
+
+/// Picks the thinking counter for a prompt, for callers that hold no format instance.
+pub struct ThinkCounters;
+
+impl ThinkCounters {
+    /// A Gemma counter when the prompt carries Gemma 4 turn/channel syntax, else a no-op one.
+    pub fn for_prompt(prompt: &str) -> Box<dyn ThinkCounter> {
+        if prompt.contains(GemmaToolFormat::TURN_OPEN)
+            || prompt.contains(GemmaToolFormat::CHANNEL_OPEN)
+        {
+            GemmaToolFormat.think_counter(prompt)
+        } else {
+            Box::new(NoThinkCounter)
+        }
+    }
 }
 
 /// Streaming parser over one generation's output.
@@ -106,12 +208,18 @@ impl ToolCallFormat for GemmaToolFormat {
     fn new_parser(&self) -> Box<dyn ToolCallParser> {
         Box::new(GemmaToolParser::new())
     }
+
+    fn think_counter(&self, prompt: &str) -> Box<dyn ThinkCounter> {
+        Box::new(GemmaThinkCounter::new(prompt))
+    }
 }
 
 impl GemmaToolFormat {
     const CALL_OPEN: &'static str = "<|tool_call>";
     const CALL_CLOSE: &'static str = "<tool_call|>";
     const RESPONSE_OPEN: &'static str = "<|tool_response>";
+    const TURN_OPEN: &'static str = "<|turn>";
+    const CHANNEL_OPEN: &'static str = "<|channel>";
     const QUOTE: &'static str = "<|\"|>";
     const CALL_PREFIX: &'static str = "call:";
     const MAX_DEPTH: usize = 64;
@@ -957,5 +1065,87 @@ mod tests {
         assert!(parser.finish().is_empty());
         assert!(parser.calls().is_empty());
         assert_eq!(parser.content(), format!("hi {READ_FILE}<|tool_response>x"));
+    }
+
+    struct CounterFeed;
+
+    impl CounterFeed {
+        const MODEL_TURN: &'static str = "<|turn>model\n";
+
+        fn run(prompt: &str, chunks: &[(&str, usize)]) -> usize {
+            let mut counter = GemmaThinkCounter::new(prompt);
+            for (text, tokens) in chunks {
+                counter.push(text, *tokens);
+            }
+            counter.think_tokens()
+        }
+    }
+
+    #[test]
+    fn think_counter_counts_inside_thought_channel() {
+        let chunks = [
+            ("<|channel>thought\n", 1),
+            ("let me", 2),
+            ("<channel|>", 1),
+            ("Answer.", 2),
+        ];
+        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 3);
+    }
+
+    #[test]
+    fn think_counter_starts_inside_when_prompt_ends_with_opener() {
+        let prompt = "<|turn>model\n<|channel>thought\n";
+        assert_eq!(
+            CounterFeed::run(prompt, &[("hmm", 1), ("<channel|>Hi", 2)]),
+            3
+        );
+    }
+
+    #[test]
+    fn marker_split_across_chunks_is_seen() {
+        let chunks = [
+            ("<|channel>thought\n", 1),
+            ("<chan", 1),
+            ("nel|>", 1),
+            ("after", 5),
+        ];
+        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 2);
+        let split_open = [("<|chan", 1), ("nel>thought\nx", 1), ("y", 4)];
+        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &split_open), 4);
+    }
+
+    #[test]
+    fn answer_only_step_has_zero_think() {
+        let chunks = [("Hello", 1), (" world", 2)];
+        assert_eq!(CounterFeed::run(CounterFeed::MODEL_TURN, &chunks), 0);
+    }
+
+    #[test]
+    fn no_think_counter_is_always_zero() {
+        let mut counter = NoThinkCounter;
+        counter.push("<|channel>thought\nx", 3);
+        assert_eq!(counter.think_tokens(), 0);
+    }
+
+    #[test]
+    fn for_prompt_picks_gemma_counter_for_gemma_syntax() {
+        let mut counter = ThinkCounters::for_prompt("<|turn>model\n<|channel>thought\n");
+        counter.push("hmm", 4);
+        assert_eq!(counter.think_tokens(), 4);
+    }
+
+    #[test]
+    fn for_prompt_picks_no_counter_for_other_syntax() {
+        let mut counter = ThinkCounters::for_prompt("<start>assistant\n");
+        counter.push("<|channel>thought\nhmm", 4);
+        counter.push("more", 4);
+        assert_eq!(counter.think_tokens(), 0);
+    }
+
+    #[test]
+    fn gemma_format_owns_its_counter() {
+        let mut counter = GemmaToolFormat.think_counter("<|channel>thought\n");
+        counter.push("x", 2);
+        assert_eq!(counter.think_tokens(), 2);
     }
 }
