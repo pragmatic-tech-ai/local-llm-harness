@@ -63,24 +63,22 @@ pub(crate) struct SendTurnParams {
 }
 
 #[derive(Debug, Deserialize)]
-struct GenerateParams {
+struct PromptParams {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     tools: Option<Vec<Value>>,
     #[serde(default)]
     enable_thinking: bool,
-    #[serde(default)]
-    sampling: Option<SamplingConfig>,
 }
 
-/// The worker's `measure_prompt` params: `generate`'s, minus sampling (which is ignored).
+/// The worker's `generate` params. `measure_prompt` takes just the `PromptParams` part (an
+/// extra `sampling` field is ignored), so the two cannot drift.
 #[derive(Debug, Deserialize)]
-struct MeasureParams {
-    messages: Vec<ChatMessage>,
+struct GenerateParams {
+    #[serde(flatten)]
+    prompt: PromptParams,
     #[serde(default)]
-    tools: Option<Vec<Value>>,
-    #[serde(default)]
-    enable_thinking: bool,
+    sampling: Option<SamplingConfig>,
 }
 
 /// A prompt rendered through the chat template, with its token count.
@@ -285,7 +283,7 @@ impl RpcDispatch for Connection {
                 Ok(Value::Null)
             }
             "measure_prompt" => {
-                let p: MeasureParams = Frames::params(req.params.clone())?;
+                let p: PromptParams = Frames::params(req.params.clone())?;
                 let tools = p.tools.unwrap_or_default();
                 let rendered = self
                     .render_and_count(&p.messages, &tools, p.enable_thinking)
@@ -366,9 +364,9 @@ impl Connection {
     ///   `turn_rejected` / `turn_error`) is what ends it.
     async fn generate(&mut self, ws: &mut Ws, p: GenerateParams) -> Result<(), Failure> {
         let cfg = p.sampling.unwrap_or_else(|| self.sampling.clone());
-        let tools = p.tools.unwrap_or_default();
+        let tools = p.prompt.tools.unwrap_or_default();
         let rendered = match self
-            .render_and_count(&p.messages, &tools, p.enable_thinking)
+            .render_and_count(&p.prompt.messages, &tools, p.prompt.enable_thinking)
             .await
         {
             Ok(rendered) => rendered,
@@ -498,6 +496,7 @@ pub(crate) mod test_support {
     pub(crate) struct FakeEngine {
         chunks: Vec<String>,
         token_count: usize,
+        count_chars: bool,
         supports_tools: bool,
         template: Option<ChatTemplate>,
         recorded_tools: Mutex<Vec<Vec<Value>>>,
@@ -541,6 +540,7 @@ pub(crate) mod test_support {
             Self {
                 chunks: chunks.iter().map(|c| c.to_string()).collect(),
                 token_count: 10,
+                count_chars: false,
                 supports_tools: false,
                 template: None,
                 recorded_tools: Mutex::new(Vec::new()),
@@ -561,6 +561,12 @@ pub(crate) mod test_support {
 
         pub(crate) fn with_token_count(mut self, token_count: usize) -> Self {
             self.token_count = token_count;
+            self
+        }
+
+        /// `tokenize` counts one token per character, so the count depends on the rendered text.
+        pub(crate) fn with_char_tokens(mut self) -> Self {
+            self.count_chars = true;
             self
         }
 
@@ -588,10 +594,15 @@ pub(crate) mod test_support {
             unreachable!()
         }
 
-        async fn tokenize(&self, _text: &str) -> crate::engine::Result<TokenizeResult> {
+        async fn tokenize(&self, text: &str) -> crate::engine::Result<TokenizeResult> {
+            let count = if self.count_chars {
+                text.chars().count()
+            } else {
+                self.token_count
+            };
             Ok(TokenizeResult {
                 tokens: vec![],
-                count: self.token_count,
+                count,
             })
         }
 
@@ -997,18 +1008,47 @@ mod tests {
     async fn measure_prompt_matches_generate_turn_started_tokens() {
         let engine = Harness::tool_engine(&["ok"])
             .with_template(Harness::GEMMA4)
-            .with_token_count(37);
-        let mut client = TestClient::connect(Arc::new(engine), 4096).await;
-        let params = json!({"messages": Harness::messages(), "tools": Harness::tools(),
-            "enable_thinking": true});
-        let (notes, resp) = client.request("measure_prompt", params.clone()).await;
-        assert!(notes.is_empty());
+            .with_char_tokens();
+        let mut client = TestClient::connect(Arc::new(engine), 100_000).await;
+        let mut seen = Vec::new();
+        for (tools, thinking) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut params = json!({"messages": Harness::messages(), "enable_thinking": thinking});
+            if tools {
+                params["tools"] = Harness::tools();
+            }
+            let (notes, resp) = client.request("measure_prompt", params.clone()).await;
+            assert!(notes.is_empty());
+            let (gen_notes, _) = client.request("generate", params).await;
+            let started = &TestClient::params_of(&gen_notes, "turn_started")[0];
+            let measured = resp["result"]["prompt_tokens"].as_u64().expect("count");
+            assert_eq!(measured, started["prompt_tokens"].as_u64().unwrap());
+            assert_eq!(
+                measured as usize,
+                started["prompt"].as_str().unwrap().chars().count()
+            );
+            assert_eq!(resp["result"]["n_ctx"], started["n_ctx"]);
+            assert_eq!(resp["result"]["n_ctx"], 100_000);
+            seen.push(measured);
+        }
+        // Each input changes the rendered prompt, so each case counts differently.
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "tools and thinking must reach the render");
+    }
+
+    #[tokio::test]
+    async fn measure_prompt_with_tools_on_unsupporting_engine_matches_generate() {
+        let engine = Arc::new(FakeEngine::new(&["ok"]));
+        let mut client = TestClient::connect(engine.clone(), 8192).await;
+        let params = json!({"messages": Harness::messages(), "tools": Harness::tools()});
+        let (_, resp) = client.request("measure_prompt", params.clone()).await;
+        assert_eq!(resp["error"]["code"], ERR_INTERNAL);
         let (gen_notes, _) = client.request("generate", params).await;
-        let started = &TestClient::params_of(&gen_notes, "turn_started")[0];
-        assert_eq!(resp["result"]["prompt_tokens"], started["prompt_tokens"]);
-        assert_eq!(resp["result"]["prompt_tokens"], 37);
-        assert_eq!(resp["result"]["n_ctx"], 4096);
-        assert_eq!(resp["result"]["n_ctx"], started["n_ctx"]);
+        assert_eq!(
+            resp["error"]["message"],
+            TestClient::params_of(&gen_notes, "turn_error")[0]["message"]
+        );
+        assert!(engine.recorded_tools().is_empty());
     }
 
     #[tokio::test]

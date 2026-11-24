@@ -87,8 +87,8 @@ pub(crate) struct FakeLink {
 impl FakeLink {
     const MEASURE_UNAVAILABLE: &'static str = "measure_prompt unavailable";
 
-    /// Every `measure_prompt` call answers `size` (the default is an error). Unused until the
-    /// compaction tasks that drive the loop with it.
+    /// Every `measure_prompt` call answers `size` (the default is an error). Unused until Task 5, which
+    /// uses it and removes the attribute.
     #[allow(dead_code)]
     pub(crate) fn set_measure(&self, size: PromptSize) {
         *self.measure.lock().expect("measure") = Ok(size);

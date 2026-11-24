@@ -1,5 +1,5 @@
 //! The runtime's client side of the worker protocol: calls the worker's `generate`,
-//! `model_props` and `tokenize` over a websocket.
+//! `measure_prompt`, `model_props` and `tokenize` over a websocket.
 
 use std::fmt;
 use std::time::Duration;
@@ -378,6 +378,14 @@ mod tests {
         let (link, _closed) = Fixture::raw_server(Script::Frames(vec![frame])).await;
         let err = link.measure_prompt(&Fixture::request()).await.unwrap_err();
         assert!(err.0.contains("unknown method"), "{}", err.0);
+    }
+
+    #[tokio::test]
+    async fn ws_link_measure_prompt_invalid_params_is_err() {
+        let frame = r#"{"id":1,"error":{"code":-32602,"message":"invalid params"}}"#;
+        let (link, _closed) = Fixture::raw_server(Script::Frames(vec![frame])).await;
+        let err = link.measure_prompt(&Fixture::request()).await.unwrap_err();
+        assert_eq!(err.0, "invalid params");
     }
 
     #[tokio::test]
