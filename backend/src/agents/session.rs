@@ -28,6 +28,8 @@ pub struct SessionRecord {
     pub transcript: Vec<ChatMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 impl SessionRecord {
@@ -52,6 +54,7 @@ impl SessionRecord {
             enable_thinking: None,
             transcript,
             compaction: None,
+            notes: Vec::new(),
         }
     }
 

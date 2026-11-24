@@ -235,7 +235,9 @@ impl Drop for Dispatcher {
 mod tests {
     use super::*;
     use crate::agents::host::{FakeHost, HostState};
-    use crate::agents::template::{AgentTemplate, ContextStrategy, DEFAULT_COMPACT_AT_PCT};
+    use crate::agents::template::{
+        AgentTemplate, ContextStrategy, WorkspaceConfig, DEFAULT_COMPACT_AT_PCT,
+    };
     use crate::runtime::test_support::FakeLink;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -600,6 +602,7 @@ mod tests {
             host: Some("hive".into()),
             context_strategy: ContextStrategy::default(),
             compact_at_pct: DEFAULT_COMPACT_AT_PCT,
+            workspace: WorkspaceConfig::default(),
         };
         let record = SessionRecord::new("s1".into(), "T".into(), "t", template, 0);
         assert_eq!(

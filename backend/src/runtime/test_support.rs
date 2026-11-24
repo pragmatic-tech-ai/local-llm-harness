@@ -399,6 +399,12 @@ impl TestRuntime {
             models: vec![(Self::MODEL.to_string(), vec![Self::RUNTIME.to_string()])],
             tools: registry.specs().into_iter().map(|s| s.name).collect(),
             hosts: vec![Self::HOST.to_string()],
+            writing_tools: registry
+                .specs()
+                .into_iter()
+                .filter(|s| s.side_effects)
+                .map(|s| s.name)
+                .collect(),
         }
     }
 

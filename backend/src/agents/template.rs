@@ -1,5 +1,7 @@
 //! The agent template: the declarative, file-backed definition of an agent.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::engine::SamplingConfig;
@@ -14,6 +16,13 @@ const ERR_STEP_BUDGET: &str = "step_budget must be at least 1";
 const ERR_UNKNOWN_HOST: &str = "unknown host: ";
 const ERR_UNKNOWN_STRATEGY: &str = "unknown context strategy: ";
 const ERR_COMPACT_PCT: &str = "compact_at_pct must be between 10 and 95";
+const ERR_UNKNOWN_WORKSPACE_MODE: &str = "unknown workspace mode: ";
+const ERR_WORKSPACE_NAME_REQUIRED: &str = "workspace name is required for named mode";
+const ERR_WORKSPACE_NAME_INVALID: &str = "workspace name must be 1-64 letters, digits, _ or -";
+const MAX_WORKSPACE_NAME_LEN: usize = 64;
+const SESSIONS_FOLDER: &str = "sessions";
+const SHARED_FOLDER: &str = "shared";
+const NAMED_FOLDER: &str = "workspaces";
 pub(crate) const DEFAULT_COMPACT_AT_PCT: u8 = 75;
 const MIN_COMPACT_AT_PCT: u8 = 10;
 const MAX_COMPACT_AT_PCT: u8 = 95;
@@ -63,6 +72,103 @@ impl<'de> Deserialize<'de> for ContextStrategy {
     }
 }
 
+/// Where an agent's writing tools keep their files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkspaceMode {
+    /// A private folder per session.
+    #[default]
+    Session,
+    /// One folder shared by every agent that asks for it.
+    Shared,
+    /// A folder chosen by name.
+    Named,
+}
+
+impl WorkspaceMode {
+    /// Every mode with its wire name: the one table behind serialization and parsing.
+    const ALL: [(Self, &'static str); 3] = [
+        (Self::Session, "session"),
+        (Self::Shared, "shared"),
+        (Self::Named, "named"),
+    ];
+
+    /// The wire name.
+    pub fn as_str(&self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(m, _)| m == self)
+            .map(|(_, n)| *n)
+            .unwrap_or_default()
+    }
+
+    fn parse(v: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(_, n)| *n == v).map(|(m, _)| *m)
+    }
+}
+
+impl Serialize for WorkspaceMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = String::deserialize(d)?;
+        Self::parse(&v)
+            .ok_or_else(|| serde::de::Error::custom(format!("{ERR_UNKNOWN_WORKSPACE_MODE}{v}")))
+    }
+}
+
+/// A template's workspace: the mode, plus the folder name for `named`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    #[serde(default)]
+    pub mode: WorkspaceMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl WorkspaceConfig {
+    /// The folder for this workspace, relative to the sandbox.
+    pub fn folder(&self, session_id: &str) -> PathBuf {
+        match self.mode {
+            WorkspaceMode::Session => [SESSIONS_FOLDER, session_id].iter().collect(),
+            WorkspaceMode::Shared => PathBuf::from(SHARED_FOLDER),
+            WorkspaceMode::Named => [NAMED_FOLDER, self.name.as_deref().unwrap_or_default()]
+                .iter()
+                .collect(),
+        }
+    }
+
+    /// The same config with the name dropped unless the mode is `named`.
+    pub fn normalized(self) -> Self {
+        match self.mode {
+            WorkspaceMode::Named => self,
+            _ => Self { name: None, ..self },
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.mode != WorkspaceMode::Named {
+            return Ok(());
+        }
+        let name = self.name.as_deref().unwrap_or_default();
+        if name.is_empty() {
+            return Err(ERR_WORKSPACE_NAME_REQUIRED.to_string());
+        }
+        let ok = name.chars().count() <= MAX_WORKSPACE_NAME_LEN
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if ok {
+            Ok(())
+        } else {
+            Err(ERR_WORKSPACE_NAME_INVALID.to_string())
+        }
+    }
+}
+
 /// A saved summary of the older part of a session's transcript.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionState {
@@ -101,6 +207,8 @@ pub struct AgentTemplate {
         deserialize_with = "AgentTemplate::deserialize_compact_at_pct"
     )]
     pub compact_at_pct: u8,
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
 }
 
 impl AgentTemplate {
@@ -131,6 +239,8 @@ pub struct TemplateRules {
     pub models: Vec<(String, Vec<String>)>,
     pub tools: Vec<String>,
     pub hosts: Vec<String>,
+    /// The names of the registry tools that have side effects.
+    pub writing_tools: Vec<String>,
 }
 
 /// Where a template store reads its rules on every use. A fixed [`TemplateRules`] is one; the
@@ -178,6 +288,7 @@ impl TemplateRules {
         if !(MIN_COMPACT_AT_PCT..=MAX_COMPACT_AT_PCT).contains(&t.compact_at_pct) {
             return Err(ERR_COMPACT_PCT.to_string());
         }
+        t.workspace.validate()?;
         Ok(())
     }
 
@@ -193,6 +304,7 @@ impl TemplateRules {
             ],
             tools: vec!["read_file".into(), "web_search".into()],
             hosts: vec!["hive".into()],
+            writing_tools: vec![],
         }
     }
 }
@@ -265,5 +377,103 @@ mod tests {
             t.compact_at_pct = ok;
             assert!(rules.validate(&t).is_ok());
         }
+    }
+
+    #[test]
+    fn workspace_defaults_to_session_when_missing() {
+        let t: AgentTemplate = toml::from_str(BASE).unwrap();
+        assert_eq!(t.workspace.mode, WorkspaceMode::Session);
+        assert_eq!(t.workspace.name, None);
+    }
+
+    #[test]
+    fn workspace_named_round_trips() {
+        let text = format!("{BASE}[workspace]
+mode = \"named\"
+name = \"research\"
+");
+        let t: AgentTemplate = toml::from_str(&text).unwrap();
+        assert_eq!(t.workspace.mode, WorkspaceMode::Named);
+        assert_eq!(t.workspace.name.as_deref(), Some("research"));
+        let again: AgentTemplate = toml::from_str(&toml::to_string_pretty(&t).unwrap()).unwrap();
+        assert_eq!(again, t);
+    }
+
+    #[test]
+    fn unknown_workspace_mode_is_rejected() {
+        let text = format!("{BASE}[workspace]
+mode = \"bogus\"
+");
+        let e = toml::from_str::<AgentTemplate>(&text)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown workspace mode: bogus"), "{e}");
+    }
+
+    #[test]
+    fn named_without_name_is_rejected() {
+        let rules = TemplateRules::for_tests();
+        let mut t: AgentTemplate = toml::from_str(BASE).unwrap();
+        t.workspace.mode = WorkspaceMode::Named;
+        for name in [None, Some(String::new())] {
+            t.workspace.name = name;
+            assert_eq!(
+                rules.validate(&t).unwrap_err(),
+                "workspace name is required for named mode"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_workspace_name_is_rejected() {
+        let rules = TemplateRules::for_tests();
+        let mut t: AgentTemplate = toml::from_str(BASE).unwrap();
+        t.workspace.mode = WorkspaceMode::Named;
+        for bad in ["a b", "x/y", &"a".repeat(65)] {
+            t.workspace.name = Some(bad.to_string());
+            assert_eq!(
+                rules.validate(&t).unwrap_err(),
+                "workspace name must be 1-64 letters, digits, _ or -"
+            );
+        }
+        t.workspace.name = Some("aZ0_-".repeat(12) + "aZ0_");
+        assert_eq!(t.workspace.name.as_ref().unwrap().len(), 64);
+        assert!(rules.validate(&t).is_ok());
+    }
+
+    #[test]
+    fn name_on_other_mode_is_dropped_by_normalized() {
+        let w = WorkspaceConfig {
+            mode: WorkspaceMode::Shared,
+            name: Some("x".into()),
+        };
+        assert_eq!(w.normalized().name, None);
+        let n = WorkspaceConfig {
+            mode: WorkspaceMode::Named,
+            name: Some("x".into()),
+        };
+        assert_eq!(n.clone().normalized(), n);
+    }
+
+    #[test]
+    fn folder_maps_each_mode() {
+        let named = WorkspaceConfig {
+            mode: WorkspaceMode::Named,
+            name: Some("research".into()),
+        };
+        let shared = WorkspaceConfig {
+            mode: WorkspaceMode::Shared,
+            name: None,
+        };
+        let session = WorkspaceConfig::default();
+        assert_eq!(
+            session.folder("s-1-0"),
+            ["sessions", "s-1-0"].iter().collect::<std::path::PathBuf>()
+        );
+        assert_eq!(shared.folder("s-1-0"), std::path::PathBuf::from("shared"));
+        assert_eq!(
+            named.folder("s-1-0"),
+            ["workspaces", "research"].iter().collect::<std::path::PathBuf>()
+        );
     }
 }

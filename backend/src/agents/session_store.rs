@@ -226,6 +226,7 @@ impl SessionStore {
         self.mutate(id, Bump::Kept, |r| {
             r.transcript = SessionRecord::initial_transcript(&r.snapshot);
             r.compaction = None;
+            r.notes.clear();
         })
     }
 
@@ -237,6 +238,11 @@ impl SessionStore {
         state: Option<CompactionState>,
     ) -> Result<(), SessionError> {
         self.mutate(id, Bump::Kept, |r| r.compaction = state)
+    }
+
+    /// Replaces the session's notes; `updated` is kept.
+    pub fn set_notes(&self, id: &str, notes: Vec<String>) -> Result<(), SessionError> {
+        self.mutate(id, Bump::Kept, |r| r.notes = notes)
     }
 
     /// Applies `f` to a copy of the record, persists it, then swaps it in.
@@ -296,7 +302,9 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::template::{ContextStrategy, TemplateRules, DEFAULT_COMPACT_AT_PCT};
+    use crate::agents::template::{
+        ContextStrategy, TemplateRules, WorkspaceConfig, DEFAULT_COMPACT_AT_PCT,
+    };
     use crate::agents::template_store::TemplateStore;
     use crate::engine::types::{FunctionCall, Role, ToolCall};
     use std::sync::Arc;
@@ -341,6 +349,7 @@ mod tests {
                 host: None,
                 context_strategy: ContextStrategy::default(),
                 compact_at_pct: DEFAULT_COMPACT_AT_PCT,
+                workspace: WorkspaceConfig::default(),
             }
         }
 
@@ -725,5 +734,51 @@ mod tests {
         assert!(s.sessions.is_poisoned());
         assert!(s.get(&rec.id).is_some());
         assert_eq!(s.list().len(), 1);
+    }
+
+    #[test]
+    fn set_notes_persists_and_reloads() {
+        let d = TempDir::new("notes");
+        let s = d.store();
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        assert!(rec.notes.is_empty());
+        let notes = vec!["one".to_string(), "two".to_string()];
+        s.set_notes(&rec.id, notes.clone()).unwrap();
+        drop(s);
+        let s = d.store();
+        assert_eq!(s.get(&rec.id).unwrap().notes, notes);
+    }
+
+    #[test]
+    fn reset_clears_notes() {
+        let d = TempDir::new("notesreset");
+        let s = d.store();
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        s.set_notes(&rec.id, vec!["one".into()]).unwrap();
+        s.reset(&rec.id).unwrap();
+        assert!(s.get(&rec.id).unwrap().notes.is_empty());
+    }
+
+    #[test]
+    fn set_notes_on_unknown_session_errors() {
+        let d = TempDir::new("notesunknown");
+        let s = d.store();
+        assert_eq!(
+            s.set_notes("nope", vec![]).unwrap_err(),
+            SessionError::unknown("nope")
+        );
+    }
+
+    #[test]
+    fn old_record_without_notes_loads_empty() {
+        let d = TempDir::new("notesold");
+        let s = d.store();
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        drop(s);
+        let file = d.0.join("sessions").join(format!("{}.json", rec.id));
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("notes"));
+        let s = d.store();
+        assert!(s.get(&rec.id).unwrap().notes.is_empty());
     }
 }

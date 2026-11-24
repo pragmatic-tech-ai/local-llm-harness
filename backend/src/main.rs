@@ -153,6 +153,12 @@ impl AgentsStack {
         let source = Arc::new(DiscoveredCatalog::new(
             Arc::clone(catalog),
             registry.specs().into_iter().map(|s| s.name).collect(),
+            registry
+                .specs()
+                .into_iter()
+                .filter(|s| s.side_effects)
+                .map(|s| s.name)
+                .collect(),
             host_names.clone(),
         ));
         let data_dir = catalog.agents.data_dir();

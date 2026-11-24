@@ -41,14 +41,21 @@ impl CatalogSource for CatalogView {
 pub struct DiscoveredCatalog {
     catalog: Arc<Catalog>,
     tools: Vec<String>,
+    writing_tools: Vec<String>,
     hosts: Vec<String>,
 }
 
 impl DiscoveredCatalog {
-    pub fn new(catalog: Arc<Catalog>, tools: Vec<String>, hosts: Vec<String>) -> Self {
+    pub fn new(
+        catalog: Arc<Catalog>,
+        tools: Vec<String>,
+        writing_tools: Vec<String>,
+        hosts: Vec<String>,
+    ) -> Self {
         Self {
             catalog,
             tools,
+            writing_tools,
             hosts,
         }
     }
@@ -78,6 +85,7 @@ impl RulesSource for DiscoveredCatalog {
                 .map(|m| (m.display_name, m.runtimes))
                 .collect(),
             tools: self.tools.clone(),
+            writing_tools: self.writing_tools.clone(),
             hosts: self.hosts.clone(),
         }
     }
@@ -141,6 +149,7 @@ mod tests {
         let source = DiscoveredCatalog::new(
             Fixtures::catalog(&dir.0),
             vec![TOOL.to_string()],
+            vec![],
             vec![HOST.to_string()],
         );
         let before = source.view();
@@ -154,6 +163,7 @@ mod tests {
         let rules = source.rules();
         assert!(rules.models.iter().any(|(m, _)| m == "late"));
         assert_eq!(rules.tools, [TOOL]);
+        assert!(rules.writing_tools.is_empty());
         assert_eq!(rules.hosts, [HOST]);
         assert_eq!(rules.runtimes, ["llamacpp"]);
     }

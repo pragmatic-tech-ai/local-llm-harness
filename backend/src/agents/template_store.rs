@@ -10,7 +10,8 @@ use serde::Serialize;
 
 use super::atomic_file::AtomicFile;
 use super::template::{
-    AgentTemplate, ContextStrategy, RulesSource, TemplateRules, DEFAULT_COMPACT_AT_PCT,
+    AgentTemplate, ContextStrategy, RulesSource, TemplateRules, WorkspaceConfig,
+    DEFAULT_COMPACT_AT_PCT,
 };
 
 const EXT: &str = "toml";
@@ -168,6 +169,7 @@ impl TemplateStore {
             host: None,
             context_strategy: ContextStrategy::default(),
             compact_at_pct: DEFAULT_COMPACT_AT_PCT,
+            workspace: WorkspaceConfig::default(),
         }
     }
 
@@ -257,6 +259,10 @@ impl TemplateStore {
         if let Some(e) = self.check(t) {
             return Err(TemplateError(e));
         }
+        let t = &AgentTemplate {
+            workspace: t.workspace.clone().normalized(),
+            ..t.clone()
+        };
         let dir = self.dir_for(path)?;
         let _g = self.lock()?;
         let (id, old) = match id {
@@ -574,6 +580,7 @@ mod tests {
                 host: Some("hive".into()),
                 context_strategy: ContextStrategy::default(),
                 compact_at_pct: DEFAULT_COMPACT_AT_PCT,
+            workspace: WorkspaceConfig::default(),
             }
         }
     }
@@ -1058,6 +1065,7 @@ n_ctx = 4096
             ],
             tools: vec![],
             hosts: vec![],
+            writing_tools: vec![],
         };
         let s = TemplateStore::open(&d.0.join("templates"), rules).unwrap();
         assert_eq!(s.get("default").unwrap().0.model, "alpha");
