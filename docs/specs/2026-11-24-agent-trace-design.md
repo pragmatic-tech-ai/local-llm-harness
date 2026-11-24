@@ -1,6 +1,6 @@
 # Agent trace in the instrument panel
 
-**Status:** draft 2026-11-24, awaiting owner approval
+**Status:** approved 2026-11-24 (owner "go"); implemented on feat/agent-trace
 **Roadmap:** step 2 (`docs/roadmap.md`)
 **Builds on:** `docs/specs/2026-11-23-agent-templates-sessions-design.md` (sessions, the
 runtime on :8779, the dispatcher)
