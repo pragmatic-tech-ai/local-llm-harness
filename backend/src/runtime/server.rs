@@ -74,7 +74,8 @@
 //! list could not be fetched; the save stands) and `delete_repository {name}` deletes one. A
 //! rename or delete is refused while a template uses the repository (`repository is used by
 //! templates: {names}`, the names from the template store). Each broadcasts
-//! `repositories_changed` (a listing only when it refreshed) and signals the dispatcher, so
+//! `repositories_changed` (a listing only when it fetched: a refresh, or the first listing of
+//! a list never fetched) and signals the dispatcher, so
 //! sessions whose placement changed with it (a deleted repository reads `repository not found:
 //! {name}`) get `placement_changed`. `list_catalog` adds `repositories` (each with its kind,
 //! capabilities and models). Session rows (`list_sessions`, `attach_session`) carry the
@@ -1054,7 +1055,9 @@ impl SharedRequests {
                     .models(&p.name, p.refresh)
                     .await
                     .map_err(RpcError::internal)?;
-                if p.refresh {
+                // Any fetch that ran (a refresh, or a first listing of an unknown list) may
+                // have changed what the repository serves.
+                if models.fetched {
                     self.repositories_changed();
                 }
                 Self::to_value(models)
@@ -3583,13 +3586,25 @@ mod tests {
                 .count()
         };
         assert_eq!(changed(&mut b), 1);
-        // A plain listing announces nothing; a refresh does.
+        // A listing that fetches the unknown list announces it; a plain listing of a known
+        // list announces nothing; a refresh does.
+        let listed = a
+            .call(
+                C::M_LIST_REPOSITORY_MODELS,
+                json!({ "name": Repositories::REPO }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed["models"][0]["id"], Repositories::MODEL);
+        assert!(listed.get("fetched").is_none());
+        assert_eq!(changed(&mut b), 1);
         a.call(
             C::M_LIST_REPOSITORY_MODELS,
             json!({ "name": Repositories::REPO }),
         )
         .await
         .unwrap();
+        assert_eq!(changed(&mut b), 0);
         let refreshed = a
             .call(
                 C::M_LIST_REPOSITORY_MODELS,

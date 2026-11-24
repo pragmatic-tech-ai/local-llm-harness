@@ -131,6 +131,10 @@ pub struct RepositoryModels {
     pub fetched_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether this listing fetched the list (so what the repository serves may have
+    /// changed). Not on the wire.
+    #[serde(skip)]
+    pub fetched: bool,
 }
 
 /// A `save_repository` result: the saved name, and why the model list could not be fetched.
@@ -228,14 +232,14 @@ impl OpenRouterEntry {
             .clone()
     }
 
-    /// Fetches the list, caching it in memory and in `cache_dir`. A failure keeps the previous
-    /// list, is remembered as the listing's error and is returned.
-    async fn fetch(&self, cache_dir: &Path) -> Option<String> {
-        match self.api.models().await {
+    /// Keeps a fetch's outcome: a list is cached in memory and in `cache_dir`; a failure keeps
+    /// the previous list and is remembered as the listing's error.
+    fn keep_fetched(&self, fetched: &Result<Vec<OpenRouterModel>, String>, cache_dir: &Path) {
+        match fetched {
             Ok(models) => {
                 let cache = ModelCache {
                     fetched_at: RepositoryRegistry::now(),
-                    models,
+                    models: models.clone(),
                 };
                 if let Err(e) = Self::write_cache(cache_dir, &self.config.name, &cache) {
                     eprintln!("{} {}: {e}", Self::ERR_CACHE_WRITE, self.config.name);
@@ -244,12 +248,8 @@ impl OpenRouterEntry {
                     cache: Some(cache),
                     error: None,
                 });
-                None
             }
-            Err(error) => {
-                self.lock_listing().error = Some(error.clone());
-                Some(error)
-            }
+            Err(error) => self.lock_listing().error = Some(error.clone()),
         }
     }
 
@@ -275,12 +275,13 @@ impl OpenRouterEntry {
         }
     }
 
-    fn models(&self) -> RepositoryModels {
+    fn models(&self, fetched: bool) -> RepositoryModels {
         let listing = self.listing();
         RepositoryModels {
             models: self.model_values(),
             fetched_at: listing.cache.map(|c| c.fetched_at),
             error: listing.error,
+            fetched,
         }
     }
 
@@ -309,6 +310,10 @@ impl OpenRouterEntry {
     }
 }
 
+/// The checked contents of `repositories.toml`, from [`RepositoryRegistry::load`].
+#[derive(Debug)]
+pub struct LoadedRepositories(Vec<OpenRouterConfig>);
+
 /// Every repository and its provider; the dispatcher's [`ProviderSource`].
 pub struct RepositoryRegistry {
     data_dir: PathBuf,
@@ -333,23 +338,59 @@ impl RepositoryRegistry {
     const ERR_NOT_EDITABLE: &'static str = "repository is not editable: ";
     const ERR_FILE: &'static str = "repositories file: ";
     const ERR_PARSE: &'static str = "does not parse at line ";
+    const ERR_CACHE_RENAME: &'static str = "model cache not moved for repository";
 
-    /// Opens the registry over `data_dir`: the Pragmatic repositories as given (models from
-    /// `discovery`), the OpenRouter ones from `repositories.toml` (none when the file is
-    /// missing) with their cached model lists. A file that does not parse, or names a
-    /// repository invalidly or twice, is an `InvalidData` error.
+    /// Opens the registry over `data_dir`: [`Self::load`] then [`Self::build`], with the
+    /// Pragmatic repositories' names taken from `pragmatic`.
     pub fn open(
         data_dir: &Path,
         pragmatic: Vec<(String, Arc<dyn Provider>)>,
         discovery: Arc<dyn CatalogSource>,
         base_url: String,
     ) -> io::Result<Self> {
+        let names: Vec<String> = pragmatic.iter().map(|(n, _)| n.clone()).collect();
+        let loaded = Self::load(data_dir, &names)?;
+        Ok(Self::build(
+            data_dir, loaded, pragmatic, discovery, base_url,
+        ))
+    }
+
+    /// Reads and checks `repositories.toml` in `data_dir` (none when the file is missing)
+    /// against the Pragmatic repository names. A file that does not parse, or names a
+    /// repository invalidly, twice or like a Pragmatic one, is an `InvalidData` error that
+    /// never quotes the file.
+    pub fn load(data_dir: &Path, pragmatic_names: &[String]) -> io::Result<LoadedRepositories> {
         let path = data_dir.join(Self::FILE_NAME);
         let file: RepositoriesFile = match fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text).map_err(|e| Self::unparsable(&text, &e))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => RepositoriesFile::default(),
             Err(e) => return Err(e),
         };
+        let mut seen: Vec<&str> = Vec::new();
+        for config in &file.openrouter {
+            Self::check_name(&config.name).map_err(Self::invalid)?;
+            if pragmatic_names.contains(&config.name) || seen.contains(&config.name.as_str()) {
+                return Err(Self::invalid(format!(
+                    "{}{}",
+                    Self::ERR_EXISTS,
+                    config.name
+                )));
+            }
+            seen.push(&config.name);
+        }
+        Ok(LoadedRepositories(file.openrouter))
+    }
+
+    /// The registry over `loaded` (from [`Self::load`] with these Pragmatic names): the
+    /// Pragmatic repositories as given (models from `discovery`) and the OpenRouter ones with
+    /// their cached model lists.
+    pub fn build(
+        data_dir: &Path,
+        loaded: LoadedRepositories,
+        pragmatic: Vec<(String, Arc<dyn Provider>)>,
+        discovery: Arc<dyn CatalogSource>,
+        base_url: String,
+    ) -> Self {
         let registry = RepositoryRegistry {
             data_dir: data_dir.to_path_buf(),
             base_url,
@@ -358,30 +399,32 @@ impl RepositoryRegistry {
             openrouter: Mutex::new(Vec::new()),
         };
         let cache_dir = registry.cache_dir();
-        let mut entries: Vec<Arc<OpenRouterEntry>> = Vec::new();
-        for config in file.openrouter {
-            Self::check_name(&config.name).map_err(Self::invalid)?;
-            if registry.is_pragmatic(&config.name)
-                || entries.iter().any(|e| e.config.name == config.name)
-            {
-                return Err(Self::invalid(format!(
-                    "{}{}",
-                    Self::ERR_EXISTS,
-                    config.name
-                )));
-            }
-            let listing = Listing {
-                cache: OpenRouterEntry::read_cache(&cache_dir, &config.name),
-                error: None,
-            };
-            entries.push(Arc::new(OpenRouterEntry::new(
-                config,
-                &registry.base_url,
-                listing,
-            )));
-        }
+        let entries = loaded
+            .0
+            .into_iter()
+            .map(|config| {
+                let listing = Listing {
+                    cache: OpenRouterEntry::read_cache(&cache_dir, &config.name),
+                    error: None,
+                };
+                Arc::new(OpenRouterEntry::new(config, &registry.base_url, listing))
+            })
+            .collect();
         *registry.lock() = entries;
-        Ok(registry)
+        registry
+    }
+
+    /// Fetches `entry`'s list. The outcome is kept (in memory and in the cache file) only if
+    /// `entry` is still the live repository of its name, checked under the lock, so a fetch
+    /// that a rename or delete overtook writes nothing back. Returns the fetch's error.
+    async fn fetch(&self, entry: &Arc<OpenRouterEntry>) -> Option<String> {
+        let fetched = entry.api.models().await;
+        let entries = self.lock();
+        if entries.iter().any(|e| Arc::ptr_eq(e, entry)) {
+            entry.keep_fetched(&fetched, &self.cache_dir());
+        }
+        drop(entries);
+        fetched.err()
     }
 
     /// The parse error of `text`, by line only: toml's own message quotes the offending
@@ -526,13 +569,15 @@ impl RepositoryRegistry {
                 models: self.discovery.view().models,
                 fetched_at: None,
                 error: None,
+                fetched: false,
             });
         }
         let entry = self.entry(name).ok_or_else(|| Self::not_found(name))?;
-        if refresh || entry.served().is_none() {
-            entry.fetch(&self.cache_dir()).await;
+        let fetch = refresh || entry.served().is_none();
+        if fetch {
+            self.fetch(&entry).await;
         }
-        Ok(entry.models())
+        Ok(entry.models(fetch))
     }
 
     /// Creates or updates an OpenRouter repository, then fetches its model list.
@@ -552,7 +597,7 @@ impl RepositoryRegistry {
         used_by: &(dyn Fn(&str) -> Vec<String> + Sync),
     ) -> Result<SaveResult, String> {
         let entry = self.store(name, previous_name, id_prefixes, api_key, used_by)?;
-        let fetch_error = entry.fetch(&self.cache_dir()).await;
+        let fetch_error = self.fetch(&entry).await;
         Ok(SaveResult {
             name: name.to_string(),
             fetch_error,
@@ -623,15 +668,27 @@ impl RepositoryRegistry {
             Some(i) => entries[i] = Arc::clone(&entry),
             None => entries.push(Arc::clone(&entry)),
         }
-        drop(entries);
+        // Under the lock, so no fetch of either name writes its cache in between.
         if renaming {
-            let cache_dir = self.cache_dir();
-            let _ = fs::rename(
-                cache_dir.join(OpenRouterEntry::cache_file_name(target)),
-                cache_dir.join(OpenRouterEntry::cache_file_name(name)),
-            );
+            self.move_cache(target, name);
         }
+        drop(entries);
         Ok(entry)
+    }
+
+    /// Moves the cache file of `from` to `to`. No cache is fine; any other failure is logged
+    /// (the list stays in memory and is refetched by the next save or refresh).
+    fn move_cache(&self, from: &str, to: &str) {
+        let cache_dir = self.cache_dir();
+        let moved = fs::rename(
+            cache_dir.join(OpenRouterEntry::cache_file_name(from)),
+            cache_dir.join(OpenRouterEntry::cache_file_name(to)),
+        );
+        if let Err(e) = moved {
+            if e.kind() != io::ErrorKind::NotFound {
+                eprintln!("{} {from} -> {to}: {e}", Self::ERR_CACHE_RENAME);
+            }
+        }
     }
 
     /// Deletes an OpenRouter repository and its cache, refused while `used_by` lists
@@ -654,11 +711,12 @@ impl RepositoryRegistry {
             .collect();
         self.write_file(configs)?;
         entries.remove(index);
-        drop(entries);
+        // Under the lock, so a fetch finishing now finds the entry gone and writes nothing.
         let _ = fs::remove_file(
             self.cache_dir()
                 .join(OpenRouterEntry::cache_file_name(name)),
         );
+        drop(entries);
         Ok(())
     }
 
@@ -1036,6 +1094,68 @@ mod tests {
         assert!(reopened.rules()[0].models.is_some());
         reopened.delete(Fixtures::REPO, &Fixtures::unused).unwrap();
         assert!(!cache.exists());
+    }
+
+    #[tokio::test]
+    async fn a_fetch_overtaken_by_a_delete_writes_no_cache() {
+        let dir = TempDir::new("repos-overtaken");
+        // The list arrives in slow parts, so the delete lands while it is fetched.
+        let body = Fixtures::models_body(&["google/a"]);
+        let parts: Vec<String> = body
+            .as_bytes()
+            .chunks(body.len() / 8 + 1)
+            .map(|c| String::from_utf8(c.to_vec()).unwrap())
+            .collect();
+        let (base, _requests) = FakeHttp::serve(vec![Canned { status: 200, parts }]).await;
+        let registry = Fixtures::registry(&dir.0, &base);
+        let save = registry.save(Fixtures::REPO, None, vec![], None, &Fixtures::unused);
+        let delete = async {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            registry.delete(Fixtures::REPO, &Fixtures::unused)
+        };
+        let (saved, deleted) = tokio::join!(save, delete);
+        assert_eq!(saved.unwrap().fetch_error, None);
+        assert_eq!(deleted, Ok(()));
+        assert!(registry.provider(Fixtures::REPO).is_none());
+        let cache = dir
+            .0
+            .join(RepositoryRegistry::CACHE_DIR)
+            .join("openrouter-or1.json");
+        assert!(!cache.exists(), "the overtaken fetch wrote its cache back");
+    }
+
+    #[test]
+    fn load_checks_the_file_against_the_pragmatic_names() {
+        let dir = TempDir::new("repos-load");
+        let hive = vec!["hive".to_string()];
+        assert!(RepositoryRegistry::load(&dir.0, &hive)
+            .unwrap()
+            .0
+            .is_empty());
+        let file = dir.0.join(RepositoryRegistry::FILE_NAME);
+        fs::write(&file, "[[openrouter]]\nname = \"hive\"\n").unwrap();
+        assert_eq!(
+            RepositoryRegistry::load(&dir.0, &hive)
+                .unwrap_err()
+                .to_string(),
+            "repositories file: repository already exists: hive"
+        );
+        fs::write(
+            &file,
+            "[[openrouter]]\nname = \"a\"\n[[openrouter]]\nname = \"a\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            RepositoryRegistry::load(&dir.0, &hive)
+                .unwrap_err()
+                .to_string(),
+            "repositories file: repository already exists: a"
+        );
+        fs::write(&file, "[[openrouter]]\nname = \"bad name\"\n").unwrap();
+        assert_eq!(
+            RepositoryRegistry::load(&dir.0, &hive).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
