@@ -12,6 +12,49 @@ const ERR_UNKNOWN_RUNTIME: &str = "unknown runtime: ";
 const ERR_UNKNOWN_MODEL: &str = "unknown model: ";
 const ERR_STEP_BUDGET: &str = "step_budget must be at least 1";
 const ERR_UNKNOWN_HOST: &str = "unknown host: ";
+const ERR_UNKNOWN_STRATEGY: &str = "unknown context strategy: ";
+const ERR_COMPACT_PCT: &str = "compact_at_pct must be between 10 and 95";
+const DEFAULT_COMPACT_AT_PCT: u8 = 75;
+const MIN_COMPACT_AT_PCT: u8 = 10;
+const MAX_COMPACT_AT_PCT: u8 = 95;
+
+/// How an agent keeps its prompt inside the context window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextStrategy {
+    #[default]
+    Off,
+    Trim,
+    Summarize,
+}
+
+impl ContextStrategy {
+    fn parse(v: &str) -> Option<Self> {
+        match v {
+            "off" => Some(Self::Off),
+            "trim" => Some(Self::Trim),
+            "summarize" => Some(Self::Summarize),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextStrategy {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = String::deserialize(d)?;
+        Self::parse(&v)
+            .ok_or_else(|| serde::de::Error::custom(format!("{ERR_UNKNOWN_STRATEGY}{v}")))
+    }
+}
+
+/// A saved summary of the older part of a session's transcript.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionState {
+    pub summary: String,
+    pub covers: usize,
+    pub tokens: u32,
+    pub at: u64,
+}
 
 /// An agent definition, stored as one TOML file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,11 +75,19 @@ pub struct AgentTemplate {
     pub sampling: Option<SamplingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    #[serde(default)]
+    pub context_strategy: ContextStrategy,
+    #[serde(default = "AgentTemplate::default_compact_at_pct")]
+    pub compact_at_pct: u8,
 }
 
 impl AgentTemplate {
     fn default_step_budget() -> usize {
         DEFAULT_STEP_BUDGET
+    }
+
+    fn default_compact_at_pct() -> u8 {
+        DEFAULT_COMPACT_AT_PCT
     }
 }
 
@@ -92,6 +143,9 @@ impl TemplateRules {
         if let Some(host) = t.host.as_ref().filter(|h| !self.hosts.contains(h)) {
             return Err(format!("{ERR_UNKNOWN_HOST}{host}"));
         }
+        if !(MIN_COMPACT_AT_PCT..=MAX_COMPACT_AT_PCT).contains(&t.compact_at_pct) {
+            return Err(ERR_COMPACT_PCT.to_string());
+        }
         Ok(())
     }
 
@@ -107,6 +161,60 @@ impl TemplateRules {
             ],
             tools: vec!["read_file".into(), "web_search".into()],
             hosts: vec!["hive".into()],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = "name = \"T\"\nruntime = \"llamacpp\"\nmodel = \"tiny\"\nn_ctx = 4096\n";
+
+    #[test]
+    fn context_fields_default_when_absent() {
+        let t: AgentTemplate = toml::from_str(BASE).unwrap();
+        assert_eq!(t.context_strategy, ContextStrategy::Off);
+        assert_eq!(t.compact_at_pct, 75);
+    }
+
+    #[test]
+    fn context_fields_round_trip() {
+        let text = format!("{BASE}context_strategy = \"summarize\"\ncompact_at_pct = 60\n");
+        let t: AgentTemplate = toml::from_str(&text).unwrap();
+        assert_eq!(t.context_strategy, ContextStrategy::Summarize);
+        assert_eq!(t.compact_at_pct, 60);
+        let again: AgentTemplate = toml::from_str(&toml::to_string_pretty(&t).unwrap()).unwrap();
+        assert_eq!(again, t);
+    }
+
+    #[test]
+    fn unknown_context_strategy_is_rejected() {
+        let text = format!("{BASE}context_strategy = \"shrink\"\n");
+        let e = toml::from_str::<AgentTemplate>(&text)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown context strategy: shrink"), "{e}");
+        let j = serde_json::from_value::<ContextStrategy>(serde_json::json!("shrink"))
+            .unwrap_err()
+            .to_string();
+        assert!(j.contains("unknown context strategy: shrink"), "{j}");
+    }
+
+    #[test]
+    fn compact_at_pct_out_of_range_is_rejected() {
+        let rules = TemplateRules::for_tests();
+        let mut t: AgentTemplate = toml::from_str(BASE).unwrap();
+        for bad in [9u8, 96] {
+            t.compact_at_pct = bad;
+            assert_eq!(
+                rules.validate(&t).unwrap_err(),
+                "compact_at_pct must be between 10 and 95"
+            );
+        }
+        for ok in [10u8, 95] {
+            t.compact_at_pct = ok;
+            assert!(rules.validate(&t).is_ok());
         }
     }
 }

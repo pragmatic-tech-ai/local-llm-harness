@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::template::AgentTemplate;
+use super::template::{AgentTemplate, CompactionState};
 use crate::engine::types::{ChatMessage, Role};
 use crate::engine::SamplingConfig;
 
@@ -26,6 +26,8 @@ pub struct SessionRecord {
     pub enable_thinking: Option<bool>,
     #[serde(default)]
     pub transcript: Vec<ChatMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionState>,
 }
 
 impl SessionRecord {
@@ -49,6 +51,7 @@ impl SessionRecord {
             sampling: None,
             enable_thinking: None,
             transcript,
+            compaction: None,
         }
     }
 

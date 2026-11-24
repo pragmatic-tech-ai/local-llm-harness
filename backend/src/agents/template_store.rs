@@ -164,6 +164,8 @@ impl TemplateStore {
             enable_thinking: false,
             sampling: None,
             host: None,
+            context_strategy: Default::default(),
+            compact_at_pct: 75,
         }
     }
 
@@ -568,6 +570,8 @@ mod tests {
                 enable_thinking: true,
                 sampling: Some(crate::engine::SamplingConfig::default()),
                 host: Some("hive".into()),
+            context_strategy: Default::default(),
+                compact_at_pct: 75,
             }
         }
     }

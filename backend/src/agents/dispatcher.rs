@@ -598,6 +598,8 @@ mod tests {
             enable_thinking: false,
             sampling: None,
             host: Some("hive".into()),
+            context_strategy: Default::default(),
+            compact_at_pct: 75,
         };
         let record = SessionRecord::new("s1".into(), "T".into(), "t", template, 0);
         assert_eq!(

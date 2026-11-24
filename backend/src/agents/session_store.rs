@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::atomic_file::AtomicFile;
 use super::host::ModelRequirement;
 use super::session::{SessionRecord, SessionSummary};
-use super::template::AgentTemplate;
+use super::template::{AgentTemplate, CompactionState};
 use crate::engine::types::ChatMessage;
 use crate::engine::SamplingConfig;
 
@@ -224,8 +224,19 @@ impl SessionStore {
     /// kept.
     pub fn reset(&self, id: &str) -> Result<(), SessionError> {
         self.mutate(id, Bump::Kept, |r| {
-            r.transcript = SessionRecord::initial_transcript(&r.snapshot)
+            r.transcript = SessionRecord::initial_transcript(&r.snapshot);
+            r.compaction = None;
         })
+    }
+
+    /// Saves (or clears) the summary of the older transcript; `updated` is kept and nothing is
+    /// broadcast.
+    pub fn set_compaction(
+        &self,
+        id: &str,
+        state: Option<CompactionState>,
+    ) -> Result<(), SessionError> {
+        self.mutate(id, Bump::Kept, |r| r.compaction = state)
     }
 
     /// Applies `f` to a copy of the record, persists it, then swaps it in.
@@ -328,6 +339,8 @@ mod tests {
                 enable_thinking: false,
                 sampling: None,
                 host: None,
+                context_strategy: Default::default(),
+                compact_at_pct: 75,
             }
         }
 
@@ -451,6 +464,75 @@ mod tests {
         s.commit(&rec.id, TempDir::rich_transcript()).unwrap();
         s.reset(&rec.id).unwrap();
         assert_eq!(s.get(&rec.id).unwrap().transcript, rec.transcript);
+    }
+
+    fn state() -> CompactionState {
+        CompactionState {
+            summary: "so far".into(),
+            covers: 3,
+            tokens: 42,
+            at: 7,
+        }
+    }
+
+    #[test]
+    fn set_compaction_persists_and_reopens() {
+        let d = TempDir::new("comp");
+        let s = d.store();
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        assert_eq!(rec.compaction, None);
+        s.set_compaction(&rec.id, Some(state())).unwrap();
+        drop(s);
+        let s = d.store();
+        assert_eq!(s.get(&rec.id).unwrap().compaction, Some(state()));
+        s.set_compaction(&rec.id, None).unwrap();
+        assert_eq!(s.get(&rec.id).unwrap().compaction, None);
+        assert!(s.set_compaction("nope", None).is_err());
+    }
+
+    #[test]
+    fn set_compaction_keeps_updated() {
+        let d = TempDir::new("compkeep");
+        let ms = Arc::new(AtomicU64::new(10_000));
+        let s = d.clocked(&ms);
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        ms.store(20_000, Ordering::SeqCst);
+        s.set_compaction(&rec.id, Some(state())).unwrap();
+        assert_eq!(s.get(&rec.id).unwrap().updated, 10);
+    }
+
+    #[test]
+    fn reset_clears_compaction() {
+        let d = TempDir::new("compreset");
+        let s = d.store();
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        s.set_compaction(&rec.id, Some(state())).unwrap();
+        s.reset(&rec.id).unwrap();
+        assert_eq!(s.get(&rec.id).unwrap().compaction, None);
+    }
+
+    #[test]
+    fn old_session_json_without_compaction_loads() {
+        let d = TempDir::new("compold");
+        let s = d.store();
+        let rec = s.create("r", &TempDir::sample("R", "p")).unwrap();
+        drop(s);
+        let path = d.0.join("sessions").join(format!("{}.json", rec.id));
+        let text = fs::read_to_string(&path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(v.get("compaction").is_none());
+        v["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("context_strategy");
+        v["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compact_at_pct");
+        fs::write(&path, v.to_string()).unwrap();
+        let got = d.store().get(&rec.id).unwrap();
+        assert_eq!(got.compaction, None);
+        assert_eq!(got.snapshot.compact_at_pct, 75);
     }
 
     #[test]
