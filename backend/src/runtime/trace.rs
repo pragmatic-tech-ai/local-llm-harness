@@ -13,6 +13,8 @@ pub const TRACE_FILE_SUFFIX: &str = ".trace.jsonl";
 
 /// Schema version written on every record.
 const SCHEMA_VERSION: u32 = 1;
+/// Error text for a session id that is not a single file-name component.
+const INVALID_ID: &str = "invalid session id";
 /// Page size when the caller gives none.
 const DEFAULT_LIMIT: usize = 20;
 
@@ -112,11 +114,19 @@ pub struct TracePage {
     pub reset_pending: bool,
 }
 
+/// What appends need to know, guarded by one lock.
+struct WriteState {
+    /// The file is known to end in a line feed (or to be absent/empty).
+    tail_clean: bool,
+    /// The log was deleted with its session; appends are dropped.
+    deleted: bool,
+}
+
 /// The append-only trace log of one session. Opening is lazy: nothing is read until used.
 pub struct TraceLog {
     path: PathBuf,
     /// Serializes appends so the tail check and the write are one step.
-    write_lock: Mutex<()>,
+    write: Mutex<WriteState>,
     /// The next turn number, once scanned.
     next: Mutex<Option<u64>>,
 }
@@ -128,7 +138,10 @@ impl TraceLog {
     pub fn open(path: PathBuf) -> TraceLog {
         TraceLog {
             path,
-            write_lock: Mutex::new(()),
+            write: Mutex::new(WriteState {
+                tail_clean: false,
+                deleted: false,
+            }),
             next: Mutex::new(None),
         }
     }
@@ -142,19 +155,13 @@ impl TraceLog {
         })
         .map_err(io::Error::other)?;
         {
-            let _guard = Self::guard(&self.write_lock);
-            let mut buf = Vec::with_capacity(line.len() + 2);
-            if Self::tail_is_cut(&self.path)? {
-                buf.push(b'\n');
+            let mut state = Self::guard(&self.write);
+            if state.deleted {
+                return Ok(());
             }
-            buf.extend_from_slice(line.as_bytes());
-            buf.push(b'\n');
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?;
-            file.write_all(&buf)?;
-            file.flush()?;
+            let written = self.write_line(&mut state, &line);
+            state.tail_clean = written.is_ok();
+            written?;
         }
         if let Some(turn) = Self::turn_of(record) {
             let mut next = Self::guard(&self.next);
@@ -167,20 +174,36 @@ impl TraceLog {
         Ok(())
     }
 
+    /// Writes one line (checking a possibly cut tail first), under the write lock.
+    fn write_line(&self, state: &mut WriteState, line: &str) -> io::Result<()> {
+        let mut buf = Vec::with_capacity(line.len() + 2);
+        if !state.tail_clean && Self::tail_is_cut(&self.path)? {
+            buf.push(b'\n');
+        }
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        file.write_all(&buf)?;
+        file.flush()
+    }
+
     /// The highest `turn` in any step or turn record, plus 1; scanned once, then cached.
-    /// A missing file gives 1.
-    pub fn next_turn(&self) -> u64 {
+    /// A missing file gives 1. A read error is returned and nothing is cached.
+    pub fn next_turn(&self) -> io::Result<u64> {
         let mut next = Self::guard(&self.next);
         if let Some(n) = *next {
-            return n;
+            return Ok(n);
         }
-        let highest = Self::read_records(&self.path)
+        let highest = Self::read_records(&self.path)?
             .iter()
             .filter_map(Self::turn_of)
             .max()
             .unwrap_or(0);
         *next = Some(highest + 1);
-        highest + 1
+        Ok(highest + 1)
     }
 
     /// Turns newest first, those below `before` (exclusive), at most `limit` of them
@@ -189,7 +212,9 @@ impl TraceLog {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, Self::MAX_LIMIT);
         let mut turns: BTreeMap<u64, TraceTurn> = BTreeMap::new();
         let mut reset_open = false;
-        for record in Self::read_records(&self.path) {
+        // A reset before the first turn still sets `reset_before` on that turn: the UI draws
+        // the divider under the oldest turn, which records the history faithfully.
+        for record in Self::read_records(&self.path)? {
             match record {
                 TraceRecord::Reset(_) => reset_open = true,
                 TraceRecord::Step(step) => {
@@ -206,7 +231,7 @@ impl TraceLog {
         let mut eligible: Vec<TraceTurn> = turns
             .into_values()
             .rev()
-            .filter(|t| before.map_or(true, |b| t.turn < b))
+            .filter(|t| before.is_none_or(|b| t.turn < b))
             .collect();
         let more = eligible.len() > limit;
         eligible.truncate(limit);
@@ -219,8 +244,20 @@ impl TraceLog {
 
     /// Removes the log file; a missing file is fine.
     pub fn delete(&self) -> io::Result<()> {
-        let _guard = Self::guard(&self.write_lock);
+        let mut state = Self::guard(&self.write);
+        self.remove_file(&mut state)
+    }
+
+    /// Deletes the file and drops every later append: the session is gone.
+    fn retire(&self) -> io::Result<()> {
+        let mut state = Self::guard(&self.write);
+        state.deleted = true;
+        self.remove_file(&mut state)
+    }
+
+    fn remove_file(&self, state: &mut WriteState) -> io::Result<()> {
         *Self::guard(&self.next) = None;
+        state.tail_clean = false;
         match fs::remove_file(&self.path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -266,15 +303,17 @@ impl TraceLog {
     }
 
     /// Every readable record in log order. A missing file is empty; partial, unparseable
-    /// and unknown-kind lines are skipped.
-    fn read_records(path: &Path) -> Vec<TraceRecord> {
-        let Ok(bytes) = fs::read(path) else {
-            return Vec::new();
+    /// and unknown-kind lines are skipped; any other read error is returned.
+    fn read_records(path: &Path) -> io::Result<Vec<TraceRecord>> {
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
-        String::from_utf8_lossy(&bytes)
+        Ok(String::from_utf8_lossy(&bytes)
             .lines()
             .filter_map(|l| serde_json::from_str::<TraceRecord>(l).ok())
-            .collect()
+            .collect())
     }
 
     fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -296,21 +335,45 @@ impl TraceStore {
         }
     }
 
-    /// The session's log, created lazily and cached.
-    pub fn log(&self, id: &str) -> Arc<TraceLog> {
+    /// The session's log, created lazily and cached. The id must be a single plain
+    /// file-name component (no separators, `..` or empty).
+    pub fn log(&self, id: &str) -> io::Result<Arc<TraceLog>> {
+        Self::check_id(id)?;
         let mut logs = TraceLog::guard(&self.logs);
-        Arc::clone(logs.entry(id.to_string()).or_insert_with(|| {
-            Arc::new(TraceLog::open(
-                self.dir.join(format!("{id}{TRACE_FILE_SUFFIX}")),
-            ))
-        }))
+        Ok(Arc::clone(logs.entry(id.to_string()).or_insert_with(
+            || Arc::new(TraceLog::open(self.path_for(id))),
+        )))
     }
 
-    /// Deletes the session's log file and evicts the cache entry.
+    /// Deletes the session's log file and evicts the cache entry. A handle still held
+    /// elsewhere is retired: its later appends are dropped instead of recreating the file.
     pub fn delete(&self, id: &str) -> io::Result<()> {
-        let log = self.log(id);
-        TraceLog::guard(&self.logs).remove(id);
-        log.delete()
+        Self::check_id(id)?;
+        let mut logs = TraceLog::guard(&self.logs);
+        let log = logs
+            .remove(id)
+            .unwrap_or_else(|| Arc::new(TraceLog::open(self.path_for(id))));
+        log.retire()
+    }
+
+    fn path_for(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}{TRACE_FILE_SUFFIX}"))
+    }
+
+    fn check_id(id: &str) -> io::Result<()> {
+        let mut parts = Path::new(id).components();
+        let plain = matches!(
+            (parts.next(), parts.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) && !id.contains(['/', '\\']);
+        if plain {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{INVALID_ID}: {id:?}"),
+            ))
+        }
     }
 }
 
@@ -320,6 +383,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const FILE: &str = "s-1-0.trace.jsonl";
+    /// A crash-cut record: cut mid-kind, no line feed.
+    const CUT_LINE: &str = "{\"v\":1,\"kind\":\"st";
 
     /// A unique temp directory removed on drop.
     struct TempDir(PathBuf);
@@ -378,7 +443,11 @@ mod tests {
         }
 
         fn summary(turn: u64) -> TraceRecord {
-            TraceRecord::Turn(TurnRecord {
+            TraceRecord::Turn(Self::turn_record(turn))
+        }
+
+        fn turn_record(turn: u64) -> TurnRecord {
+            TurnRecord {
                 turn,
                 at: 2000 + turn,
                 steps: 1,
@@ -389,7 +458,7 @@ mod tests {
                 peak_fill: 0.1,
                 committed: true,
                 user: "hi".into(),
-            })
+            }
         }
 
         fn reset() -> TraceRecord {
@@ -407,9 +476,11 @@ mod tests {
     fn records_round_trip_with_version_and_kind() {
         let d = TempDir::new("rt");
         let log = d.log();
-        for r in [TempDir::step(1, 1), TempDir::summary(1), TempDir::reset()] {
-            log.append(&r).unwrap();
+        let records = vec![TempDir::step(1, 1), TempDir::summary(1), TempDir::reset()];
+        for r in &records {
+            log.append(r).unwrap();
         }
+        assert_eq!(TraceLog::read_records(&d.0.join(FILE)).unwrap(), records);
         let text = fs::read_to_string(d.0.join(FILE)).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
@@ -421,7 +492,7 @@ mod tests {
         let page = log.page(None, None).unwrap();
         assert_eq!(page.turns.len(), 1);
         assert_eq!(page.turns[0].steps, vec![TempDir::step_record(1, 1)]);
-        assert_eq!(page.turns[0].summary.as_ref().unwrap().turn, 1);
+        assert_eq!(page.turns[0].summary, Some(TempDir::turn_record(1)));
         assert!(page.reset_pending);
     }
 
@@ -431,11 +502,11 @@ mod tests {
         let log = d.log();
         log.append(&TempDir::step(1, 1)).unwrap();
         log.append(&TempDir::step(1, 2)).unwrap();
-        d.raw("{\"v\":1,\"kind\":\"st");
+        d.raw(CUT_LINE);
         let page = log.page(None, None).unwrap();
         assert_eq!(page.turns.len(), 1);
         assert_eq!(page.turns[0].steps.len(), 2);
-        assert_eq!(log.next_turn(), 2);
+        assert_eq!(log.next_turn().unwrap(), 2);
     }
 
     #[test]
@@ -443,9 +514,10 @@ mod tests {
         let d = TempDir::new("fuse");
         let log = d.log();
         log.append(&TempDir::step(1, 1)).unwrap();
-        d.raw("{\"v\":1,\"kind\":\"st");
-        log.append(&TempDir::step(1, 2)).unwrap();
-        assert_eq!(log.page(None, None).unwrap().turns[0].steps.len(), 2);
+        d.raw(CUT_LINE);
+        let reopened = d.log();
+        reopened.append(&TempDir::step(1, 2)).unwrap();
+        assert_eq!(reopened.page(None, None).unwrap().turns[0].steps.len(), 2);
     }
 
     #[test]
@@ -520,21 +592,57 @@ mod tests {
         let p = log.page(Some(2), None).unwrap();
         assert!(!p.reset_pending);
         assert!(!p.turns[0].reset_before);
+        let p = log.page(None, Some(1)).unwrap();
+        assert!(p.more);
+        assert_eq!(p.turns.len(), 1);
+        assert!(p.turns[0].reset_before);
+    }
+
+    #[test]
+    fn unreadable_log_is_an_error_and_not_cached() {
+        let d = TempDir::new("unreadable");
+        fs::create_dir(d.0.join(FILE)).unwrap();
+        let log = d.log();
+        assert!(log.page(None, None).is_err());
+        assert!(log.next_turn().is_err());
+        assert!(log.next_turn().is_err());
+    }
+
+    #[test]
+    fn store_rejects_ids_that_are_not_plain_file_names() {
+        let d = TempDir::new("ids");
+        let store = TraceStore::new(d.0.clone());
+        for bad in ["", ".", "..", "a/b", r"a\b", "../x", "/abs"] {
+            assert!(store.log(bad).is_err(), "{bad:?}");
+            assert!(store.delete(bad).is_err(), "{bad:?}");
+        }
+        assert!(store.log("s-1-0").is_ok());
+    }
+
+    #[test]
+    fn append_on_a_retired_handle_is_dropped() {
+        let d = TempDir::new("retired");
+        let store = TraceStore::new(d.0.clone());
+        let held = store.log("s-1-0").unwrap();
+        held.append(&TempDir::step(1, 1)).unwrap();
+        store.delete("s-1-0").unwrap();
+        held.append(&TempDir::step(2, 1)).unwrap();
+        assert!(!d.0.join(FILE).exists());
     }
 
     #[test]
     fn next_turn_counts_crash_cut_turns() {
         let d = TempDir::new("next");
         let log = d.log();
-        assert_eq!(log.next_turn(), 1);
+        assert_eq!(log.next_turn().unwrap(), 1);
         log.append(&TempDir::step(1, 1)).unwrap();
         log.append(&TempDir::summary(1)).unwrap();
         log.append(&TempDir::step(2, 1)).unwrap();
-        assert_eq!(log.next_turn(), 3);
+        assert_eq!(log.next_turn().unwrap(), 3);
         log.append(&TempDir::step(3, 1)).unwrap();
-        assert_eq!(log.next_turn(), 4);
+        assert_eq!(log.next_turn().unwrap(), 4);
         let fresh = d.log();
-        assert_eq!(fresh.next_turn(), 4);
+        assert_eq!(fresh.next_turn().unwrap(), 4);
         let p = fresh.page(None, None).unwrap();
         let two = p.turns.iter().find(|t| t.turn == 2).unwrap();
         assert!(two.summary.is_none());
@@ -544,16 +652,16 @@ mod tests {
     fn store_delete_removes_file_and_cache() {
         let d = TempDir::new("store");
         let store = TraceStore::new(d.0.clone());
-        let a = store.log("s-1-0");
-        assert!(Arc::ptr_eq(&a, &store.log("s-1-0")));
+        let a = store.log("s-1-0").unwrap();
+        assert!(Arc::ptr_eq(&a, &store.log("s-1-0").unwrap()));
         a.append(&TempDir::step(1, 1)).unwrap();
         let file = d.0.join(FILE);
         assert!(file.exists());
         store.delete("s-1-0").unwrap();
         assert!(!file.exists());
         store.delete("s-1-0").unwrap();
-        let b = store.log("s-1-0");
+        let b = store.log("s-1-0").unwrap();
         assert!(!Arc::ptr_eq(&a, &b));
-        assert_eq!(b.next_turn(), 1);
+        assert_eq!(b.next_turn().unwrap(), 1);
     }
 }
