@@ -132,6 +132,8 @@ formats can supply their own.
 ```
 
 - `at` is the wall-clock time in Unix milliseconds, recorded when the record is written.
+- A step record may also carry an optional `compaction` field, on steps where compaction ran.
+  See `docs/specs/2026-11-24-context-compaction-design.md`.
 - A step that never reached the worker (a step-0 link or load failure) is written as a
   step with `prompt_tokens`/`n_ctx` null, `end: "error"` and the error text.
 - A turn aborted because no connection remains attached still gets its turn record, with

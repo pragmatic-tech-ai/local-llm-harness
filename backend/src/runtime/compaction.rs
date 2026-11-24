@@ -52,21 +52,56 @@ impl Turns {
     }
 }
 
-/// The user message that stands in for a summarised span. It is never elided or dropped.
+/// The note that stands in for a summarised span. It rides in the system message, so the
+/// prompt keeps the user/assistant alternation strict chat templates (Gemma 3) enforce, and
+/// like the system message it is never elided or dropped.
 pub struct SummaryNote;
 
 impl SummaryNote {
     /// The fixed first line of every summary note.
     pub const HEADER: &'static str = "[Summary of the earlier conversation]";
+    /// What separates the session's system prompt from the note.
+    const SEPARATOR: &'static str = "\n\n";
 
-    /// The note carrying `summary`: the header, a line feed, then the summary.
-    pub fn message(summary: &str) -> ChatMessage {
-        ChatMessage::new(Role::User, format!("{}\n{summary}", Self::HEADER))
+    /// The note text for `summary`: the header, a line feed, then the summary.
+    pub fn text(summary: &str) -> String {
+        format!("{}\n{summary}", Self::HEADER)
     }
 
-    /// Whether `message` is a summary note.
+    /// The system message of a session without one: the note alone.
+    pub fn message(summary: &str) -> ChatMessage {
+        ChatMessage::new(Role::System, Self::text(summary))
+    }
+
+    /// The system message carrying `summary`: `system`'s content, a blank line, then the note
+    /// (just the note when `system` is `None` or empty).
+    pub fn system(system: Option<&ChatMessage>, summary: &str) -> ChatMessage {
+        match system {
+            Some(system) if !system.content.is_empty() => {
+                let mut out = system.clone();
+                out.content = format!(
+                    "{}{}{}",
+                    system.content,
+                    Self::SEPARATOR,
+                    Self::text(summary)
+                );
+                out
+            }
+            Some(system) => {
+                let mut out = system.clone();
+                out.content = Self::text(summary);
+                out
+            }
+            None => Self::message(summary),
+        }
+    }
+
+    /// Whether `message` is a system message carrying a summary note.
     pub fn is_note(message: &ChatMessage) -> bool {
-        message.role == Role::User && message.content.starts_with(Self::HEADER)
+        let after_prompt = format!("{}{}", Self::SEPARATOR, Self::HEADER);
+        message.role == Role::System
+            && (message.content.starts_with(Self::HEADER)
+                || message.content.contains(&after_prompt))
     }
 }
 
@@ -177,8 +212,8 @@ impl<'a> TrimPlan<'a> {
         }
     }
 
-    /// Whether `index` lies in the region trim may change: after a leading system message,
-    /// before the current turn, and not a summary note.
+    /// Whether `index` lies in the region trim may change: after a leading system message
+    /// (which also carries any summary note), before the current turn, and not a summary note.
     fn touchable(&self, index: usize) -> bool {
         let system = index == 0 && self.messages[0].role == Role::System;
         index < self.current && !system && !SummaryNote::is_note(&self.messages[index])
@@ -262,9 +297,9 @@ pub trait SummarySink: Send + Sync {
 }
 
 /// The summarize strategy: keep the previous and current turns verbatim and replace everything
-/// between the system message and them with one summary note, made by an extra `generate` on
-/// the worker link (chunked when the span is too big for one call) and saved through a
-/// [`SummarySink`] so later steps and turns reuse it.
+/// between the system message and them with one summary note appended to the system message,
+/// made by an extra `generate` on the worker link (chunked when the span is too big for one
+/// call) and saved through a [`SummarySink`] so later steps and turns reuse it.
 pub struct Summarize;
 
 impl Summarize {
@@ -282,9 +317,12 @@ impl Summarize {
     pub const MAX_CALLS: usize = 4;
     const TEMPERATURE: f32 = 0.2;
     const TOP_P: f32 = 0.9;
+    const TOP_K: u32 = 40;
+    const REPEAT_PENALTY: f32 = 1.0;
     const ERR_NOTHING: &'static str = "nothing to summarize before the kept tail";
     const ERR_SAVE: &'static str = "saving the summary failed: ";
     const ERR_NOTE_MEASURE: &'static str = "measuring the summary note failed: ";
+    const ERR_PROMPT_MEASURE: &'static str = "measuring the summarized prompt failed: ";
 
     /// A summary call's `max_tokens`: `min(1024, n_ctx / 8)`.
     pub fn max_tokens(n_ctx: usize) -> usize {
@@ -295,21 +333,27 @@ impl Summarize {
     /// scratch from `current_turn_start`) so the prompt plus `reservation` fits `budget`.
     ///
     /// - **Reuse.** A `saved` summary whose `covers` lies after the system message and within
-    ///   the committed transcript (and before the current turn) gives the system message, the
-    ///   note, then `messages[covers..]`. If that fits, it is sent with `reused_summary`.
+    ///   the committed transcript (and before the current turn) gives the system message with
+    ///   the note appended (or the note as the system message), then `messages[covers..]`. If
+    ///   that fits, it is sent with `reused_summary`.
     /// - **Summarise.** Otherwise the span from after the system message (or from
     ///   `saved.covers`, with the old summary text folded in) up to the start of the turn
     ///   before the current one is summarised over `link`, saved through `sink` with `covers`
     ///   set to the span's end index, and the summarised prompt is measured. If it is still
     ///   over budget, [`Trim`] runs on it and its counts are merged in. When there is nothing
     ///   new to summarise but a saved summary exists, trim runs on the reused prompt.
-    /// - **Fallback.** Any summary failure, including a failed save, runs [`Trim`] on the
-    ///   original messages with `fallback` true and the cause in `summary_error`.
+    /// - **Fallback.** Any summary failure, including a failed save, and any failed measure of
+    ///   a summarised prompt (a template rejecting it, say) runs [`Trim`] on the original
+    ///   messages with `fallback` true and the cause in `summary_error`.
+    ///
+    /// `measure` sizes the step's prompts (the step's tools and thinking flag);
+    /// `summary_measure` sizes the summary calls (no tools, thinking off): their input budget,
+    /// chunks and the saved `tokens`.
     ///
     /// `covers` is a transcript index: the summary replaces `messages[system_len..covers]`,
     /// and `summarized_messages` is that count. The record is always `Some`, with `strategy`
     /// `"summarize"` and `after_tokens` from the last measure. `Err` carries a measure error
-    /// on the path that sends a prompt (as [`Trim::compact`] does).
+    /// of the original messages (as [`Trim::compact`] does).
     #[allow(clippy::too_many_arguments)]
     pub async fn compact(
         messages: &[ChatMessage],
@@ -323,6 +367,7 @@ impl Summarize {
         sampling: &SamplingConfig,
         link: &dyn WorkerLink,
         measure: &dyn PromptMeasure,
+        summary_measure: &dyn PromptMeasure,
         sink: &dyn SummarySink,
     ) -> Result<Compacted, String> {
         let current = current_turn_start.min(messages.len());
@@ -336,11 +381,15 @@ impl Summarize {
             before,
             measure,
         };
+        let none = SummaryStats::default();
         let saved = saved.filter(|s| step.can_reuse(s));
         let mut reused_tokens = None;
         if let Some(state) = saved {
             let prompt = step.prompt(&state.summary, state.covers);
-            let tokens = measure.measure(&prompt).await?.prompt_tokens;
+            let tokens = match measure.measure(&prompt).await {
+                Ok(size) => size.prompt_tokens,
+                Err(e) => return step.fallback(Self::prompt_error(&e), &none).await,
+            };
             reused_tokens = Some(tokens);
             if Trim::fits(tokens, reservation, budget) {
                 let mut record = CompactionRecord::new(Self::STRATEGY, before, tokens);
@@ -355,28 +404,23 @@ impl Summarize {
         let span_start = saved.map_or(step.system_len, |s| s.covers);
         let span_end = step.tail_start().max(span_start);
         if span_end == span_start {
-            return match saved {
-                Some(state) => {
-                    let mut out = step
-                        .on_top(
-                            &state.summary,
-                            state.covers,
-                            reused_tokens,
-                            &SummaryStats::default(),
-                        )
-                        .await?;
+            let Some(state) = saved else {
+                return step.fallback(Self::ERR_NOTHING.into(), &none).await;
+            };
+            return match step
+                .on_top(&state.summary, state.covers, reused_tokens, &none)
+                .await
+            {
+                Ok(mut out) => {
                     if let Some(record) = out.record.as_mut() {
                         record.reused_summary = true;
                     }
                     Ok(out)
                 }
-                None => {
-                    step.fallback(Self::ERR_NOTHING.into(), &SummaryStats::default())
-                        .await
-                }
+                Err(e) => step.fallback(Self::prompt_error(&e), &none).await,
             };
         }
-        let mut summarizer = Summarizer::new(link, measure, sampling, n_ctx);
+        let mut summarizer = Summarizer::new(link, summary_measure, sampling, n_ctx);
         let old = saved.map(|s| s.summary.as_str());
         let lines: Vec<String> = messages[span_start..span_end]
             .iter()
@@ -386,9 +430,8 @@ impl Summarize {
             Ok(summary) => summary,
             Err(error) => return step.fallback(error, &summarizer.stats).await,
         };
-        let note = [SummaryNote::message(&summary)];
-        let tokens = match measure.measure(&note).await {
-            Ok(size) => CompactionRecord::count(size.prompt_tokens),
+        let tokens = match summarizer.note_tokens(&summary).await {
+            Ok(tokens) => tokens,
             Err(e) => {
                 let error = format!("{}{e}", Self::ERR_NOTE_MEASURE);
                 return step.fallback(error, &summarizer.stats).await;
@@ -404,8 +447,21 @@ impl Summarize {
             let error = format!("{}{e}", Self::ERR_SAVE);
             return step.fallback(error, &summarizer.stats).await;
         }
-        step.on_top(&state.summary, state.covers, None, &summarizer.stats)
+        match step
+            .on_top(&state.summary, state.covers, None, &summarizer.stats)
             .await
+        {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                step.fallback(Self::prompt_error(&e), &summarizer.stats)
+                    .await
+            }
+        }
+    }
+
+    /// The `summary_error` of a failed measure of a summarised prompt.
+    fn prompt_error(error: &str) -> String {
+        format!("{}{error}", Self::ERR_PROMPT_MEASURE)
     }
 
     /// 1 when `messages` starts with the system message, otherwise 0.
@@ -458,17 +514,19 @@ impl SummarizeStep<'_> {
         CompactionRecord::count(covers.saturating_sub(self.system_len))
     }
 
-    /// The system message (if any), the summary note, then `messages[covers..]`.
+    /// The system message carrying the summary note (see [`SummaryNote::system`]), then
+    /// `messages[covers..]`. The prompt always starts with that one system message, so the
+    /// user/assistant turns after it alternate as in the transcript.
     fn prompt(&self, summary: &str, covers: usize) -> Vec<ChatMessage> {
-        let mut out = self.messages[..self.system_len].to_vec();
-        out.push(SummaryNote::message(summary));
+        let system = self.messages[..self.system_len].first();
+        let mut out = vec![SummaryNote::system(system, summary)];
         out.extend_from_slice(&self.messages[covers..]);
         out
     }
 
     /// Sends the summarised prompt, trimming it when it is still over budget. `measured` is
     /// the prompt's size when the caller has already measured it (the reused prompt), so it
-    /// is not measured twice.
+    /// is not measured twice. `Err` is a failed measure of the summarised prompt.
     async fn on_top(
         &self,
         summary: &str,
@@ -485,7 +543,8 @@ impl SummarizeStep<'_> {
         let messages = if Trim::fits(tokens, self.reservation, self.budget) {
             prompt
         } else {
-            let current = self.system_len + 1 + (self.current - covers);
+            // The note's system message, then `messages[covers..]`.
+            let current = 1 + (self.current - covers);
             let trimmed = Trim::compact(
                 &prompt,
                 current,
@@ -542,8 +601,11 @@ impl SpanLine {
     const SEPARATOR: &'static str = ": ";
 
     /// The line for `message`. A tool message's content is its result (a string as is,
-    /// anything else as JSON) cut to [`Summarize::RESULT_CHARS`] characters; an assistant
-    /// message's tool calls follow its text as `name(arguments)`.
+    /// anything else as JSON) cut to [`Summarize::RESULT_CHARS`] characters. Other content
+    /// loses its reasoning channels ([`OpenChannel::strip_blocks`]) and surrounding
+    /// whitespace, as the chat template would drop them from a normal prompt; only this
+    /// summary-call text changes, never the transcript. An assistant message's tool calls
+    /// follow its text as `name(arguments)`.
     fn render(message: &ChatMessage) -> String {
         let role = serde_json::to_value(message.role)
             .ok()
@@ -552,7 +614,9 @@ impl SpanLine {
         let mut content = match (&message.role, &message.tool_result) {
             (Role::Tool, Some(Value::String(text))) => Self::cut(text),
             (Role::Tool, Some(result)) => Self::cut(&result.to_string()),
-            _ => message.content.clone(),
+            _ => OpenChannel::strip_blocks(&message.content)
+                .trim()
+                .to_string(),
         };
         for call in message.tool_calls.iter().flatten() {
             if !content.is_empty() {
@@ -616,9 +680,7 @@ impl<'a> Summarizer<'a> {
     const ERR_MAX_TOKENS: &'static str = "summary hit its max_tokens before stopping: ";
     const ERR_REJECTED: &'static str = "summary call rejected (window full), needed/total: ";
     const ERR_ERRORED: &'static str = "summary call errored: ";
-    /// Tokens a `\n` join adds per line (and slack for a merge at the boundary).
-    const JOIN_TOKENS: usize = 1;
-    /// Tokens the blank line after a running summary adds.
+    /// Tokens the blank line after a running summary adds (and slack for a merge at it).
     const SUMMARY_BREAK_TOKENS: usize = 2;
 
     fn new(
@@ -628,11 +690,14 @@ impl<'a> Summarizer<'a> {
         n_ctx: usize,
     ) -> Self {
         let max_tokens = Summarize::max_tokens(n_ctx);
+        // Fixed whatever the session samples with; only the seed is the session's.
         let sampling = SamplingConfig {
             temperature: Summarize::TEMPERATURE,
             top_p: Summarize::TOP_P,
+            top_k: Summarize::TOP_K,
+            repeat_penalty: Summarize::REPEAT_PENALTY,
+            seed: session.seed,
             max_tokens: i32::try_from(max_tokens).unwrap_or(i32::MAX),
-            ..session.clone()
         };
         Self {
             link,
@@ -656,54 +721,63 @@ impl<'a> Summarizer<'a> {
         running.ok_or_else(|| Summarize::ERR_NOTHING.to_string())
     }
 
-    /// The chunks of `lines`, oldest first: the whole span when one call fits (measured
-    /// joined), otherwise as many whole lines per call as fit the input budget. A line costs
-    /// its measured tokens plus [`Self::JOIN_TOKENS`] for its `\n` join. The first chunk
-    /// makes room for the `old` summary, later chunks for a running summary of up to
-    /// `max_tokens`, both also for the blank line after it. Needing more than
-    /// [`Summarize::MAX_CALLS`] chunks is an error, found before any call; planning stops
-    /// measuring as soon as it is known.
+    /// The chunks of `lines`, oldest first: the whole span when one call fits, otherwise as
+    /// many whole lines per call as fit. Each chunk's end is found by a binary search over
+    /// its length, measuring the assembled call (about log2 of the remaining lines measures
+    /// per chunk). A call fits when its measured prompt is at most `n_ctx - max_tokens`; the
+    /// first call carries the `old` summary (if any), later calls make room for a running
+    /// summary of up to `max_tokens` plus the blank line after it. Needing more than
+    /// [`Summarize::MAX_CALLS`] chunks is an error, found before any call: planning stops as
+    /// soon as four chunks leave lines over.
     async fn plan(
         &self,
         old: Option<&str>,
         lines: &[String],
     ) -> Result<Vec<std::ops::Range<usize>>, String> {
         let window = self.n_ctx.saturating_sub(self.max_tokens);
-        let whole = self.tokens(&Self::content(old, lines)).await?;
-        if whole <= window {
+        if self.tokens(&Self::content(old, lines)).await? <= window {
             return Ok(vec![0..lines.len()]);
         }
-        let overhead = self.tokens("").await?;
-        let input = window.saturating_sub(overhead);
-        let mut room = match old {
-            Some(old) => input
-                .saturating_sub(self.cost(old, overhead).await?)
-                .saturating_sub(Self::SUMMARY_BREAK_TOKENS),
-            None => input,
-        };
-        let later_room = input
-            .saturating_sub(self.max_tokens)
-            .saturating_sub(Self::SUMMARY_BREAK_TOKENS);
         let mut chunks = Vec::new();
-        let (mut start, mut used) = (0, 0);
-        for (index, line) in lines.iter().enumerate() {
-            let cost = self.cost(line, overhead).await? + Self::JOIN_TOKENS;
-            if used + cost > room && index > start {
-                chunks.push(start..index);
-                if chunks.len() == Summarize::MAX_CALLS {
-                    // Lines remain, so at least one more call would be needed.
-                    return Err(Self::too_many_calls());
-                }
-                (start, used) = (index, 0);
-                room = later_room;
+        let mut start = 0;
+        while start < lines.len() {
+            if chunks.len() == Summarize::MAX_CALLS {
+                return Err(Self::too_many_calls());
             }
-            if cost > room {
+            let first = chunks.is_empty();
+            // The whole span is known not to fit the first call.
+            let (mut fit, mut over) = (start, if first { lines.len() } else { lines.len() + 1 });
+            while over - fit > 1 {
+                let mid = fit + (over - fit) / 2;
+                if self.fits(first, old, &lines[start..mid], window).await? {
+                    fit = mid;
+                } else {
+                    over = mid;
+                }
+            }
+            if fit == start {
                 return Err(Self::ERR_LINE_TOO_BIG.to_string());
             }
-            used += cost;
+            chunks.push(start..fit);
+            start = fit;
         }
-        chunks.push(start..lines.len());
         Ok(chunks)
+    }
+
+    /// Whether a call over `chunk` fits `window`: the first call with the `old` summary, a
+    /// later one with room for a running summary of up to `max_tokens`.
+    async fn fits(
+        &self,
+        first: bool,
+        old: Option<&str>,
+        chunk: &[String],
+        window: usize,
+    ) -> Result<bool, String> {
+        if first {
+            return Ok(self.tokens(&Self::content(old, chunk)).await? <= window);
+        }
+        let room = self.max_tokens + Self::SUMMARY_BREAK_TOKENS;
+        Ok(self.tokens(&Self::content(None, chunk)).await? + room <= window)
     }
 
     fn too_many_calls() -> String {
@@ -737,9 +811,14 @@ impl<'a> Summarizer<'a> {
             .map_err(|e| format!("{}{e}", Self::ERR_MEASURE))
     }
 
-    /// The tokens `text` adds to an empty summary call (whose size is `overhead`).
-    async fn cost(&self, text: &str, overhead: usize) -> Result<usize, String> {
-        Ok(self.tokens(text).await?.saturating_sub(overhead))
+    /// The saved `tokens` of the note for `summary`: what its text adds to an empty summary
+    /// call, as the summary call's own render counts it.
+    async fn note_tokens(&self, summary: &str) -> Result<u32, String> {
+        let text = SummaryNote::text(summary);
+        let note = self.measure.measure(&Self::messages(&text)).await?;
+        let empty = self.measure.measure(&Self::messages("")).await?;
+        let tokens = note.prompt_tokens.saturating_sub(empty.prompt_tokens);
+        Ok(CompactionRecord::count(tokens))
     }
 
     /// One summary call: tools and thinking off, the fixed sampling. The reply is
@@ -853,7 +932,7 @@ pub struct Compactor {
     saved: Option<CompactionState>,
     /// The length of the committed transcript the turn started from.
     committed_len: usize,
-    /// The session's sampling; a summary call copies it, overriding a few fields.
+    /// The session's sampling; a summary call takes only its seed.
     sampling: SamplingConfig,
     sink: Arc<dyn SummarySink>,
     /// The session named in the measure-failure log line (empty when unknown).
@@ -921,13 +1000,18 @@ impl Compactor {
     /// step's `tools` and `enable_thinking`.
     ///
     /// The budget is `floor(n_ctx * compact_at_pct / 100)` and the reservation
-    /// `max(max_tokens, 0)`. The messages come back unchanged, with no record, when the
-    /// strategy is off, when the prompt plus the reservation fits the budget, or when a
-    /// measure fails (an old worker without `measure_prompt`, or a link error): the step then
-    /// goes out uncompacted and the turn continues (the turn's first failure is logged to
-    /// stderr once, see [`Self::logged_failures`]). Otherwise the strategy's result is
-    /// returned, with its record. A summary saved through the sink is also kept here, even
-    /// when a later measure of the same step fails.
+    /// `max(max_tokens, 0)`. When the reservation alone reaches the budget, the target is the
+    /// window instead (the budget becomes `n_ctx`): compaction then only removes what keeps
+    /// the prompt plus the reservation out of `n_ctx`, and when the reservation fills the
+    /// whole window nothing is compacted. The messages come back unchanged, with no record,
+    /// when the strategy is off, when the prompt plus the reservation fits the target, when
+    /// the reservation fills the window, or when a measure of the original prompt fails (an
+    /// old worker without `measure_prompt`, or a link error): the step then goes out
+    /// uncompacted and the turn continues (the turn's first failure is logged to stderr once,
+    /// see [`Self::logged_failures`]). Otherwise the strategy's result is returned, with its
+    /// record. A summary saved through the sink is also kept here, even when a later measure
+    /// of the same step fails. Summary calls are measured on their own, with no tools and
+    /// thinking off.
     pub async fn prepare(
         &mut self,
         messages: &[ChatMessage],
@@ -953,8 +1037,10 @@ impl Compactor {
                 return Self::unchanged(messages);
             }
         };
-        let budget = size.n_ctx.saturating_mul(usize::from(self.compact_at_pct)) / Self::PERCENT;
         let reservation = usize::try_from(max_tokens.max(0)).unwrap_or(usize::MAX);
+        let Some(budget) = Self::target(size.n_ctx, self.compact_at_pct, reservation) else {
+            return Self::unchanged(messages);
+        };
         let before = size.prompt_tokens;
         if Trim::fits(before, reservation, budget) {
             return Self::unchanged(messages);
@@ -977,6 +1063,12 @@ impl Compactor {
                     inner: self.sink.as_ref(),
                     kept: Mutex::new(None),
                 };
+                let summary_measure = LinkMeasure {
+                    link,
+                    tools: &[],
+                    enable_thinking: false,
+                    sampling: &self.sampling,
+                };
                 let outcome = Summarize::compact(
                     messages,
                     self.committed_len,
@@ -989,6 +1081,7 @@ impl Compactor {
                     &self.sampling,
                     link,
                     &measure,
+                    &summary_measure,
                     &keeping,
                 )
                 .await;
@@ -1004,6 +1097,19 @@ impl Compactor {
                 self.measure_failed(&error);
                 Self::unchanged(messages)
             }
+        }
+    }
+
+    /// The budget compaction aims for: `floor(n_ctx * pct / 100)`, or `n_ctx` when
+    /// `reservation` alone reaches that; `None` when `reservation` fills the whole window.
+    fn target(n_ctx: usize, pct: u8, reservation: usize) -> Option<usize> {
+        let budget = n_ctx.saturating_mul(usize::from(pct)) / Self::PERCENT;
+        if reservation < budget {
+            Some(budget)
+        } else if reservation < n_ctx {
+            Some(n_ctx)
+        } else {
+            None
         }
     }
 
@@ -1266,10 +1372,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trim_never_touches_system_current_turn_or_summary_note() {
+    async fn trim_never_touches_system_note_or_current_turn() {
         let system = ChatMessage::new(Role::System, "s".repeat(BIG));
-        let note = SummaryNote::message(&"n".repeat(BIG));
-        let mut messages = vec![system.clone(), note.clone()];
+        let note = SummaryNote::system(Some(&system), &"n".repeat(BIG));
+        assert!(SummaryNote::is_note(&note));
+        let mut messages = vec![note.clone()];
         messages.extend(Fx::tool_turn(1, Fx::big()));
         let current = messages.len();
         let current_turn = Fx::tool_turn(2, Fx::big());
@@ -1286,7 +1393,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut expected = vec![system, note];
+        let mut expected = vec![note];
         expected.extend(current_turn);
         assert_eq!(out.messages, expected);
         let record = out.record.unwrap();
@@ -1417,17 +1524,31 @@ mod tests {
     fn turns_starts_marks_each_user_message() {
         let mut messages = vec![Fx::system()];
         messages.extend(Fx::tool_turn(0, json!(1)));
-        messages.push(SummaryNote::message("s"));
         messages.push(Fx::user("q"));
         messages.push(Fx::assistant("a"));
-        assert_eq!(Turns::starts(&messages), vec![1, 5, 6]);
+        assert_eq!(Turns::starts(&messages), vec![1, 5]);
         assert!(Turns::starts(&[]).is_empty());
-        assert!(SummaryNote::is_note(&messages[5]));
-        assert!(!SummaryNote::is_note(&messages[6]));
+    }
+
+    #[test]
+    fn summary_note_rides_in_the_system_message() {
+        let note = SummaryNote::system(Some(&Fx::system()), "s");
+        assert_eq!(note.role, Role::System);
         assert_eq!(
-            messages[5].content,
-            "[Summary of the earlier conversation]\ns"
+            note.content,
+            "you are helpful\n\n[Summary of the earlier conversation]\ns"
         );
+        let alone = SummaryNote::system(None, "s");
+        assert_eq!(alone, SummaryNote::message("s"));
+        assert_eq!(alone.role, Role::System);
+        assert_eq!(alone.content, "[Summary of the earlier conversation]\ns");
+        let empty = ChatMessage::new(Role::System, "");
+        assert_eq!(SummaryNote::system(Some(&empty), "s"), alone);
+        assert!(SummaryNote::is_note(&note));
+        assert!(SummaryNote::is_note(&alone));
+        assert!(!SummaryNote::is_note(&Fx::system()));
+        let as_user = ChatMessage::new(Role::User, SummaryNote::text("s"));
+        assert!(!SummaryNote::is_note(&as_user));
     }
 
     // ---- summarize ----
@@ -1544,7 +1665,8 @@ mod tests {
             .await
         }
 
-        /// Like [`Self::run`], measuring through `measure`.
+        /// Like [`Self::run`], measuring the step's prompts through `measure` (summary calls
+        /// through a fresh [`FakeMeasure`]).
         #[allow(clippy::too_many_arguments)]
         async fn run_measured(
             messages: &[ChatMessage],
@@ -1555,6 +1677,34 @@ mod tests {
             link: &FakeLink,
             sink: &RecordingSink,
             measure: &dyn PromptMeasure,
+        ) -> Compacted {
+            let summary_measure = FakeMeasure::new();
+            Self::run_both(
+                messages,
+                current,
+                saved,
+                budget,
+                n_ctx,
+                link,
+                sink,
+                measure,
+                &summary_measure,
+            )
+            .await
+        }
+
+        /// Like [`Self::run_measured`], measuring summary calls through `summary_measure`.
+        #[allow(clippy::too_many_arguments)]
+        async fn run_both(
+            messages: &[ChatMessage],
+            current: usize,
+            saved: Option<&CompactionState>,
+            budget: usize,
+            n_ctx: usize,
+            link: &FakeLink,
+            sink: &RecordingSink,
+            measure: &dyn PromptMeasure,
+            summary_measure: &dyn PromptMeasure,
         ) -> Compacted {
             let before = FakeMeasure::tokens(messages);
             Summarize::compact(
@@ -1569,6 +1719,7 @@ mod tests {
                 &Self::sampling(),
                 link,
                 measure,
+                summary_measure,
                 sink,
             )
             .await
@@ -1599,20 +1750,23 @@ mod tests {
         let link = Sx::link(vec![Sx::reply("<|channel>thought\n S \n", 3)]);
         let sink = RecordingSink::new();
         let out = Sx::run(&messages, current, None, budget, N_CTX, &link, &sink).await;
-        let mut expected = vec![Fx::system(), SummaryNote::message(SUMMARY)];
+        let mut expected = vec![SummaryNote::system(Some(&Fx::system()), SUMMARY)];
         expected.extend_from_slice(&messages[17..]);
         assert_eq!(out.messages, expected);
         assert_eq!(
-            out.messages[1].content,
-            "[Summary of the earlier conversation]\nS"
+            out.messages[0].content,
+            "you are helpful\n\n[Summary of the earlier conversation]\nS"
         );
         let saved = sink.saved();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].summary, SUMMARY);
         assert_eq!(saved[0].covers, 17);
+        // The note text's own tokens, as the summary call's render counts them.
+        let note = Summarizer::messages(&SummaryNote::text(SUMMARY));
+        let empty = Summarizer::messages("");
         assert_eq!(
             saved[0].tokens as usize,
-            FakeMeasure::tokens(&[SummaryNote::message(SUMMARY)])
+            FakeMeasure::tokens(&note) - FakeMeasure::tokens(&empty)
         );
         assert!(saved[0].at > 1_700_000_000_000);
         let record = out.record.unwrap();
@@ -1655,7 +1809,8 @@ mod tests {
         assert_eq!(req.sampling.max_tokens, 512);
         assert_eq!(req.sampling.max_tokens as usize, (SMALL_CTX / 8).min(1024));
         assert_eq!(Summarize::max_tokens(N_CTX), 1024);
-        assert_eq!((req.sampling.top_k, req.sampling.repeat_penalty), (7, 1.3));
+        // Fixed, not the session's top_k 7 and repeat_penalty 1.3.
+        assert_eq!((req.sampling.top_k, req.sampling.repeat_penalty), (40, 1.0));
         let lines: Vec<&str> = Sx::content(req).lines().collect();
         // Four summarised turns of four messages each.
         assert_eq!(lines.len(), 16);
@@ -1687,7 +1842,7 @@ mod tests {
         .await;
         assert!(link.requests().is_empty());
         assert!(sink.saved().is_empty());
-        let mut expected = vec![Fx::system(), SummaryNote::message(OLD)];
+        let mut expected = vec![SummaryNote::system(Some(&Fx::system()), OLD)];
         expected.extend_from_slice(&messages[17..]);
         assert_eq!(out.messages, expected);
         let record = out.record.unwrap();
@@ -1703,7 +1858,7 @@ mod tests {
         let (messages, current) = Sx::transcript();
         // Reusing the summary over 1..9 leaves turns 9, 13 and 17 verbatim: too big. A new
         // summary up to 17 leaves only the previous turn.
-        let mut two_turns = vec![Fx::system(), SummaryNote::message(OLD)];
+        let mut two_turns = vec![SummaryNote::system(Some(&Fx::system()), OLD)];
         two_turns.extend_from_slice(&messages[13..]);
         let budget = FakeMeasure::tokens(&two_turns) + RESERVATION;
         let saved = Sx::state(OLD, 9);
@@ -1730,7 +1885,7 @@ mod tests {
         assert_eq!(saved_now.len(), 1);
         assert_eq!(saved_now[0].covers, 17);
         assert!(saved_now[0].covers > saved.covers);
-        let mut expected = vec![Fx::system(), SummaryNote::message(SUMMARY)];
+        let mut expected = vec![SummaryNote::system(Some(&Fx::system()), SUMMARY)];
         expected.extend_from_slice(&messages[17..]);
         assert_eq!(out.messages, expected);
         let record = out.record.unwrap();
@@ -1797,7 +1952,7 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].summary, "S4");
         assert_eq!(saved[0].covers, 9);
-        let mut expected = vec![Fx::system(), SummaryNote::message("S4")];
+        let mut expected = vec![SummaryNote::system(Some(&Fx::system()), "S4")];
         expected.extend_from_slice(&messages[9..]);
         assert_eq!(out.messages, expected);
         let record = out.record.unwrap();
@@ -1810,8 +1965,8 @@ mod tests {
 
     #[tokio::test]
     async fn span_needing_five_chunks_falls_back_to_trim() {
-        // The sixth turn is too big for any call. Planning stops at the fifth chunk, so it is
-        // never measured and the reason is the call limit, not the oversized message.
+        // The sixth turn is too big for any call. Planning stops when four chunks leave
+        // lines over, so the reason is the call limit, not the oversized message.
         let (messages, current) = Sx::long_turns_of(&[BIG, BIG, BIG, BIG, BIG, 5 * BIG]);
         let budget = FakeMeasure::tokens(&messages) - 1500;
         // No script: the plan fails before any call.
@@ -1943,7 +2098,7 @@ mod tests {
         messages.extend(Fx::tool_turn(3, Fx::big()));
         let current = messages.len();
         messages.push(Fx::user("now"));
-        let mut expected = vec![Fx::system(), SummaryNote::message(SUMMARY)];
+        let mut expected = vec![SummaryNote::system(Some(&Fx::system()), SUMMARY)];
         let mut prev = Fx::tool_turn(3, Fx::big());
         prev[2].tool_result = Some(Fx::stub(&Fx::big()));
         expected.extend(prev);
@@ -1964,13 +2119,17 @@ mod tests {
         assert_eq!(record.after_tokens as usize, FakeMeasure::tokens(&expected));
     }
 
-    /// A measure that fails on a lone summary note and otherwise counts like `FakeMeasure`.
+    /// A summary-call measure that fails on the note text and otherwise counts like
+    /// `FakeMeasure`.
     struct NoteFailingMeasure(FakeMeasure);
 
     #[async_trait]
     impl PromptMeasure for NoteFailingMeasure {
         async fn measure(&self, messages: &[ChatMessage]) -> Result<PromptSize, String> {
-            if messages.len() == 1 && SummaryNote::is_note(&messages[0]) {
+            let note = messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.starts_with(SummaryNote::HEADER));
+            if note {
                 return Err("tokenizer gone".into());
             }
             self.0.measure(messages).await
@@ -1983,7 +2142,7 @@ mod tests {
         // The saved summary already covers everything before the previous turn, but the
         // reused prompt is still over budget: trim runs on it, with no summary call.
         let saved = Sx::state(OLD, 17);
-        let mut expected = vec![Fx::system(), SummaryNote::message(OLD)];
+        let mut expected = vec![SummaryNote::system(Some(&Fx::system()), OLD)];
         let mut prev = Fx::tool_turn(4, Fx::big());
         prev[2].tool_result = Some(Fx::stub(&Fx::big()));
         expected.extend(prev);
@@ -2049,9 +2208,17 @@ mod tests {
         let budget = FakeMeasure::tokens(&messages) - 1500;
         let link = Sx::link(vec![Sx::reply(SUMMARY, 1)]);
         let sink = RecordingSink::new();
-        let measure = NoteFailingMeasure(FakeMeasure::new());
-        let out = Sx::run_measured(
-            &messages, current, None, budget, N_CTX, &link, &sink, &measure,
+        let summary_measure = NoteFailingMeasure(FakeMeasure::new());
+        let out = Sx::run_both(
+            &messages,
+            current,
+            None,
+            budget,
+            N_CTX,
+            &link,
+            &sink,
+            &FakeMeasure::new(),
+            &summary_measure,
         )
         .await;
         assert_eq!(link.requests().len(), 1);
@@ -2065,5 +2232,181 @@ mod tests {
             Some("measuring the summary note failed: tokenizer gone")
         );
         assert_eq!(record.summary_prompt_tokens, Some(10));
+    }
+
+    /// A step measure that rejects any prompt starting with the summary note, as a chat
+    /// template raising on it would, and otherwise counts like `FakeMeasure`.
+    struct NoteRejectingMeasure(FakeMeasure);
+
+    impl NoteRejectingMeasure {
+        const REJECTED: &'static str = "template rejected the prompt";
+    }
+
+    #[async_trait]
+    impl PromptMeasure for NoteRejectingMeasure {
+        async fn measure(&self, messages: &[ChatMessage]) -> Result<PromptSize, String> {
+            if messages.first().is_some_and(SummaryNote::is_note) {
+                return Err(Self::REJECTED.into());
+            }
+            self.0.measure(messages).await
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_summarized_prompt_falls_back_to_trim_with_reason() {
+        let (messages, current) = Sx::transcript();
+        let budget = FakeMeasure::tokens(&messages) - 1500;
+        let trimmed = Sx::trimmed(&messages, current, budget).await;
+        let expected = format!(
+            "measuring the summarized prompt failed: {}",
+            NoteRejectingMeasure::REJECTED
+        );
+        // A fresh summary is made and saved, then its prompt is rejected.
+        let link = Sx::link(vec![Sx::reply(SUMMARY, 1)]);
+        let sink = RecordingSink::new();
+        let measure = NoteRejectingMeasure(FakeMeasure::new());
+        let out = Sx::run_measured(
+            &messages, current, None, budget, N_CTX, &link, &sink, &measure,
+        )
+        .await;
+        assert_eq!(link.requests().len(), 1);
+        assert_eq!(sink.saved().len(), 1);
+        assert_eq!(out.messages, trimmed.messages);
+        let record = out.record.unwrap();
+        assert!(record.fallback);
+        assert_eq!(record.summary_error.as_deref(), Some(expected.as_str()));
+        assert_eq!(record.summary_prompt_tokens, Some(10));
+        // A saved summary whose reused prompt is rejected: no call, the same fallback.
+        let saved = Sx::state(OLD, 17);
+        let link = Sx::link(vec![]);
+        let sink = RecordingSink::new();
+        let out = Sx::run_measured(
+            &messages,
+            current,
+            Some(&saved),
+            budget,
+            N_CTX,
+            &link,
+            &sink,
+            &measure,
+        )
+        .await;
+        assert!(link.requests().is_empty());
+        assert!(sink.saved().is_empty());
+        assert_eq!(out.messages, trimmed.messages);
+        let record = out.record.unwrap();
+        assert!(record.fallback);
+        assert!(!record.reused_summary);
+        assert_eq!(record.summary_error.as_deref(), Some(expected.as_str()));
+        assert_eq!(record.summary_ms, None);
+    }
+
+    /// A chat template that, like Gemma 3's, folds the system message into the first user
+    /// turn and raises unless the remaining roles alternate user/assistant.
+    const STRICT_ALTERNATION: &str = concat!(
+        "{{ bos_token }}",
+        "{%- if messages[0]['role'] == 'system' -%}",
+        "{%- set first_user_prefix = messages[0]['content'] + '\\n\\n' -%}",
+        "{%- set loop_messages = messages[1:] -%}",
+        "{%- else -%}",
+        "{%- set first_user_prefix = '' -%}",
+        "{%- set loop_messages = messages -%}",
+        "{%- endif -%}",
+        "{%- for message in loop_messages -%}",
+        "{%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) -%}",
+        "{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}",
+        "{%- endif -%}",
+        "{%- if message['role'] == 'assistant' -%}{%- set role = 'model' -%}",
+        "{%- else -%}{%- set role = message['role'] -%}{%- endif -%}",
+        "{{ '<start_of_turn>' + role + '\\n' + (first_user_prefix if loop.first else '') }}",
+        "{{ message['content'] | trim }}<end_of_turn>\n",
+        "{%- endfor -%}",
+        "{%- if add_generation_prompt -%}<start_of_turn>model\n{%- endif -%}",
+    );
+
+    #[tokio::test]
+    async fn summarized_prompt_renders_through_gemma4_and_strict_alternation() {
+        const GEMMA4: &str = include_str!("../../tests/fixtures/gemma4-chat-template.jinja");
+        let gemma4 = crate::engine::template::ChatTemplate::from_jinja(GEMMA4).unwrap();
+        let strict = crate::engine::template::ChatTemplate::from_jinja(STRICT_ALTERNATION).unwrap();
+        let (with_system, current) = Sx::long_turns(4);
+        let without_system = with_system[1..].to_vec();
+        for (messages, current) in [(with_system, current), (without_system, current - 1)] {
+            let budget = FakeMeasure::tokens(&messages);
+            let link = Sx::link(vec![Sx::reply(SUMMARY, 1)]);
+            let sink = RecordingSink::new();
+            let out = Sx::run(&messages, current, None, budget, N_CTX, &link, &sink).await;
+            let record = out.record.unwrap();
+            assert!(!record.fallback, "{:?}", record.summary_error);
+            assert!(SummaryNote::is_note(&out.messages[0]));
+            assert_eq!(out.messages.len(), 4);
+            for template in [&gemma4, &strict] {
+                let prompt = template.render(&out.messages, true, false, &[]).unwrap();
+                assert!(prompt.contains(SummaryNote::HEADER), "{prompt}");
+            }
+        }
+        // The old shape, a separate user note before the kept tail, breaks the alternation.
+        let old_shape = vec![
+            Fx::system(),
+            ChatMessage::new(Role::User, SummaryNote::text(SUMMARY)),
+            Fx::user("prev"),
+            Fx::assistant("done"),
+        ];
+        let error = strict.render(&old_shape, true, false, &[]).unwrap_err();
+        assert!(error.to_string().contains("must alternate"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn span_lines_drop_thinking_channels_but_the_transcript_keeps_them() {
+        const THOUGHT: &str = "<|channel>thought\nlong private reasoning<channel|>The answer.";
+        const OPEN_TAIL: &str = "Partial.<|channel>thought\nunfinished reasoning";
+        let (mut messages, current) = Sx::transcript();
+        messages[4].content = THOUGHT.into();
+        messages[8].content = OPEN_TAIL.into();
+        let budget = FakeMeasure::tokens(&messages);
+        let link = Sx::link(vec![Sx::reply(SUMMARY, 1)]);
+        let sink = RecordingSink::new();
+        Sx::run(&messages, current, None, budget, N_CTX, &link, &sink).await;
+        let requests = link.requests();
+        let content = Sx::content(&requests[0]);
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[3], "assistant: The answer.");
+        assert_eq!(lines[7], "assistant: Partial.");
+        assert!(!content.contains(OpenChannel::OPEN), "{content}");
+        assert!(!content.contains(OpenChannel::CLOSE), "{content}");
+        assert!(!content.contains("reasoning"), "{content}");
+        assert_eq!(messages[4].content, THOUGHT);
+        assert_eq!(messages[8].content, OPEN_TAIL);
+    }
+
+    #[tokio::test]
+    async fn chunk_planning_binary_searches_each_chunk_end() {
+        const LINES: usize = 40;
+        let lines: Vec<String> = (0..LINES)
+            .map(|_| format!("user: {}", "x".repeat(200)))
+            .collect();
+        let link = Sx::link(vec![]);
+        let measure = FakeMeasure::new();
+        let summarizer = Summarizer::new(link.as_ref(), &measure, &Sx::sampling(), Sx::CHUNK_CTX);
+        let chunks = summarizer.plan(None, &lines).await.unwrap();
+        assert_eq!(chunks, vec![0..33, 33..LINES]);
+        // One whole-span measure, then a binary search per chunk end: 6 for the first chunk
+        // (over 0..40) and 3 for the second (over 33..41), not one measure per line.
+        assert_eq!(measure.calls.load(Ordering::SeqCst), 10);
+        let window = Sx::CHUNK_CTX - Summarize::max_tokens(Sx::CHUNK_CTX);
+        let first = Summarizer::messages(&Summarizer::content(None, &lines[chunks[0].clone()]));
+        assert!(FakeMeasure::tokens(&first) <= window);
+        let more = Summarizer::messages(&Summarizer::content(None, &lines[0..34]));
+        assert!(FakeMeasure::tokens(&more) > window);
+    }
+
+    #[test]
+    fn target_is_the_window_when_the_reservation_reaches_the_budget() {
+        // 75% of 8192 is 6144.
+        assert_eq!(Compactor::target(8192, 75, 1000), Some(6144));
+        assert_eq!(Compactor::target(8192, 75, 6144), Some(8192));
+        assert_eq!(Compactor::target(8192, 75, 6500), Some(8192));
+        assert_eq!(Compactor::target(8192, 75, 8192), None);
+        assert_eq!(Compactor::target(8192, 75, 9000), None);
     }
 }

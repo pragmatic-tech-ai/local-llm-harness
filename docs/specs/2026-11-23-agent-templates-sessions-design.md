@@ -431,7 +431,8 @@ Several app windows attached to the same session all receive its notifications.
 - Remote `supervisor` hosts and `api` hosts behind `ModelHost`.
 - Other `PlacementPolicy` implementations: auto-load, load-balancing, fallback chains.
 - Template fields for later roadmap steps: compaction settings, planning mode, delegate
-  agents.
+  agents. Compaction is now specified in
+  `docs/specs/2026-11-24-context-compaction-design.md`: what the model sees may be compacted.
 - A coordinator agent calling `create_session` / `send_turn` through tools (step 6).
 
 ## Tests (what proves it)

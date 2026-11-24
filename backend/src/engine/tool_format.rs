@@ -72,7 +72,7 @@ pub struct GemmaThinkCounter {
 
 impl GemmaThinkCounter {
     const THOUGHT: &'static str = "thought";
-    const CHANNEL_CLOSE: &'static str = "<channel|>";
+    const CHANNEL_CLOSE: &'static str = OpenChannel::CLOSE;
     /// Bytes of tail kept between chunks: one short of the longest marker.
     const CARRY_LEN: usize = OpenChannel::OPEN.len() + Self::THOUGHT.len() - 1;
 

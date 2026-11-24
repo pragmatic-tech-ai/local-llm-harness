@@ -101,6 +101,7 @@ impl WsWorkerLink {
     const CALL_TIMEOUT: Duration = Duration::from_secs(30);
     const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
     const ERR_CONNECT_TIMEOUT: &'static str = "worker connect timed out";
+    const M_MEASURE_PROMPT: &'static str = "measure_prompt";
 
     pub fn new(url: String) -> Self {
         Self {
@@ -239,9 +240,9 @@ impl WorkerLink for WsWorkerLink {
 
     async fn measure_prompt(&self, req: &GenerateRequest) -> Result<PromptSize, LinkError> {
         let params = serde_json::to_value(req).map_err(|e| LinkError(e.to_string()))?;
-        let result = self.call("measure_prompt", params).await?;
+        let result = self.call(Self::M_MEASURE_PROMPT, params).await?;
         serde_json::from_value(result)
-            .map_err(|e| LinkError(format!("bad measure_prompt result: {e}")))
+            .map_err(|e| LinkError(format!("bad {} result: {e}", Self::M_MEASURE_PROMPT)))
     }
 
     async fn generate(

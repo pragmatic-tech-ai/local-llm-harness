@@ -74,7 +74,26 @@ pub struct OpenChannel;
 
 impl OpenChannel {
     pub const OPEN: &'static str = "<|channel>";
+    /// The marker that closes a channel.
+    pub const CLOSE: &'static str = "<channel|>";
     const NAME_END: char = '\n';
+
+    /// `text` without its channel blocks: each `<|channel>`…`<channel|>` is removed, and an
+    /// opener with no closer removes the rest of the text. Text outside the blocks is kept as
+    /// it is.
+    pub fn strip_blocks(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find(Self::OPEN) {
+            out.push_str(&rest[..at]);
+            match rest[at..].find(Self::CLOSE) {
+                Some(end) => rest = &rest[at + end + Self::CLOSE.len()..],
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
 
     /// The opener text when `prompt` ends with exactly `<|channel>` + a channel name
     /// (`[A-Za-z0-9_]+`) + `\n`. Anything else after the last marker (no newline, other
@@ -286,6 +305,27 @@ mod tests {
         assert_eq!(OpenChannel::at_tail("x<|channel>a b\n"), None);
         assert_eq!(OpenChannel::at_tail("x<|channel>thought\n\n"), None);
         assert_eq!(OpenChannel::at_tail("x<|channel>thought\n<channel|>"), None);
+    }
+
+    #[test]
+    fn strip_blocks_removes_closed_and_trailing_open_channels() {
+        assert_eq!(
+            OpenChannel::strip_blocks("<|channel>thought\nhmm<channel|>The answer."),
+            "The answer."
+        );
+        assert_eq!(
+            OpenChannel::strip_blocks("a<|channel>thought\nx<channel|>b<|channel>t\ny<channel|>c"),
+            "abc"
+        );
+        assert_eq!(
+            OpenChannel::strip_blocks("Kept.<|channel>thought\nstill thinking"),
+            "Kept."
+        );
+        assert_eq!(
+            OpenChannel::strip_blocks("no channels here"),
+            "no channels here"
+        );
+        assert_eq!(OpenChannel::strip_blocks(""), "");
     }
 
     #[test]

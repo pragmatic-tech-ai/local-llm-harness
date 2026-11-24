@@ -598,9 +598,14 @@ mod tests {
         assert!(body.contains("shrink"));
         fs::write(dir.join("Bad.toml"), body).unwrap();
         let tree = s.tree();
+        let bad = |c: &TemplateNode| match c {
+            TemplateNode::Template { error: Some(e), .. } => {
+                e.contains("unknown context strategy: shrink")
+            }
+            _ => false,
+        };
         let found = tree.iter().any(|g| match g {
-            TemplateNode::Group { children, .. } => children.iter().any(|c| matches!(c,
-                TemplateNode::Template { error: Some(e), .. } if e.contains("unknown context strategy: shrink"))),
+            TemplateNode::Group { children, .. } => children.iter().any(bad),
             _ => false,
         });
         assert!(found, "{tree:?}");

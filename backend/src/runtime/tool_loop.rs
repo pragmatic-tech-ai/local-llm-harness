@@ -18,7 +18,6 @@ use super::registry::ToolRegistry;
 use super::tool::ToolCallRequest;
 use super::trace::{CompactionRecord, StepOutcome, StepRecord, ToolTiming, TurnTrace};
 use super::worker::{GenerateRequest, LinkError, Note, WorkerLink};
-use crate::agents::template::ContextStrategy;
 use crate::engine::tool_format::{NoThinkCounter, ParsedCall, ThinkCounter, ThinkCounters};
 use crate::engine::types::{FunctionCall, ToolCall};
 use crate::engine::{ChatMessage, Role, SamplingConfig};
@@ -86,13 +85,6 @@ pub struct TurnConfig {
     pub tools: Vec<String>,
     pub enable_thinking: bool,
     pub sampling: SamplingConfig,
-    /// How the prompt is kept inside the window (the session's snapshot). The loop does not
-    /// read it: it configures the [`Compactor`] the caller builds and passes to
-    /// [`ToolLoop::run`] (the server's `SessionView::compactor`).
-    pub context_strategy: ContextStrategy,
-    /// The budget, as a percentage of the window, past which the prompt is compacted. Like
-    /// `context_strategy`, it configures the caller's [`Compactor`]; the loop does not read it.
-    pub compact_at_pct: u8,
 }
 
 /// The link for one step, and the time spent loading the model to get it.
@@ -721,7 +713,7 @@ impl ToolLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::template::{CompactionState, DEFAULT_COMPACT_AT_PCT};
+    use crate::agents::template::{CompactionState, ContextStrategy, DEFAULT_COMPACT_AT_PCT};
     use crate::engine::template::ChatTemplate;
     use crate::runtime::compaction::{Summarize, SummaryNote, SummarySink, Trim};
     use crate::runtime::policy::ReadOnlyPolicy;
@@ -845,8 +837,6 @@ mod tests {
                     tools: enabled.iter().map(|n| n.to_string()).collect(),
                     enable_thinking: false,
                     sampling: SamplingConfig::default(),
-                    context_strategy: ContextStrategy::default(),
-                    compact_at_pct: DEFAULT_COMPACT_AT_PCT,
                 },
                 compactor: Compactor::off(),
                 sink: RecordingSink::new(),
@@ -2216,6 +2206,35 @@ You are terse.<|tool>declaration:echo{";
                 assert_eq!(record.before_tokens as usize, prompt);
             }
             assert_eq!(f.compactor.logged_failures(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn reservation_past_the_budget_targets_the_window() {
+        // A 1600 reservation alone passes the 1500 budget: the target becomes the 2000
+        // window, so only a prompt the worker would reject is compacted. A reservation that
+        // fills the window leaves every prompt alone.
+        for (max_tokens, prompt, compacted) in [
+            (1600, 300, false),
+            (1600, 500, true),
+            (2000, 500, false),
+            (2500, 10, false),
+        ] {
+            let mut f = Fixture::new();
+            f.config.sampling.max_tokens = max_tokens;
+            f.compactor = Compaction::compactor(ContextStrategy::Trim);
+            let link = FakeLink::new(true, vec![Fixture::step("hi", vec![])]);
+            link.set_measure(Compaction::size(prompt));
+            f.run(Some(link.clone())).await.unwrap();
+            let record = f.trace.records[0].compaction.clone();
+            let row = format!("max_tokens {max_tokens}, prompt {prompt}");
+            assert_eq!(record.is_some(), compacted, "{row}");
+            if let Some(record) = record {
+                assert_eq!(record.strategy, Trim::STRATEGY, "{row}");
+                assert_eq!(record.before_tokens as usize, prompt, "{row}");
+            }
+            assert_eq!(link.measured().len(), 1, "{row}");
+            assert_eq!(f.compactor.logged_failures(), 0, "{row}");
         }
     }
 

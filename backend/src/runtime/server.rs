@@ -290,29 +290,28 @@ impl SessionView {
         rec.enable_thinking.unwrap_or(rec.snapshot.enable_thinking)
     }
 
-    /// What one turn of `rec` runs with: the snapshot's budget, tools and context strategy,
-    /// and the session's sampling and thinking.
+    /// What one turn of `rec` runs with: the snapshot's budget and tools, and the session's
+    /// sampling and thinking.
     fn turn_config(rec: &SessionRecord) -> TurnConfig {
         TurnConfig {
             step_budget: rec.snapshot.step_budget,
             tools: rec.snapshot.tools.clone(),
             enable_thinking: Self::thinking(rec),
             sampling: Self::sampling(rec),
-            context_strategy: rec.snapshot.context_strategy,
-            compact_at_pct: rec.snapshot.compact_at_pct,
         }
     }
 
-    /// The compactor of one turn of `rec` under `config`: it starts from the session's saved
-    /// summary and saves a fresh one back on the session.
+    /// The compactor of one turn of `rec` under `config`: the snapshot's context strategy and
+    /// threshold, starting from the session's saved summary and saving a fresh one back on the
+    /// session.
     fn compactor(deps: &RuntimeDeps, rec: &SessionRecord, config: &TurnConfig) -> Compactor {
         let sink = SessionCompactionSink {
             sessions: Arc::clone(&deps.sessions),
             session: rec.id.clone(),
         };
         Compactor::new(
-            config.context_strategy,
-            config.compact_at_pct,
+            rec.snapshot.context_strategy,
+            rec.snapshot.compact_at_pct,
             rec.compaction.clone(),
             rec.transcript.len(),
             config.sampling.clone(),
@@ -1806,8 +1805,6 @@ mod tests {
             tools: rec.snapshot.tools.clone(),
             enable_thinking: false,
             sampling: SamplingConfig::default(),
-            context_strategy: rec.snapshot.context_strategy,
-            compact_at_pct: rec.snapshot.compact_at_pct,
         };
         let mut sink = crate::runtime::test_support::RecordingSink::new();
         let (end, transcript) = rt

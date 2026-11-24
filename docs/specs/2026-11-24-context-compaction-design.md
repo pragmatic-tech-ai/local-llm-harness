@@ -112,15 +112,25 @@ Summarize keeps the most recent part verbatim and replaces the older part with a
 - **The summary call.** It runs on the same worker link, as a separate `generate` with tools off
   and thinking off. The messages are a fixed system prompt (see below) and one user message
   holding the summarised span, rendered as plain text, one line per message
-  (`{role}: {content}`, with tool results truncated to 2,000 characters each). `max_tokens` is
-  `min(1024, n_ctx / 8)`.
-- **What the model sees.** The model receives the system message, then one user message
-  `[Summary of the earlier conversation]\n{summary}`, then the kept tail. If that still exceeds
-  the budget, trim runs on the result. The summary note is never elided.
+  (`{role}: {content}`, with tool results truncated to 2,000 characters each). Reasoning
+  channels (`<|channel>…<channel|>`, and an opener left unclosed at the end) are dropped from
+  that text, as the chat template drops them from a normal prompt; the stored transcript keeps
+  them. `max_tokens` is `min(1024, n_ctx / 8)`.
+- **What the model sees.** The summary note `[Summary of the earlier conversation]\n{summary}`
+  rides in the system message: it is appended to the session's system prompt after a blank
+  line, or, when the session has no system prompt, it is the whole system message. The kept
+  tail follows. The note is never a separate user message, so the turns after the system
+  message still alternate user/assistant, which strict chat templates such as Gemma 3's
+  require. If the prompt still exceeds the budget, trim runs on the result. Trim never alters
+  the system message, so the note is never elided. If measuring a summarised prompt fails
+  (a template rejecting it, say), the step falls back to trim with the error in
+  `summary_error`.
 - **Persistence.** The summary is saved on the session as
   `compaction: {summary, covers, tokens, at}`.
-  - `covers` is the number of transcript messages the summary replaces, counted from after the
-    system message.
+  - `covers` is a transcript index: the summary replaces the messages from after the system
+    message up to, not including, `covers` (the start of the turn before the current one when
+    the summary was made). The trace's `summarized_messages` is that count.
+  - `tokens` is the note text's own size, measured as the summary call renders it.
   - On later steps and turns, the saved summary is reused while it still covers a prefix of the
     transcript and the prompt fits.
   - When the window fills again, a new summary is made over the old summary text plus the
@@ -163,6 +173,9 @@ The app's trace step row gains one line under the stats when `compaction` is pre
    ⟲ summarize failed → trim: 7 420 → 5 980 tokens · 3 results elided · 0 turns dropped
 ```
 
+When trim ran on top of a summary, the summarize and reused lines end with
+` · {e} results elided · {d} turns dropped`, only when either count is above 0.
+
 ### App
 
 - **The template editor.** It gains a "Context" combo (Off, Trim, Summarize) and a
@@ -201,9 +214,21 @@ These are the author's calls. The owner can overrule any of them.
   `summary_prompt_tokens`, `summary_out_tokens` and `summary_error` (text or null), summed
   over any chunked calls. A failed summary is visible with its reason, not just as a
   `fallback` flag.
-- **Summary sampling.** It is fixed: temperature 0.2, top_p 0.9, the session's seed, and
-  thinking off. This keeps summaries comparable across runs, whatever the session's sampling
-  is.
+- **Summary sampling.** It is fully fixed: temperature 0.2, top_p 0.9, top_k 40,
+  repeat_penalty 1.0, the session's seed, the summary `max_tokens`, and thinking off. Nothing
+  else is taken from the session. This keeps summaries comparable across runs, whatever the
+  session's sampling is.
+- **Measuring the summary call.** Summary calls are measured on their own, with no tools and
+  thinking off, as they are sent: for the input budget, for chunk planning and for the saved
+  `tokens`. The step's own measure (its tools and thinking flag) is used only for the step's
+  prompts. Chunk ends are found by a binary search over the chunk's length, measuring the
+  assembled call each time, so a long span costs about log2 of its line count measures per
+  chunk, not one per message.
+- **A reservation that reaches the budget.** When `max(max_tokens, 0)` alone is at least the
+  budget, no prompt could fit it, so the target becomes the window: compaction runs only when
+  `prompt_tokens + reservation > n_ctx`, and then removes only what is needed to fit `n_ctx`.
+  When the reservation is at least `n_ctx`, nothing is compacted and the worker's own check
+  decides.
 - **The stub's byte count.** `{bytes}` is the length of the tool result's serialized JSON,
   the same measure as `bytes` in the trace's tool timings.
 

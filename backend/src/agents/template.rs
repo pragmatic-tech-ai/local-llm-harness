@@ -67,7 +67,10 @@ impl<'de> Deserialize<'de> for ContextStrategy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionState {
     pub summary: String,
+    /// A transcript index: the summary replaces the messages after the system message, up to
+    /// but not including this one.
     pub covers: usize,
+    /// The note text's own tokens, as the summary call renders it.
     pub tokens: u32,
     pub at: u64,
 }
@@ -233,10 +236,7 @@ mod tests {
     #[test]
     fn wide_out_of_range_compact_at_pct_gives_the_range_message() {
         for bad in ["300", "-1", "0"] {
-            let text = format!(
-                "{BASE}compact_at_pct = {bad}
-"
-            );
+            let text = format!("{BASE}compact_at_pct = {bad}\n");
             let e = toml::from_str::<AgentTemplate>(&text)
                 .unwrap_err()
                 .to_string();

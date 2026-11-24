@@ -11,6 +11,10 @@
 //! `generate` is the stateless variant: the caller supplies the whole conversation (and
 //! optionally tools). It streams the same notifications, plus a `tool_call` note as soon as each
 //! call completes, and ends with `turn_done {content, tool_calls}`.
+//!
+//! `measure_prompt` takes the same params as `generate` and renders and tokenizes the prompt
+//! the same way, but generates nothing and sends no notifications: it answers
+//! `{prompt_tokens, n_ctx}`.
 
 use std::sync::Arc;
 
